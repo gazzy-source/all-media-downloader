@@ -1,0 +1,50 @@
+# Secrets & local config
+.env
+.env.*
+!.env.example
+cookies.txt
+*.cookies
+credentials*.json
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Runtime data (user downloads & stats — never publish)
+downloads/*
+!downloads/.gitkeep
+temp/*
+!temp/.gitkeep
+data/*
+!data/.gitkeep
+data/bot.lock
+*.log
+logs/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Optional local overrides
+docker-compose.override.yml

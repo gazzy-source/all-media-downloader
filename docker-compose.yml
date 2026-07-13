@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    container_name: all-media-downloader-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/app/downloads
+      - ./temp:/app/temp
+      - ./data:/app/data
+      # Optional: mount cookies for private/age-restricted content
+      # - ./cookies.txt:/app/cookies.txt:ro

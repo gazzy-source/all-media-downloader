@@ -204,12 +204,22 @@ def confirm_keyboard(session: DownloadSession) -> InlineKeyboardMarkup:
     )
 
 
-def after_download_keyboard(url: str) -> InlineKeyboardMarkup:
+def after_download_keyboard(url: str, user_id: int = 0) -> InlineKeyboardMarkup:
+    """
+    Telegram callback_data max is 64 BYTES. Never put full URLs here.
+    Store URL under a short token instead.
+    """
+    from bot.services.url_tokens import put_url
+
+    token = put_url(url, user_id)
+    # "again:" + 12 hex = 18 bytes — well under 64
+    cb = f"again:{token}"
+    assert len(cb.encode("utf-8")) <= 64
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "🔄 Download Again", callback_data=f"again:{url[:180]}"
+                    "🔄 Download Again", callback_data=cb
                 )
             ],
             [InlineKeyboardButton("📥 New Link", callback_data="new")],

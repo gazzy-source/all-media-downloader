@@ -14,6 +14,7 @@ import yt_dlp
 
 from bot.config import (
     COOKIES_FILE,
+    FORMAT_FALLBACK,
     MAX_CONCURRENT_DOWNLOADS,
     PROXY,
     QUALITY_MAP,
@@ -430,7 +431,7 @@ class DownloadManager:
             if mode == "audio":
                 opts.update(
                     {
-                        "format": "bestaudio/best",
+                        "format": f"bestaudio/best/{FORMAT_FALLBACK}",
                         "postprocessors": [
                             {
                                 "key": "FFmpegExtractAudio",
@@ -444,11 +445,10 @@ class DownloadManager:
             elif mode == "image":
                 opts.update(
                     {
-                        "format": "best",
+                        "format": FORMAT_FALLBACK,
                         "writethumbnail": False,
                     }
                 )
-                # For pure image pages, yt-dlp still works for many extractors
             elif mode == "video_subs":
                 q = QUALITY_MAP.get(quality, QUALITY_MAP["720"])
                 lang = subtitle_lang or "en.*"
@@ -475,13 +475,9 @@ class DownloadManager:
                     }
                 )
 
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if info is None:
-                    raise RuntimeError("Download returned no data.")
-                # Resolve final filename
-                prepared = ydl.prepare_filename(info)
-                title = str(info.get("title") or title_hint)[:200]
+            info, prepared, title = self._extract_with_format_fallback(
+                opts, url, title_hint
+            )
 
             files = sorted(
                 [p for p in work_dir.iterdir() if p.is_file() and not p.name.endswith(".part")],
@@ -562,6 +558,65 @@ class DownloadManager:
             self._cleanup_dir(work_dir)
             return DownloadResult(success=False, error=str(e)[:300], mode=mode, quality=quality)
 
+    def _extract_with_format_fallback(
+        self,
+        opts: dict[str, Any],
+        url: str,
+        title_hint: str,
+    ) -> tuple[dict[str, Any], str, str]:
+        """
+        Try preferred format first; on 'format not available' retry with FORMAT_FALLBACK.
+        Instagram/Facebook often expose progressive-only formats that miss height filters.
+        """
+        format_chain = [
+            opts.get("format") or FORMAT_FALLBACK,
+            FORMAT_FALLBACK,
+            "best",
+            "worst",
+        ]
+        formats: list[str] = []
+        seen: set[str] = set()
+        for f in format_chain:
+            if f and f not in seen:
+                seen.add(f)
+                formats.append(f)
+
+        last_err: Exception | None = None
+        for i, fmt in enumerate(formats):
+            attempt_opts = dict(opts)
+            attempt_opts["format"] = fmt
+            # Don't re-run heavy postprocessors that need a real download on dry fails
+            try:
+                with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if info is None:
+                        raise RuntimeError("Download returned no data.")
+                    prepared = ydl.prepare_filename(info)
+                    title = str(info.get("title") or title_hint)[:200]
+                    if i > 0:
+                        logger.info("Download succeeded with fallback format: %s", fmt)
+                    return info, prepared, title
+            except yt_dlp.utils.DownloadError as e:
+                last_err = e
+                err = str(e).lower()
+                retryable = (
+                    "format is not available" in err
+                    or "requested format" in err
+                    or "no video formats" in err
+                    or "only images" in err
+                )
+                if retryable and i < len(formats) - 1:
+                    logger.warning(
+                        "Format %r failed (%s); trying fallback…",
+                        fmt[:80],
+                        str(e).split("\n")[-1][:120],
+                    )
+                    continue
+                raise
+        if last_err:
+            raise last_err
+        raise RuntimeError("Download failed with all format selectors.")
+
     def _fetch_url_file(self, url: str, dest: Path) -> Path | None:
         try:
             import urllib.request
@@ -587,16 +642,28 @@ class DownloadManager:
                 "This content is private or requires login. "
                 "Add a cookies.txt file for authenticated downloads."
             )
-        if "unavailable" in low or "not available" in low:
-            return "This media is unavailable in your region or has been removed."
+        # Must be before generic "not available" (format errors were mislabeled as region)
+        if "format is not available" in low or "requested format" in low:
+            return (
+                "That quality/format isn't offered for this link. "
+                "Try Max quality, or Video again — the bot will auto-fallback."
+            )
+        if "only images are available" in low:
+            return "This post is image-only. Choose the Image download option."
+        if "geo" in low or "region" in low or "not available in your country" in low:
+            return "This media is blocked in the server's region."
+        if "unavailable" in low or "has been removed" in low or "video is not available" in low:
+            return "This media is unavailable or has been removed."
         if "copyright" in low or "blocked" in low:
-            return "This media is blocked due to copyright or regional restrictions."
+            return "This media is blocked due to copyright or platform restrictions."
         if "unsupported url" in low or "no suitable extractor" in low:
             return "This URL is not supported yet. Try another link from a major platform."
         if "ffmpeg" in low:
             return "FFmpeg is required for this format. Install FFmpeg and try again."
         if "timed out" in low or "timeout" in low:
             return "The download timed out. Please try again."
+        if "rate-limit" in low or "rate limit" in low or "too many requests" in low:
+            return "The platform rate-limited the bot. Wait a minute and try again."
         return msg or "Download failed for an unknown reason."
 
     @staticmethod

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="200" viewBox="0 0 720 200" role="img" aria-label="All-Media Downloader Bot">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f172a"/>
+      <stop offset="100%" style="stop-color:#1e1b4b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#a78bfa"/>
+      <stop offset="50%" style="stop-color:#38bdf8"/>
+      <stop offset="100%" style="stop-color:#34d399"/>
+    </linearGradient>
+  </defs>
+  <rect width="720" height="200" rx="24" fill="url(#bg)"/>
+  <circle cx="120" cy="100" r="52" fill="#312e81" stroke="url(#accent)" stroke-width="3"/>
+  <path d="M105 100 L135 82 L135 118 Z" fill="#e2e8f0"/>
+  <text x="200" y="88" font-family="Segoe UI, system-ui, sans-serif" font-size="28" font-weight="700" fill="#f8fafc">All-Media Downloader Bot</text>
+  <text x="200" y="122" font-family="Segoe UI, system-ui, sans-serif" font-size="16" fill="#94a3b8">Guided multi-platform downloads for Telegram</text>
+  <text x="200" y="152" font-family="Segoe UI, system-ui, sans-serif" font-size="14" fill="#a78bfa">Built by Gazzy Labs · Open Source · MIT</text>
+</svg>

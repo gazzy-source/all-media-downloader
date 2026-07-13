@@ -1,0 +1,13 @@
+All-Media Downloader Bot
+Copyright (c) 2026 Gazzy Labs
+
+This product includes software developed by Gazzy Labs and third-party open
+source projects. See LICENSE (MIT) for terms of this project.
+
+Third-party components (selected):
+  - yt-dlp — Unlicense / public domain style; see upstream LICENSE
+  - python-telegram-bot — LGPL / project license; see upstream
+  - FFmpeg — LGPL/GPL depending on build; install separately or via Docker image
+
+Operators must comply with Telegram Bot API terms, site Terms of Service, and
+applicable copyright law. This project does not provide copyrighted media.

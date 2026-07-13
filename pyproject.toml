@@ -1,0 +1,35 @@
+[project]
+name = "all-media-downloader-bot"
+version = "1.0.0"
+description = "Guided multi-platform Telegram media downloader by Gazzy Labs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Gazzy Labs" }]
+keywords = [
+  "telegram",
+  "bot",
+  "yt-dlp",
+  "downloader",
+  "youtube",
+  "instagram",
+  "tiktok",
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Communications :: Chat",
+  "Topic :: Multimedia :: Video",
+]
+
+[project.urls]
+Homepage = "https://github.com/gazzy-source/all-media-downloader"
+Documentation = "https://github.com/gazzy-source/all-media-downloader#readme"
+Issues = "https://github.com/gazzy-source/all-media-downloader/issues"
+
+[tool.setuptools.packages.find]
+include = ["bot*"]

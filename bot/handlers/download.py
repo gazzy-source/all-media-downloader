@@ -174,12 +174,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith("again:"):
-        url = data[6:]
-        # Fabricate a mini update flow
-        class _Fake:
-            pass
+        from bot.services.url_tokens import get_url
 
-        # Re-use message
+        token = data[6:].strip()
+        url = get_url(token, user_id)
+        if not url:
+            # Legacy / expired: maybe raw URL was embedded (old builds)
+            if token.startswith("http"):
+                url = token
+            else:
+                await query.answer(
+                    "Link expired. Please paste the URL again.",
+                    show_alert=True,
+                )
+                return
         await query.message.reply_text(  # type: ignore[union-attr]
             f"🔄 Re-analyzing…\n<code>{_esc(url[:100])}</code>",
             parse_mode=ParseMode.HTML,
@@ -471,7 +479,8 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         pass
 
     caption = _build_caption(session, result, size)
-    actions = after_download_keyboard(session.url)
+    # Short token only — full URLs exceed Telegram's 64-byte callback_data limit
+    actions = after_download_keyboard(session.url, user_id=session.user_id)
 
     try:
         if size > MAX_FILE_SIZE_BYTES:

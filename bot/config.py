@@ -77,28 +77,42 @@ SUPPORTED_PLATFORMS = [
     ("VK", "vk.com, vk.video"),
 ]
 
+# Format chains always end with broad fallbacks — IG/FB/TikTok often only expose
+# progressive files without height tags, so strict height filters alone fail.
 QUALITY_MAP = {
     "480": {
         "label": "480p",
         "height": 480,
-        "format": "bv*[height<=480]+ba/b[height<=480]/best[height<=480]",
+        "format": (
+            "bv*[height<=480]+ba/b[height<=480]/"
+            "best[height<=480]/bestvideo*+bestaudio/best"
+        ),
     },
     "720": {
         "label": "720p",
         "height": 720,
-        "format": "bv*[height<=720]+ba/b[height<=720]/best[height<=720]",
+        "format": (
+            "bv*[height<=720]+ba/b[height<=720]/"
+            "best[height<=720]/bestvideo*+bestaudio/best"
+        ),
     },
     "1080": {
         "label": "1080p",
         "height": 1080,
-        "format": "bv*[height<=1080]+ba/b[height<=1080]/best[height<=1080]",
+        "format": (
+            "bv*[height<=1080]+ba/b[height<=1080]/"
+            "best[height<=1080]/bestvideo*+bestaudio/best"
+        ),
     },
     "max": {
         "label": "Max Quality",
         "height": 9999,
-        "format": "bv*+ba/b",
+        "format": "bestvideo*+bestaudio/best/bv*+ba/b",
     },
 }
+
+# Ultra-safe fallback when a site rejects the quality selector
+FORMAT_FALLBACK = "bestvideo*+bestaudio/best/bestvideo/bestaudio/best"
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)

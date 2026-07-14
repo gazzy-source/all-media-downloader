@@ -18,12 +18,23 @@ _UA = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-# Strong video signals in HTML / JSON embeds
+# Strong video signals only (avoid generic page JS false positives like "videos")
 _VIDEO_RE = re.compile(
-    r"(?:pinimg\.com/videos|v\.pinimg\.com|\.mp4(?:\?|\")|"
-    r'"video_list"|V_\d+P|isVideo["\']?\s*:\s*true|'
-    r'"@type"\s*:\s*"VideoObject"|property=["\']og:video|'
-    r'content=["\']video["\']|video/mp4|m3u8)',
+    r"(?:"
+    r"pinimg\.com/videos/"
+    r"|v\.pinimg\.com/"
+    r'|"video_list"\s*:\s*\{'
+    r'|"V_(?:HLS|720P|540P|480P|360P)"\s*:\s*\{'
+    r'|isVideo"\s*:\s*true'
+    r'|"@type"\s*:\s*"VideoObject"'
+    r'|property=["\']og:video(?::secure_url|:url)?["\']\s+content=["\']https?://'
+    r"|https?://[^\"'\s>]+\.mp4(?:\?|\"|')"
+    r")",
+    re.I,
+)
+
+_IMAGE_PIN_RE = re.compile(
+    r"i\.pinimg\.com/(?:originals|736x|564x)/[a-f0-9/._-]+\.(?:jpg|jpeg|png|webp|gif)",
     re.I,
 )
 
@@ -93,12 +104,17 @@ def _detect_pinterest(url: str) -> str:
     if not html:
         # Unknown — video first; downloader falls back to image if needed
         return "video"
-    if _VIDEO_RE.search(html):
-        logger.info("Pinterest pin detected as VIDEO: %s", url[:80])
+    has_video = bool(_VIDEO_RE.search(html))
+    has_image = bool(_IMAGE_PIN_RE.search(html))
+    if has_video and not has_image:
+        logger.info("Pinterest pin VIDEO: %s", url[:80])
         return "video"
-    # pinimg originals without video signals → image
-    if re.search(r"i\.pinimg\.com/(?:originals|736x|564x)/", html, re.I):
-        logger.info("Pinterest pin detected as IMAGE: %s", url[:80])
+    if has_video and has_image:
+        # Video pins also embed poster images — prefer video
+        logger.info("Pinterest pin VIDEO(+poster): %s", url[:80])
+        return "video"
+    if has_image:
+        logger.info("Pinterest pin IMAGE: %s", url[:80])
         return "image"
     return "video"
 

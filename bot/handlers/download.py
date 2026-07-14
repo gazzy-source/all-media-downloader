@@ -50,6 +50,23 @@ def _is_group_chat(update: Update) -> bool:
     return chat.type in ("group", "supergroup")
 
 
+def _url_looks_like_image_host(url: str) -> bool:
+    """Heuristic: Pinterest pins / direct image links often have no video."""
+    low = (url or "").lower()
+    if any(low.endswith(f".{e}") for e in ("jpg", "jpeg", "png", "webp", "gif")):
+        return True
+    return any(
+        h in low
+        for h in (
+            "pinterest.com/pin/",
+            "pin.it/",
+            "i.pinimg.com/",
+            "imgur.com/",
+            "i.imgur.com/",
+        )
+    )
+
+
 def _should_auto_download(update: Update) -> bool:
     if AUTO_DOWNLOAD_ALWAYS:
         return True
@@ -141,10 +158,11 @@ async def auto_download_flow(
 
     try:
         await context.bot.send_chat_action(chat.id, ChatAction.UPLOAD_DOCUMENT)
-        # Prefer video; if site is image-only downloader still falls back via format chain
+        # Prefer video; auto-falls back to image for Pinterest pins / photo posts
+        mode = "image" if _url_looks_like_image_host(url) else "video"
         result = await download_manager.download(
             url=url,
-            mode="video",
+            mode=mode,
             quality=quality,
             title_hint="media",
             progress_cb=on_progress,
@@ -193,9 +211,10 @@ async def auto_download_flow(
 
     # Minimal caption for groups
     title = _esc((result.title or "Media")[:100])
+    kind = "🖼 Image" if result.is_image else f"📐 {q_label}"
     caption = (
         f"🎬 <b>{title}</b>\n"
-        f"📐 {q_label} · 💾 {format_size(size)}\n"
+        f"{kind} · 💾 {format_size(size)}\n"
         f"⚡ All-Media Downloader · Gazzy Labs"
     )
     actions = after_download_keyboard(url, user_id=user.id)

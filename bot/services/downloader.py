@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import unquote, urlparse
 
 import yt_dlp
 
@@ -377,7 +379,7 @@ class DownloadManager:
             self.active += 1
             try:
                 loop = asyncio.get_running_loop()
-                return await loop.run_in_executor(
+                result = await loop.run_in_executor(
                     None,
                     lambda: self._download_sync(
                         url=url,
@@ -390,8 +392,44 @@ class DownloadManager:
                         loop=loop,
                     ),
                 )
+                # Auto: video request on image-only posts (Pinterest pins, etc.)
+                if (
+                    not result.success
+                    and mode == "video"
+                    and self._looks_like_image_only_error(result.error or "")
+                ):
+                    logger.info("Retrying as image download for %s", url)
+                    result = await loop.run_in_executor(
+                        None,
+                        lambda: self._download_sync(
+                            url=url,
+                            mode="image",
+                            quality=quality,
+                            subtitle_lang=subtitle_lang,
+                            audio_format=audio_format,
+                            title_hint=title_hint,
+                            progress_cb=progress_cb,
+                            loop=loop,
+                        ),
+                    )
+                return result
             finally:
                 self.active -= 1
+
+    @staticmethod
+    def _looks_like_image_only_error(err: str) -> bool:
+        low = (err or "").lower()
+        return any(
+            s in low
+            for s in (
+                "no video formats",
+                "only images are available",
+                "image-only",
+                "there is no video",
+                "no video could be found",
+                "pinterest",
+            )
+        ) and "403" not in low
 
     def _download_sync(
         self,
@@ -472,10 +510,23 @@ class DownloadManager:
                     }
                 )
             elif mode == "image":
+                # Pinterest / pure image pages: yt-dlp often cannot "download" them.
+                # Use dedicated image pipeline (og:image / pinimg / thumbnails).
+                img_result = self._download_image_page(
+                    url=url,
+                    work_dir=work_dir,
+                    title_hint=title_hint,
+                    progress_cb=progress_cb,
+                    loop=loop,
+                )
+                if img_result.success:
+                    return img_result
+                # Fall through to yt-dlp best-effort
                 opts.update(
                     {
-                        "format": FORMAT_FALLBACK,
-                        "writethumbnail": False,
+                        "format": "best",
+                        "writethumbnail": True,
+                        "skip_download": False,
                     }
                 )
             elif mode == "video_subs":
@@ -663,6 +714,153 @@ class DownloadManager:
             raise last_err
         raise RuntimeError("Download failed with all format selectors.")
 
+    def _download_image_page(
+        self,
+        url: str,
+        work_dir: Path,
+        title_hint: str,
+        progress_cb: ProgressCallback | None,
+        loop: asyncio.AbstractEventLoop,
+    ) -> DownloadResult:
+        """Download still images from pins/posts when yt-dlp has no video formats."""
+        try:
+            if progress_cb:
+                try:
+                    r = progress_cb(10, "🖼 Looking for image…")
+                    if asyncio.iscoroutine(r):
+                        asyncio.run_coroutine_threadsafe(r, loop)
+                except Exception:
+                    pass
+
+            candidates = self._discover_image_urls(url)
+            if not candidates:
+                return DownloadResult(
+                    success=False,
+                    error="No image found on this page.",
+                    mode="image",
+                )
+
+            # Prefer originals / largest
+            def rank(u: str) -> tuple[int, int]:
+                score = 0
+                lu = u.lower()
+                if "originals" in lu:
+                    score += 100
+                if "/736x/" in lu or "736x" in lu:
+                    score += 50
+                if "/564x/" in lu:
+                    score += 30
+                if lu.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                    score += 5
+                return (score, len(u))
+
+            candidates = sorted(set(candidates), key=rank, reverse=True)
+            title = title_hint or "image"
+            last_err = None
+            for img_url in candidates[:8]:
+                ext = self._guess_image_ext(img_url)
+                dest = work_dir / f"{safe_filename(title)}.{ext}"
+                if progress_cb:
+                    try:
+                        r = progress_cb(40, "🖼 Downloading image…")
+                        if asyncio.iscoroutine(r):
+                            asyncio.run_coroutine_threadsafe(r, loop)
+                    except Exception:
+                        pass
+                path = self._fetch_url_file(img_url, dest)
+                if path and path.stat().st_size > 500:
+                    size = path.stat().st_size
+                    return DownloadResult(
+                        success=True,
+                        files=[path],
+                        primary=path,
+                        title=title[:200],
+                        mode="image",
+                        file_size=size,
+                        is_image=True,
+                    )
+                last_err = f"Could not fetch {img_url[:80]}"
+            return DownloadResult(
+                success=False,
+                error=last_err or "Image download failed.",
+                mode="image",
+            )
+        except Exception as e:
+            logger.exception("image page download failed")
+            return DownloadResult(success=False, error=str(e)[:300], mode="image")
+
+    def _discover_image_urls(self, page_url: str) -> list[str]:
+        """Find direct image URLs from a social/image page (Pinterest, etc.)."""
+        found: list[str] = []
+        # Direct image link
+        if any(page_url.lower().endswith(f".{e}") for e in IMAGE_EXTS):
+            return [page_url]
+
+        html = self._fetch_text(page_url)
+        if not html:
+            return found
+
+        patterns = [
+            r'property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+            r'content=["\']([^"\']+)["\']\s+property=["\']og:image["\']',
+            r'property=["\']og:image:secure_url["\']\s+content=["\']([^"\']+)["\']',
+            r'"image_spec_url"\s*:\s*"([^"]+)"',
+            r'"url"\s*:\s*"(https://i\.pinimg\.com/originals/[^"]+)"',
+            r'(https://i\.pinimg\.com/originals/[a-f0-9/._-]+\.(?:jpg|jpeg|png|webp|gif))',
+            r'(https://i\.pinimg\.com/(?:736x|564x|474x|236x)/[a-f0-9/._-]+\.(?:jpg|jpeg|png|webp|gif))',
+            r'(https://[^"\'\s>]+\.(?:jpg|jpeg|png|webp|gif)(?:\?[^"\'\s>]*)?)',
+        ]
+        for pat in patterns:
+            for m in re.findall(pat, html, flags=re.I):
+                u = unquote(m.replace("\\u002F", "/").replace("\\/", "/"))
+                u = u.split(")")[0].split("}")[0].rstrip("\\")
+                if not u.startswith("http"):
+                    continue
+                # Skip tiny icons / tracking
+                low = u.lower()
+                if any(x in low for x in ("favicon", "sprite", "logo", "1x1", "pixel")):
+                    continue
+                if "pinimg.com" in low or "og:image" in pat or low.endswith(
+                    (".jpg", ".jpeg", ".png", ".webp", ".gif")
+                ):
+                    found.append(u)
+
+        # Prefer pinimg originals uniquely
+        pin_orig = [u for u in found if "pinimg.com/originals/" in u]
+        if pin_orig:
+            return pin_orig
+        return found
+
+    def _fetch_text(self, url: str) -> str | None:
+        try:
+            import urllib.request
+
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                return resp.read().decode("utf-8", "replace")
+        except Exception:
+            logger.exception("Failed to fetch page %s", url)
+            return None
+
+    @staticmethod
+    def _guess_image_ext(url: str) -> str:
+        path = urlparse(url).path.lower()
+        for e in ("jpg", "jpeg", "png", "webp", "gif"):
+            if path.endswith("." + e):
+                return "jpg" if e == "jpeg" else e
+        return "jpg"
+
     def _fetch_url_file(self, url: str, dest: Path) -> Path | None:
         try:
             import urllib.request
@@ -670,7 +868,13 @@ class DownloadManager:
             req = urllib.request.Request(
                 url,
                 headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0 Safari/537.36"
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                    "Referer": "https://www.pinterest.com/",
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
                 },
             )
             with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:
@@ -705,8 +909,12 @@ class DownloadManager:
                 "That quality/format isn't offered for this link. "
                 "Try Max quality, or Video again — the bot will auto-fallback."
             )
-        if "only images are available" in low:
-            return "This post is image-only. Choose the Image download option."
+        if "only images are available" in low or "no video formats" in low:
+            return (
+                "No video on this link (likely an image post). "
+                "The bot will retry as image automatically; "
+                "in private chat pick 🖼 Image."
+            )
         if "geo" in low or "region" in low or "not available in your country" in low:
             return "This media is blocked in the server's region."
         if "unavailable" in low or "has been removed" in low or "video is not available" in low:

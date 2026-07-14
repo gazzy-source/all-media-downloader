@@ -419,17 +419,22 @@ class DownloadManager:
     @staticmethod
     def _looks_like_image_only_error(err: str) -> bool:
         low = (err or "").lower()
+        if "403" in low or "forbidden" in low:
+            return False
         return any(
             s in low
             for s in (
                 "no video formats",
+                "no video on this link",
+                "likely an image",
                 "only images are available",
                 "image-only",
                 "there is no video",
                 "no video could be found",
+                "no image found",
                 "pinterest",
             )
-        ) and "403" not in low
+        )
 
     def _download_sync(
         self,

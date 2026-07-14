@@ -17,6 +17,7 @@ from bot.config import (
     AUTO_DOWNLOAD_ALWAYS,
     AUTO_DOWNLOAD_GROUPS,
     AUTO_QUALITY,
+    DM_FAST_AUTO,
     MAX_FILE_SIZE_BYTES,
     QUALITY_MAP,
 )
@@ -58,6 +59,44 @@ def _should_auto_download(update: Update) -> bool:
     return AUTO_DOWNLOAD_GROUPS and _is_group_chat(update)
 
 
+def _is_fast_auto_url(url: str) -> bool:
+    """Major platforms: skip metadata wizard → download immediately."""
+    u = (url or "").lower()
+    return any(
+        x in u
+        for x in (
+            "youtu.be/",
+            "youtube.com/",
+            "music.youtube.com/",
+            "instagram.com/",
+            "instagr.am/",
+            "tiktok.com/",
+            "vm.tiktok.com/",
+            "facebook.com/",
+            "fb.watch/",
+            "fb.com/",
+            "x.com/",
+            "twitter.com/",
+            "reddit.com/",
+            "v.redd.it/",
+            "pinterest.",
+            "pin.it/",
+            "vimeo.com/",
+            "twitch.tv/",
+            "soundcloud.com/",
+        )
+    )
+
+
+def _should_fast_auto(update: Update, url: str) -> bool:
+    """Group auto, or private DM fast-path for known platforms."""
+    if _should_auto_download(update):
+        return True
+    if DM_FAST_AUTO and not _is_group_chat(update) and _is_fast_auto_url(url):
+        return True
+    return False
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message or not update.effective_user:
         return
@@ -81,12 +120,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # Groups / auto: process up to 5 links concurrently
-    if _should_auto_download(update):
-        batch = urls[:5]
-        if len(urls) > 5:
+    # Groups + DM fast-path: skip metadata wizard, download immediately
+    fast = [u for u in urls if _should_fast_auto(update, u)]
+    wizard = [u for u in urls if u not in fast]
+    if fast:
+        batch = fast[:5]
+        if len(fast) > 5:
             await update.effective_message.reply_text(
-                f"📎 {len(urls)} links — starting first <b>5</b> in parallel.",
+                f"📎 {len(fast)} links — starting first <b>5</b> in parallel.",
                 parse_mode=ParseMode.HTML,
             )
         elif len(batch) > 1:
@@ -98,15 +139,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             *[auto_download_flow(update, context, u) for u in batch],
             return_exceptions=True,
         )
-        return
-
-    if len(urls) > 1:
-        await update.effective_message.reply_text(
-            f"📎 Found <b>{len(urls)}</b> links. Starting with the first one.\n"
-            f"Send the others again after this download finishes.",
-            parse_mode=ParseMode.HTML,
-        )
-    await start_url_flow(update, context, urls[0])
+    if wizard:
+        # Unknown / rare sites still use the quality wizard (one at a time)
+        await start_url_flow(update, context, wizard[0])
+    return
 
 
 async def auto_download_flow(
@@ -155,8 +191,7 @@ async def auto_download_flow(
 
     kind = "🖼 Image" if mode == "image" else f"🎥 {q_label}"
     status = await msg.reply_text(
-        f"⚡ <b>Starting</b> · {kind}\n"
-        f"<code>{download_manager.active}/{download_manager.max_concurrent} parallel</code>",
+        f"⚡ <b>Downloading</b> · {kind}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -164,9 +199,11 @@ async def auto_download_flow(
 
     async def on_progress(pct: float, text: str) -> None:
         now = time.time()
-        is_status = pct < 5 or "Queued" in text or "Starting" in text or "Connecting" in text
-        # Light UI updates only — don't slow the download path
-        if not is_status and now - last_edit["t"] < 3.0 and pct < 95:
+        is_status = pct < 8 or any(
+            k in text for k in ("Queued", "Starting", "Resolving", "Fetching")
+        )
+        # Light UI updates — avoid Telegram flood while still feeling live
+        if not is_status and now - last_edit["t"] < 2.5 and pct < 95:
             return
         last_edit["t"] = now
         try:

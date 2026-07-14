@@ -21,12 +21,13 @@ WELCOME = f"""
 {__bot_bio__}
 
 <b>How to use</b>
-• <b>Private chat:</b> paste a link → choose format &amp; quality
-• <b>Groups:</b> paste a link → downloads automatically (best quality)
+• Paste a link → downloads instantly (video, up to 1080p)
+• Works the same in <b>DM</b> and <b>groups</b>
+• Rare sites may still open a short quality wizard
 
 <b>Pro tips</b>
 • YouTube / IG / TikTok / X / Facebook / Pinterest &amp; 1000+ sites
-• Audio · subtitles · images supported in private wizard
+• Audio / subtitles: use the wizard on non-auto sites, or ask admin
 • Bot needs to see group messages (@BotFather → /setprivacy → Disable)
 
 Just paste a link 👇

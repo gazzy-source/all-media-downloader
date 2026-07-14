@@ -51,6 +51,13 @@ AUTO_DOWNLOAD_ALWAYS: bool = os.getenv("AUTO_DOWNLOAD_ALWAYS", "0").strip() in (
     "True",
     "yes",
 )
+# Private chat: skip slow metadata wizard for major platforms (instant like groups)
+DM_FAST_AUTO: bool = os.getenv("DM_FAST_AUTO", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "no",
+)
 AUTO_QUALITY: str = (os.getenv("AUTO_QUALITY", "1080") or "1080").strip().lower()
 if AUTO_QUALITY not in ("480", "720", "1080", "max"):
     AUTO_QUALITY = "1080"

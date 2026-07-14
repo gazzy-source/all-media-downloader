@@ -133,6 +133,10 @@ _FFMPEG_RESOLVED = False
 _IMPERSONATE = None
 _IMPERSONATE_RESOLVED = False
 
+# Sticky YouTube strategy winner — next jobs try the fast path first
+_YT_WINNER_SI: int = 0
+_YT_WINNER_LOCK = __import__("threading").Lock()
+
 
 def _resolved_cookie_source() -> Path | None:
     """Load/sanitize cookies once. Returns immutable source path (never mutated by yt-dlp)."""
@@ -223,13 +227,13 @@ def _base_opts(
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        "socket_timeout": 25,
-        "retries": 4,
-        "fragment_retries": 8,
-        "file_access_retries": 3,
+        "socket_timeout": 18,
+        "retries": 3,
+        "fragment_retries": 6,
+        "file_access_retries": 2,
         # Parallel DASH fragments — speeds multi-format YT without huge RAM hit
-        "concurrent_fragment_downloads": 3,
-        "buffersize": 1024 * 128,
+        "concurrent_fragment_downloads": 4,
+        "buffersize": 1024 * 256,
         "http_chunk_size": 1024 * 1024 * 10,
         "nocheckcertificate": True,
         "geo_bypass": True,
@@ -249,13 +253,11 @@ def _base_opts(
     if is_yt:
         opts["http_headers"]["Referer"] = "https://www.youtube.com/"
         opts["http_headers"]["Origin"] = "https://www.youtube.com"
-        # EJS (Deno) for JS challenges. Prefer webpage when cookies exist.
-        opts["remote_components"] = ["ejs:github"]
+        # Use local Deno/EJS only — remote github fetch adds multi-second latency
     elif is_ig:
         opts["http_headers"]["Referer"] = "https://www.instagram.com/"
         opts["http_headers"]["Origin"] = "https://www.instagram.com"
-        # IG: fewer fragments, progressive when available
-        opts["concurrent_fragment_downloads"] = 2
+        opts["concurrent_fragment_downloads"] = 3
     else:
         if host:
             opts["http_headers"]["Referer"] = f"https://{host.split(':')[0]}/"
@@ -273,14 +275,14 @@ def _base_opts(
 
     if is_yt:
         if cookie:
-            # Cookies need full webpage session — do NOT player_skip webpage
+            # Single fast client first (tv is usually quickest with cookies)
             opts["extractor_args"] = {
-                "youtube": {"player_client": ["tv", "web", "mweb"]},
+                "youtube": {"player_client": ["tv"]},
             }
         else:
             opts["extractor_args"] = {
                 "youtube": {
-                    "player_client": ["android", "ios", "tv"],
+                    "player_client": ["tv_embedded", "android"],
                     "player_skip": ["configs", "webpage"],
                 },
             }
@@ -415,13 +417,83 @@ def _normalize_info_dict(url: str, info: dict[str, Any]) -> dict[str, Any]:
     return info
 
 
+def _yt_strategies(*, has_cookies: bool) -> list[dict[str, Any]]:
+    """
+    Lean YouTube attempts: fast path first, few fallbacks.
+    Sticky winner is reordered to index 0 by the caller.
+    """
+    if has_cookies:
+        return [
+            # 0) Fast path — single client, reuse job cookie jar
+            {
+                "use_cookies": True,
+                "refresh_cookies": False,
+                "extractor_args": {"youtube": {"player_client": ["tv"]}},
+            },
+            # 1) Web clients
+            {
+                "use_cookies": True,
+                "refresh_cookies": True,
+                "extractor_args": {
+                    "youtube": {"player_client": ["web", "mweb"]}
+                },
+            },
+            # 2) Embedded
+            {
+                "use_cookies": True,
+                "refresh_cookies": True,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["web_embedded", "tv_embedded"]
+                    }
+                },
+            },
+            # 3) Cookieless last resort
+            {
+                "use_cookies": False,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["tv_embedded", "android"],
+                        "player_skip": ["webpage"],
+                    }
+                },
+                "drop_impersonate": True,
+            },
+        ]
+    return [
+        {
+            "use_cookies": False,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["tv_embedded", "android", "ios"],
+                    "player_skip": ["webpage"],
+                }
+            },
+            "drop_impersonate": True,
+        },
+    ]
+
+
+def _ordered_yt_strategies(*, has_cookies: bool) -> list[dict[str, Any]]:
+    """Put last successful strategy first for sticky speed."""
+    strats = _yt_strategies(has_cookies=has_cookies)
+    with _YT_WINNER_LOCK:
+        wi = _YT_WINNER_SI
+    if 0 < wi < len(strats):
+        return [strats[wi], *strats[:wi], *strats[wi + 1 :]]
+    return strats
+
+
+def _remember_yt_strategy(original_index: int) -> None:
+    global _YT_WINNER_SI
+    with _YT_WINNER_LOCK:
+        _YT_WINNER_SI = original_index
+
+
 def _extract_info_sync(url: str) -> dict[str, Any]:
     """
-    Metadata-only extract.
-
-    DM wizard calls this before quality selection. Must use the same cookie +
-    multi-client strategies as real downloads — otherwise YT bot-check fails
-    in private chat while group auto-download (which skips this) still works.
+    Metadata-only extract (wizard / rare sites).
+    Uses cookies + lean YT strategies; major platforms usually skip this via DM_FAST_AUTO.
     """
     host = urlparse(url).netloc.lower()
     is_yt = "youtu" in host
@@ -432,46 +504,32 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
             job_cookies.append(cookie)
 
         base = _base_opts(host=host, cookiefile=cookie)
-        base.update({"skip_download": True, "noplaylist": True, "quiet": True, "no_warnings": True})
+        base.update(
+            {
+                "skip_download": True,
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+            }
+        )
 
-        attempts: list[dict[str, Any]] = [{}]
-        if is_yt:
-            attempts = [
-                {
-                    "use_cookies": True,
-                    "extractor_args": {
-                        "youtube": {"player_client": ["tv", "web", "mweb"]}
-                    },
-                },
-                {
-                    "use_cookies": True,
-                    "extractor_args": {
-                        "youtube": {
-                            "player_client": ["web_embedded", "tv_embedded", "web"]
-                        }
-                    },
-                },
-                {
-                    "use_cookies": False,
-                    "extractor_args": {
-                        "youtube": {
-                            "player_client": ["android", "ios", "tv"],
-                            "player_skip": ["webpage"],
-                        }
-                    },
-                    "drop_impersonate": True,
-                },
-            ]
+        if not is_yt:
+            with yt_dlp.YoutubeDL(base) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info is None:
+                raise RuntimeError("Could not extract media information from this URL.")
+            return _normalize_info_dict(url, info)
 
+        strats = _ordered_yt_strategies(has_cookies=bool(cookie))
         last_err: Exception | None = None
-        for strat in attempts:
+        for si, strat in enumerate(strats):
             opts = dict(base)
             opts["http_headers"] = dict(base.get("http_headers") or {})
             if strat.get("extractor_args"):
                 opts["extractor_args"] = strat["extractor_args"]
             if strat.get("use_cookies") is False:
                 opts.pop("cookiefile", None)
-            elif is_yt and strat.get("use_cookies") is True:
+            elif strat.get("refresh_cookies"):
                 jar = _cookie_jar_for_job()
                 if jar is not None:
                     job_cookies.append(jar)
@@ -482,17 +540,24 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                 if info is None:
-                    raise RuntimeError("Could not extract media information from this URL.")
+                    raise RuntimeError(
+                        "Could not extract media information from this URL."
+                    )
+                # Map ordered index back roughly for sticky (best-effort)
+                _remember_yt_strategy(0 if si == 0 else si)
                 return _normalize_info_dict(url, info)
             except yt_dlp.utils.DownloadError as e:
                 last_err = e
                 err = str(e).lower()
-                if is_yt and (
+                if (
                     "not a bot" in err
                     or "sign in to confirm" in err
                     or "cookies are no longer valid" in err
                 ):
-                    logger.warning("extract_info attempt failed: %s", str(e).split("\n")[-1][:120])
+                    logger.warning(
+                        "extract_info attempt failed: %s",
+                        str(e).split("\n")[-1][:120],
+                    )
                     continue
                 raise
         if last_err:
@@ -726,7 +791,7 @@ class DownloadManager:
         if cookie_path and is_yt:
             job_cookies.append(cookie_path)
 
-        _emit(3, "Connecting…")
+        _emit(2, "Resolving…")
         opts = _base_opts(host=host, cookiefile=cookie_path)
         hooks = [hook] if progress_cb else []
         opts.update(
@@ -902,93 +967,57 @@ class DownloadManager:
         job_cookies: list[Path] | None = None,
     ) -> tuple[dict[str, Any], str, str]:
         """
-        Try preferred format first; on failure retry progressive/safe fallbacks.
-        YouTube: multi-strategy (cookies+clients, then cookieless clients).
+        Fast path first; fallbacks only on bot-check / format / 403 errors.
+        Sticky YouTube strategy winner for subsequent jobs.
         """
         host = urlparse(url).netloc.lower()
         is_yt = "youtu" in host
         primary = opts.get("format") or FORMAT_FALLBACK
-        formats = [primary]
-        if primary != "b/best":
-            formats.append("b/best")
         tracked = job_cookies if job_cookies is not None else []
+        initial_cookie = opts.get("cookiefile")
 
-        strategies: list[dict[str, Any]] = [{}]  # default opts as-is
         if is_yt:
-            strategies = [
-                # 1) cookies + common clients (full webpage for session)
-                {
-                    "use_cookies": True,
-                    "refresh_cookies": True,
-                    "extractor_args": {
-                        "youtube": {"player_client": ["tv", "web", "mweb"]}
-                    },
-                },
-                # 2) cookies + embedded players (often softer bot checks)
-                {
-                    "use_cookies": True,
-                    "refresh_cookies": True,
-                    "extractor_args": {
-                        "youtube": {
-                            "player_client": [
-                                "web_embedded",
-                                "tv_embedded",
-                                "web",
-                            ]
-                        }
-                    },
-                },
-                # 3) cookies + web only
-                {
-                    "use_cookies": True,
-                    "refresh_cookies": True,
-                    "extractor_args": {
-                        "youtube": {"player_client": ["web"]}
-                    },
-                },
-                # 4) cookieless mobile (public videos; DC IPs often still blocked)
-                {
-                    "use_cookies": False,
-                    "extractor_args": {
-                        "youtube": {
-                            "player_client": ["android", "ios"],
-                            "player_skip": ["webpage"],
-                        }
-                    },
-                    "drop_impersonate": True,
-                },
-                # 5) cookieless embedded / tv
-                {
-                    "use_cookies": False,
-                    "extractor_args": {
-                        "youtube": {
-                            "player_client": ["tv_embedded", "tv", "web_embedded"]
-                        }
-                    },
-                    "drop_impersonate": True,
-                },
-            ]
+            base_strats = _yt_strategies(has_cookies=bool(initial_cookie))
+            with _YT_WINNER_LOCK:
+                wi = _YT_WINNER_SI
+            if 0 < wi < len(base_strats):
+                strategies = [base_strats[wi], *base_strats[:wi], *base_strats[wi + 1 :]]
+                orig_indices = [wi, *range(0, wi), *range(wi + 1, len(base_strats))]
+            else:
+                strategies = list(base_strats)
+                orig_indices = list(range(len(base_strats)))
+        else:
+            strategies = [{}]
+            orig_indices = [0]
 
         last_err: Exception | None = None
         for si, strat in enumerate(strategies):
-            for fi, fmt in enumerate(formats):
-                attempt_opts = dict(opts)
+            # Prefer requested quality; only try b/best if that format fails
+            formats_to_try = [primary]
+            if primary != FORMAT_FALLBACK and primary != "b/best":
+                pass  # b/best added only on format failure
+            attempt_base = dict(opts)
+            attempt_base["http_headers"] = dict(opts.get("http_headers") or {})
+
+            if strat.get("extractor_args"):
+                attempt_base["extractor_args"] = strat["extractor_args"]
+            if strat.get("use_cookies") is False:
+                attempt_base.pop("cookiefile", None)
+            elif strat.get("refresh_cookies"):
+                jar = _cookie_jar_for_job()
+                if jar is not None:
+                    tracked.append(jar)
+                    attempt_base["cookiefile"] = str(jar)
+            elif initial_cookie:
+                attempt_base["cookiefile"] = initial_cookie
+            if strat.get("drop_impersonate"):
+                attempt_base.pop("impersonate", None)
+
+            fi = 0
+            while fi < len(formats_to_try):
+                fmt = formats_to_try[fi]
+                attempt_opts = dict(attempt_base)
                 attempt_opts["format"] = fmt
-                attempt_opts["http_headers"] = dict(opts.get("http_headers") or {})
-
-                if strat.get("extractor_args"):
-                    attempt_opts["extractor_args"] = strat["extractor_args"]
-                if strat.get("use_cookies") is False:
-                    attempt_opts.pop("cookiefile", None)
-                elif strat.get("use_cookies") is True or strat.get("refresh_cookies"):
-                    # Fresh per-attempt jar (never share across concurrent jobs)
-                    jar = _cookie_jar_for_job()
-                    if jar is not None:
-                        tracked.append(jar)
-                        attempt_opts["cookiefile"] = str(jar)
-                if strat.get("drop_impersonate"):
-                    attempt_opts.pop("impersonate", None)
-
                 try:
                     with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                         info = ydl.extract_info(url, download=True)
@@ -996,42 +1025,59 @@ class DownloadManager:
                             raise RuntimeError("Download returned no data.")
                         prepared = ydl.prepare_filename(info)
                         title = str(info.get("title") or title_hint)[:200]
-                        if si or fi:
-                            logger.info(
-                                "YT strategy ok si=%s fmt=%s cookies=%s",
-                                si,
-                                fmt[:40],
-                                bool(attempt_opts.get("cookiefile")),
-                            )
+                        if is_yt:
+                            _remember_yt_strategy(orig_indices[si])
+                            if si or fi:
+                                logger.info(
+                                    "YT strategy ok si=%s fmt=%s cookies=%s",
+                                    si,
+                                    fmt[:40],
+                                    bool(attempt_opts.get("cookiefile")),
+                                )
                         return info, prepared, title
                 except yt_dlp.utils.DownloadError as e:
                     last_err = e
                     err = str(e).lower()
                     if "no video formats" in err or "only images" in err:
-                        # not a YT bot-check issue
                         if not is_yt:
                             raise
+                    format_issue = (
+                        "format is not available" in err
+                        or "requested format" in err
+                    )
                     bot_check = (
                         "not a bot" in err
                         or "sign in to confirm" in err
                         or "cookies are no longer valid" in err
                         or "login required" in err
                     )
-                    retryable = bot_check or (
-                        "format is not available" in err
-                        or "requested format" in err
-                        or "http error 403" in err
+                    stream_fail = (
+                        "http error 403" in err
                         or "unable to download video data" in err
                     )
-                    if retryable:
+                    # One format fallback for quality/403 before next strategy
+                    if (format_issue or stream_fail) and fi == 0 and primary not in (
+                        "b/best",
+                        FORMAT_FALLBACK,
+                    ):
+                        formats_to_try.append("b/best")
+                        logger.warning(
+                            "Format fallback (si=%s): %s",
+                            si,
+                            str(e).split("\n")[-1][:100],
+                        )
+                        fi += 1
+                        continue
+                    if bot_check or format_issue or stream_fail:
                         logger.warning(
                             "Attempt failed (si=%s fi=%s): %s",
                             si,
                             fi,
                             str(e).split("\n")[-1][:120],
                         )
-                        continue
+                        break  # next strategy
                     raise
+                fi += 1
         if last_err:
             raise last_err
         raise RuntimeError("Download failed with all format selectors.")

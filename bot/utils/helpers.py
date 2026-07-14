@@ -41,8 +41,39 @@ def extract_urls(text: str) -> list[str]:
     for u in found:
         if u not in seen:
             seen.add(u)
-            out.append(u)
+            out.append(_expand_short_url(u))
     return out
+
+
+def _expand_short_url(url: str) -> str:
+    """Resolve pin.it / tiny redirects quickly (one HEAD/GET, short timeout)."""
+    low = url.lower()
+    if "pin.it/" not in low and "t.co/" not in low and "bit.ly/" not in low:
+        return url
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(
+            url,
+            method="HEAD",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            final = resp.geturl()
+            if final and final.startswith("http"):
+                return final
+    except Exception:
+        try:
+            import urllib.request
+
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                final = resp.geturl()
+                if final and final.startswith("http"):
+                    return final
+        except Exception:
+            pass
+    return url
 
 
 def is_likely_url(text: str) -> bool:

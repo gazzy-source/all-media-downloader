@@ -28,7 +28,8 @@ def _read_json(path: Path, default: Any) -> Any:
 def _write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    # compact JSON = less disk I/O on small VPS
+    tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     tmp.replace(path)
 
 
@@ -43,16 +44,46 @@ def record_download(
     file_size: int | None = None,
     error: str | None = None,
 ) -> None:
+    """Fire-and-forget disk write so Telegram upload path isn't blocked."""
+    threading.Thread(
+        target=_record_download_sync,
+        kwargs={
+            "user_id": user_id,
+            "url": url,
+            "title": title,
+            "platform": platform,
+            "mode": mode,
+            "quality": quality,
+            "success": success,
+            "file_size": file_size,
+            "error": error,
+        },
+        daemon=True,
+        name="history-write",
+    ).start()
+
+
+def _record_download_sync(
+    user_id: int,
+    url: str,
+    title: str,
+    platform: str,
+    mode: str,
+    quality: str | None,
+    success: bool,
+    file_size: int | None = None,
+    error: str | None = None,
+) -> None:
     entry = {
         "ts": time.time(),
         "url": url,
-        "title": title[:200],
+        "title": (title or "")[:200],
         "platform": platform,
         "mode": mode,
         "quality": quality,
         "success": success,
         "file_size": file_size,
-        "error": error,
+        "error": (error or "")[:300] if error else None,
     }
     with _lock:
         hist = _read_json(_HISTORY_FILE, {})

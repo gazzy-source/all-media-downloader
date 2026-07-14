@@ -100,7 +100,10 @@ async def post_init(app: Application) -> None:
     logger.info("Logged in as @%s (id=%s)", me.username, me.id)
     logger.info("Admins: %s", ADMIN_IDS or "(none)")
     logger.info("FFmpeg: %s", ff if ff else "NOT FOUND")
-    logger.info("Cookies: %s", COOKIES_FILE if COOKIES_FILE else "none")
+    from bot.services.downloader import _resolved_cookie
+
+    ck = _resolved_cookie()
+    logger.info("Cookies: %s", ck if ck else "none")
     logger.info("Telegram API: %s", TELEGRAM_API_URL or "https://api.telegram.org (default)")
     logger.info("=" * 50)
 

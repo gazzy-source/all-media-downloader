@@ -138,19 +138,27 @@ def _resolved_cookie() -> Path | None:
     if _COOKIE_RESOLVED:
         return _COOKIE_PATH
     _COOKIE_RESOLVED = True
-    candidates = []
+    from bot.utils.cookies import prepare_cookies
+
+    candidates: list[Path] = []
     if COOKIES_FILE:
         candidates.append(Path(COOKIES_FILE))
         candidates.append(BASE_DIR / COOKIES_FILE)
     candidates.append(BASE_DIR / "cookies.txt")
     candidates.append(Path("cookies.txt"))
-    for p in candidates:
-        try:
-            if p.is_file():
-                _COOKIE_PATH = p.resolve()
-                break
-        except OSError:
-            continue
+    # Sanitized jar: fewer domains → faster + more reliable yt-dlp
+    dest = BASE_DIR / "data" / "cookies.sanitized.txt"
+    filtered = prepare_cookies(candidates, dest)
+    if filtered:
+        _COOKIE_PATH = filtered
+    else:
+        for p in candidates:
+            try:
+                if p.is_file():
+                    _COOKIE_PATH = p.resolve()
+                    break
+            except OSError:
+                continue
     return _COOKIE_PATH
 
 
@@ -213,19 +221,23 @@ def _base_opts(*, host: str = "") -> dict[str, Any]:
     if is_yt:
         opts["http_headers"]["Referer"] = "https://www.youtube.com/"
         opts["http_headers"]["Origin"] = "https://www.youtube.com"
-        # tv first (fast + works with cookies); web as backup client in same extract
+        # Minimal clients for speed; EJS (Deno) still used for JS challenges
         opts["extractor_args"] = {
             "youtube": {
                 "player_client": ["tv", "web"],
-                "player_skip": ["configs"],
+                "player_skip": ["configs", "webpage"],
             },
         }
+        # Only request remote EJS if package scripts missing (set once globally cheaper)
         opts["remote_components"] = ["ejs:github"]
     elif is_ig:
         opts["http_headers"]["Referer"] = "https://www.instagram.com/"
-        # Instagram: keep it simple — no multi-client thrash
+        opts["http_headers"]["Origin"] = "https://www.instagram.com"
+        # IG: fewer fragments, progressive when available
+        opts["concurrent_fragment_downloads"] = 2
     else:
-        opts["http_headers"]["Referer"] = f"https://{host}/" if host else "https://www.google.com/"
+        if host:
+            opts["http_headers"]["Referer"] = f"https://{host.split(':')[0]}/"
 
     cookie = _resolved_cookie()
     if cookie:
@@ -593,11 +605,19 @@ class DownloadManager:
                         ],
                     }
                 )
-            else:  # video — no FFmpegMetadata (saves CPU); merge only if needed
+            else:  # video — progressive-first; merge only when needed
                 q = QUALITY_MAP.get(quality, QUALITY_MAP["1080"])
+                fmt = q["format"]
+                # Instagram: single best under cap (reels rarely need multi-format)
+                if "instagram" in host or "instagr.am" in host:
+                    h = q.get("height", 1080)
+                    if h >= 9999:
+                        fmt = "b/best"
+                    else:
+                        fmt = f"b[height<={h}]/best"
                 opts.update(
                     {
-                        "format": q["format"],
+                        "format": fmt,
                         "merge_output_format": "mp4",
                     }
                 )

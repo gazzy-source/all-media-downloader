@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import time
 from pathlib import Path
 
@@ -156,3 +157,26 @@ def prepare_cookies(src_candidates: list[Path], dest: Path) -> Path | None:
         except OSError:
             continue
     return None
+
+
+def make_runtime_cookie_copy(source: Path, runtime: Path) -> Path | None:
+    """
+    Copy sanitized jar to a writable runtime file for yt-dlp.
+
+    yt-dlp rewrites cookiefile in-place and can strip LOGIN_INFO after a failed
+    auth challenge. Always keep `cookies.txt` / sanitized as the immutable source
+    and hand yt-dlp a disposable runtime copy.
+    """
+    try:
+        if not source.is_file() or source.stat().st_size < 50:
+            return None
+        runtime.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, runtime)
+        try:
+            runtime.chmod(0o600)
+        except OSError:
+            pass
+        return runtime
+    except OSError as e:
+        logger.warning("Cannot create runtime cookies from %s: %s", source, e)
+        return None

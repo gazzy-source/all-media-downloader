@@ -15,6 +15,7 @@ from urllib.parse import unquote, urlparse
 import yt_dlp
 
 from bot.config import (
+    BASE_DIR,
     COOKIES_FILE,
     FORMAT_FALLBACK,
     MAX_CONCURRENT_DOWNLOADS,
@@ -137,10 +138,19 @@ def _resolved_cookie() -> Path | None:
     if _COOKIE_RESOLVED:
         return _COOKIE_PATH
     _COOKIE_RESOLVED = True
-    if COOKIES_FILE and Path(COOKIES_FILE).exists():
-        _COOKIE_PATH = Path(COOKIES_FILE).resolve()
-    elif Path("cookies.txt").is_file():
-        _COOKIE_PATH = Path("cookies.txt").resolve()
+    candidates = []
+    if COOKIES_FILE:
+        candidates.append(Path(COOKIES_FILE))
+        candidates.append(BASE_DIR / COOKIES_FILE)
+    candidates.append(BASE_DIR / "cookies.txt")
+    candidates.append(Path("cookies.txt"))
+    for p in candidates:
+        try:
+            if p.is_file():
+                _COOKIE_PATH = p.resolve()
+                break
+        except OSError:
+            continue
     return _COOKIE_PATH
 
 
@@ -201,14 +211,13 @@ def _base_opts(*, host: str = "") -> dict[str, Any]:
     if is_yt:
         opts["http_headers"]["Referer"] = "https://www.youtube.com/"
         opts["http_headers"]["Origin"] = "https://www.youtube.com"
-        # Single client = fewer API round-trips (tv works well with cookies+deno)
+        # tv first (fast + works with cookies); web as backup client in same extract
         opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["tv"],
-                "player_skip": ["webpage", "configs"],
+                "player_client": ["tv", "web"],
+                "player_skip": ["configs"],
             },
         }
-        # EJS scripts already installed via yt_dlp_ejs — only fetch if missing
         opts["remote_components"] = ["ejs:github"]
     elif is_ig:
         opts["http_headers"]["Referer"] = "https://www.instagram.com/"
@@ -336,7 +345,7 @@ def _subtitle_langs(info: dict[str, Any]) -> list[str]:
 
 
 def _extract_info_sync(url: str) -> dict[str, Any]:
-    opts = _base_opts()
+    opts = _base_opts(host=urlparse(url).netloc.lower())
     opts.update(
         {
             "skip_download": True,

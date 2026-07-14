@@ -400,19 +400,8 @@ def _subtitle_langs(info: dict[str, Any]) -> list[str]:
     return ordered
 
 
-def _extract_info_sync(url: str) -> dict[str, Any]:
-    opts = _base_opts(host=urlparse(url).netloc.lower())
-    opts.update(
-        {
-            "skip_download": True,
-            "noplaylist": True,
-        }
-    )
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-    if info is None:
-        raise RuntimeError("Could not extract media information from this URL.")
-    # Playlist → take first entry for preview (we download single by default)
+def _normalize_info_dict(url: str, info: dict[str, Any]) -> dict[str, Any]:
+    """Playlist → first entry preview; otherwise return info as-is."""
     if info.get("_type") == "playlist":
         entries = [e for e in (info.get("entries") or []) if e]
         if not entries:
@@ -424,6 +413,98 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
         first["_playlist_url"] = info.get("webpage_url") or url
         return first
     return info
+
+
+def _extract_info_sync(url: str) -> dict[str, Any]:
+    """
+    Metadata-only extract.
+
+    DM wizard calls this before quality selection. Must use the same cookie +
+    multi-client strategies as real downloads — otherwise YT bot-check fails
+    in private chat while group auto-download (which skips this) still works.
+    """
+    host = urlparse(url).netloc.lower()
+    is_yt = "youtu" in host
+    job_cookies: list[Path] = []
+    try:
+        cookie = _cookie_jar_for_job() if is_yt else _resolved_cookie_source()
+        if cookie and is_yt:
+            job_cookies.append(cookie)
+
+        base = _base_opts(host=host, cookiefile=cookie)
+        base.update({"skip_download": True, "noplaylist": True, "quiet": True, "no_warnings": True})
+
+        attempts: list[dict[str, Any]] = [{}]
+        if is_yt:
+            attempts = [
+                {
+                    "use_cookies": True,
+                    "extractor_args": {
+                        "youtube": {"player_client": ["tv", "web", "mweb"]}
+                    },
+                },
+                {
+                    "use_cookies": True,
+                    "extractor_args": {
+                        "youtube": {
+                            "player_client": ["web_embedded", "tv_embedded", "web"]
+                        }
+                    },
+                },
+                {
+                    "use_cookies": False,
+                    "extractor_args": {
+                        "youtube": {
+                            "player_client": ["android", "ios", "tv"],
+                            "player_skip": ["webpage"],
+                        }
+                    },
+                    "drop_impersonate": True,
+                },
+            ]
+
+        last_err: Exception | None = None
+        for strat in attempts:
+            opts = dict(base)
+            opts["http_headers"] = dict(base.get("http_headers") or {})
+            if strat.get("extractor_args"):
+                opts["extractor_args"] = strat["extractor_args"]
+            if strat.get("use_cookies") is False:
+                opts.pop("cookiefile", None)
+            elif is_yt and strat.get("use_cookies") is True:
+                jar = _cookie_jar_for_job()
+                if jar is not None:
+                    job_cookies.append(jar)
+                    opts["cookiefile"] = str(jar)
+            if strat.get("drop_impersonate"):
+                opts.pop("impersonate", None)
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                if info is None:
+                    raise RuntimeError("Could not extract media information from this URL.")
+                return _normalize_info_dict(url, info)
+            except yt_dlp.utils.DownloadError as e:
+                last_err = e
+                err = str(e).lower()
+                if is_yt and (
+                    "not a bot" in err
+                    or "sign in to confirm" in err
+                    or "cookies are no longer valid" in err
+                ):
+                    logger.warning("extract_info attempt failed: %s", str(e).split("\n")[-1][:120])
+                    continue
+                raise
+        if last_err:
+            raise last_err
+        raise RuntimeError("Could not extract media information from this URL.")
+    finally:
+        for jar in job_cookies:
+            try:
+                if jar.is_file() and "cookies.job_" in jar.name:
+                    jar.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def build_media_info(url: str, info: dict[str, Any]) -> MediaInfo:

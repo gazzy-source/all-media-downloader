@@ -66,18 +66,17 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Periodic temp file + session cleanup."""
+    """Periodic temp file + session cleanup (keep disk/RAM free on small VPS)."""
     removed_sessions = sessions.cleanup_expired()
     cutoff = time.time() - TEMP_CLEANUP_HOURS * 3600
     removed_files = 0
     try:
-        for p in TEMP_DIR.rglob("*"):
+        for p in sorted(TEMP_DIR.rglob("*"), reverse=True):
             try:
                 if p.is_file() and p.stat().st_mtime < cutoff:
                     p.unlink(missing_ok=True)
                     removed_files += 1
                 elif p.is_dir():
-                    # remove empty dirs
                     try:
                         next(p.iterdir())
                     except StopIteration:
@@ -87,9 +86,7 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         logger.exception("temp cleanup failed")
     if removed_sessions or removed_files:
-        logger.info(
-            "Cleanup: %s sessions, %s temp files", removed_sessions, removed_files
-        )
+        logger.info("Cleanup: %s sessions, %s temp files", removed_sessions, removed_files)
 
 
 async def post_init(app: Application) -> None:
@@ -199,7 +196,8 @@ def build_app() -> Application:
     app.add_error_handler(on_error)
 
     if app.job_queue:
-        app.job_queue.run_repeating(cleanup_job, interval=900, first=60)
+        # More frequent temp cleanup on small VPS
+        app.job_queue.run_repeating(cleanup_job, interval=600, first=30)
 
     return app
 

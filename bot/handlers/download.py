@@ -119,8 +119,30 @@ async def auto_download_flow(
 
     quality = AUTO_QUALITY
     q_label = QUALITY_MAP.get(quality, {}).get("label", quality)
+    # Fast path: skip HTML probe for YT/IG/TikTok (always video)
+    low_u = url.lower()
+    if any(
+        x in low_u
+        for x in (
+            "youtu",
+            "instagram.com/reel",
+            "instagram.com/tv",
+            "tiktok.com",
+            "facebook.com",
+            "fb.watch",
+            "x.com/",
+            "twitter.com/",
+        )
+    ):
+        mode = "video"
+    elif any(x in low_u for x in ("pinterest.", "pin.it/", "i.pinimg.com")):
+        mode = await asyncio.get_running_loop().run_in_executor(None, detect_mode, url)
+    else:
+        mode = "video"
+
+    kind = "🖼 Image" if mode == "image" else f"🎥 {q_label}"
     status = await msg.reply_text(
-        "⚡ <b>Auto-download</b>\n<code>Detecting media type…</code>",
+        f"⚡ <b>Downloading</b> · {kind}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -128,13 +150,13 @@ async def auto_download_flow(
 
     async def on_progress(pct: float, text: str) -> None:
         now = time.time()
-        if now - last_edit["t"] < 3.0 and pct < 99:
+        # Minimal Telegram edits (rate limits + CPU)
+        if now - last_edit["t"] < 5.0 and pct < 95:
             return
         last_edit["t"] = now
         try:
             await status.edit_text(
-                f"⚡ <b>Auto-download</b> · {q_label}\n"
-                f"{progress_bar(pct)}\n<code>{_esc(text)}</code>",
+                f"⚡ <b>Downloading</b> · {kind}\n{progress_bar(pct)}",
                 parse_mode=ParseMode.HTML,
             )
         except TelegramError:
@@ -142,18 +164,6 @@ async def auto_download_flow(
 
     try:
         await context.bot.send_chat_action(chat.id, ChatAction.UPLOAD_DOCUMENT)
-        # Smart detect: video pins vs image pins (never force all Pinterest → image)
-        mode = await asyncio.get_running_loop().run_in_executor(
-            None, detect_mode, url
-        )
-        kind = "🖼 Image" if mode == "image" else f"🎥 Video · {q_label}"
-        try:
-            await status.edit_text(
-                f"⚡ <b>Auto-download</b> · {kind}\n<code>Starting…</code>",
-                parse_mode=ParseMode.HTML,
-            )
-        except TelegramError:
-            pass
         result = await download_manager.download(
             url=url,
             mode=mode,

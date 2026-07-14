@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import re
@@ -125,7 +126,6 @@ def _esc(text: str) -> str:
 
 
 # Resolve once per process (avoid logging / path scans every download)
-_COOKIE_PATH: Path | None = None  # runtime jar passed to yt-dlp (mutable)
 _COOKIE_SOURCE: Path | None = None  # sanitized/source jar (immutable)
 _COOKIE_RESOLVED = False
 _FFMPEG_DIR: str | None = None
@@ -134,13 +134,13 @@ _IMPERSONATE = None
 _IMPERSONATE_RESOLVED = False
 
 
-def _resolved_cookie() -> Path | None:
-    """Return a writable runtime cookie jar (never the uploaded cookies.txt)."""
-    global _COOKIE_PATH, _COOKIE_SOURCE, _COOKIE_RESOLVED
+def _resolved_cookie_source() -> Path | None:
+    """Load/sanitize cookies once. Returns immutable source path (never mutated by yt-dlp)."""
+    global _COOKIE_SOURCE, _COOKIE_RESOLVED
     if _COOKIE_RESOLVED:
-        return _COOKIE_PATH
+        return _COOKIE_SOURCE
     _COOKIE_RESOLVED = True
-    from bot.utils.cookies import make_runtime_cookie_copy, prepare_cookies
+    from bot.utils.cookies import prepare_cookies
 
     candidates: list[Path] = []
     if COOKIES_FILE:
@@ -148,7 +148,6 @@ def _resolved_cookie() -> Path | None:
         candidates.append(BASE_DIR / COOKIES_FILE)
     candidates.append(BASE_DIR / "cookies.txt")
     candidates.append(Path("cookies.txt"))
-    # Sanitized jar: fewer domains → faster + more reliable yt-dlp
     dest = BASE_DIR / "data" / "cookies.sanitized.txt"
     filtered = prepare_cookies(candidates, dest)
     source: Path | None = filtered
@@ -162,34 +161,29 @@ def _resolved_cookie() -> Path | None:
                 continue
     _COOKIE_SOURCE = source
     if source is not None:
-        runtime = BASE_DIR / "data" / "cookies.runtime.txt"
-        _COOKIE_PATH = make_runtime_cookie_copy(source, runtime) or source
-        logger.info("Cookies ready: source=%s runtime=%s", source, _COOKIE_PATH)
-    return _COOKIE_PATH
+        logger.info("Cookies source ready: %s", source)
+    return _COOKIE_SOURCE
 
 
-def _refresh_cookie_runtime() -> Path | None:
+def _cookie_jar_for_job() -> Path | None:
     """
-    Reset the runtime jar from the immutable source.
+    Per-download writable cookie copy.
 
-    Call before each YouTube download that uses cookies so a failed attempt
-    cannot permanently strip LOGIN_INFO for later retries.
+    Concurrent jobs must NOT share one runtime file — yt-dlp rewrites the jar
+    and would race/corrupt LOGIN_INFO across parallel downloads.
     """
-    global _COOKIE_PATH
     from bot.utils.cookies import make_runtime_cookie_copy
 
-    source = _COOKIE_SOURCE
+    source = _resolved_cookie_source()
     if source is None:
-        # Ensure resolve ran once
-        path = _resolved_cookie()
-        source = _COOKIE_SOURCE
-        if path is None or source is None:
-            return path
-    runtime = BASE_DIR / "data" / "cookies.runtime.txt"
-    refreshed = make_runtime_cookie_copy(source, runtime)
-    if refreshed is not None:
-        _COOKIE_PATH = refreshed
-    return _COOKIE_PATH
+        return None
+    dest = BASE_DIR / "data" / f"cookies.job_{short_id(10)}.txt"
+    return make_runtime_cookie_copy(source, dest)
+
+
+# Back-compat alias used by main.py startup logging
+def _resolved_cookie() -> Path | None:
+    return _resolved_cookie_source()
 
 
 def _resolved_ffmpeg_dir() -> str | None:
@@ -216,7 +210,11 @@ def _resolved_impersonate():
     return _IMPERSONATE
 
 
-def _base_opts(*, host: str = "") -> dict[str, Any]:
+def _base_opts(
+    *,
+    host: str = "",
+    cookiefile: str | Path | None = None,
+) -> dict[str, Any]:
     """Lean yt-dlp options tuned for small VPS + speed."""
     is_yt = "youtu" in host
     is_ig = "instagram" in host or "instagr.am" in host
@@ -262,9 +260,15 @@ def _base_opts(*, host: str = "") -> dict[str, Any]:
         if host:
             opts["http_headers"]["Referer"] = f"https://{host.split(':')[0]}/"
 
-    # For YT, refresh runtime jar so prior failed auth cannot strip LOGIN_INFO
-    cookie = _refresh_cookie_runtime() if is_yt else _resolved_cookie()
-    if cookie:
+    # Prefer caller-supplied cookie jar (per-job). Else shared source for non-YT.
+    cookie: Path | None = None
+    if cookiefile is not None:
+        cookie = Path(cookiefile) if cookiefile else None
+    elif is_yt:
+        cookie = None  # YT jobs should pass a unique jar from DownloadManager
+    else:
+        cookie = _resolved_cookie_source()
+    if cookie and cookie.is_file():
         opts["cookiefile"] = str(cookie)
 
     if is_yt:
@@ -466,16 +470,38 @@ def build_media_info(url: str, info: dict[str, Any]) -> MediaInfo:
     )
 
 
+async def _emit_progress(progress_cb: ProgressCallback | None, pct: float, msg: str) -> None:
+    if not progress_cb:
+        return
+    try:
+        result = progress_cb(pct, msg)
+        if asyncio.iscoroutine(result):
+            await result
+    except Exception:
+        pass
+
+
 class DownloadManager:
     """Async-friendly download manager with concurrency limit."""
 
     def __init__(self, max_concurrent: int = MAX_CONCURRENT_DOWNLOADS) -> None:
-        self._sem = asyncio.Semaphore(max_concurrent)
+        self.max_concurrent = max(1, int(max_concurrent))
+        self._sem = asyncio.Semaphore(self.max_concurrent)
         self.active = 0
+        self.waiting = 0
+        # Dedicated pool so concurrent downloads aren't starved by default executor size
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_concurrent + 2,
+            thread_name_prefix="yt-dl",
+        )
+
+    @property
+    def free_slots(self) -> int:
+        return max(0, self.max_concurrent - self.active)
 
     async def extract_info(self, url: str) -> MediaInfo:
         loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, _extract_info_sync, url)
+        info = await loop.run_in_executor(self._executor, _extract_info_sync, url)
         return build_media_info(url, info)
 
     async def download(
@@ -488,15 +514,54 @@ class DownloadManager:
         title_hint: str = "media",
         progress_cb: ProgressCallback | None = None,
     ) -> DownloadResult:
-        async with self._sem:
-            self.active += 1
-            try:
-                loop = asyncio.get_running_loop()
+        self.waiting += 1
+        try:
+            # Only show "queued" when we would actually wait for a free slot
+            if self.active >= self.max_concurrent:
+                pos = self.waiting
+                await _emit_progress(
+                    progress_cb,
+                    0,
+                    f"Queued · position {pos} ({self.active}/{self.max_concurrent} running)",
+                )
+            await self._sem.acquire()
+        finally:
+            self.waiting -= 1
+
+        self.active += 1
+        try:
+            await _emit_progress(
+                progress_cb,
+                1,
+                f"Starting… ({self.active}/{self.max_concurrent} parallel)",
+            )
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                self._executor,
+                lambda: self._download_sync(
+                    url=url,
+                    mode=mode,
+                    quality=quality,
+                    subtitle_lang=subtitle_lang,
+                    audio_format=audio_format,
+                    title_hint=title_hint,
+                    progress_cb=progress_cb,
+                    loop=loop,
+                ),
+            )
+            # Auto: video request on image-only posts (Pinterest pins, etc.)
+            if (
+                not result.success
+                and mode == "video"
+                and self._looks_like_image_only_error(result.error or "")
+            ):
+                logger.info("Retrying as image download for %s", url)
+                await _emit_progress(progress_cb, 5, "Retrying as image…")
                 result = await loop.run_in_executor(
-                    None,
+                    self._executor,
                     lambda: self._download_sync(
                         url=url,
-                        mode=mode,
+                        mode="image",
                         quality=quality,
                         subtitle_lang=subtitle_lang,
                         audio_format=audio_format,
@@ -505,29 +570,10 @@ class DownloadManager:
                         loop=loop,
                     ),
                 )
-                # Auto: video request on image-only posts (Pinterest pins, etc.)
-                if (
-                    not result.success
-                    and mode == "video"
-                    and self._looks_like_image_only_error(result.error or "")
-                ):
-                    logger.info("Retrying as image download for %s", url)
-                    result = await loop.run_in_executor(
-                        None,
-                        lambda: self._download_sync(
-                            url=url,
-                            mode="image",
-                            quality=quality,
-                            subtitle_lang=subtitle_lang,
-                            audio_format=audio_format,
-                            title_hint=title_hint,
-                            progress_cb=progress_cb,
-                            loop=loop,
-                        ),
-                    )
-                return result
-            finally:
-                self.active -= 1
+            return result
+        finally:
+            self.active -= 1
+            self._sem.release()
 
     @staticmethod
     def _looks_like_image_only_error(err: str) -> bool:
@@ -563,6 +609,7 @@ class DownloadManager:
         work_dir = TEMP_DIR / f"dl_{short_id(12)}"
         work_dir.mkdir(parents=True, exist_ok=True)
         outtmpl = str(work_dir / f"{safe_filename(title_hint)}.%(ext)s")
+        job_cookies: list[Path] = []
 
         last_pct = {"v": -1}
 
@@ -582,8 +629,8 @@ class DownloadManager:
                 total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
                 done = d.get("downloaded_bytes") or 0
                 pct = (done / total * 100) if total else 0
-                # Heavy throttle — Telegram edits are slow/expensive
-                if abs(pct - last_pct["v"]) < 15 and pct < 95:
+                # Throttle Telegram edits (still update often enough to feel live)
+                if abs(pct - last_pct["v"]) < 8 and pct < 95:
                     return
                 last_pct["v"] = pct
                 speed = d.get("speed")
@@ -593,7 +640,13 @@ class DownloadManager:
                 _emit(100, "⚙️ Finishing…")
 
         host = urlparse(url).netloc.lower()
-        opts = _base_opts(host=host)
+        is_yt = "youtu" in host
+        cookie_path = _cookie_jar_for_job() if is_yt else _resolved_cookie_source()
+        if cookie_path and is_yt:
+            job_cookies.append(cookie_path)
+
+        _emit(3, "Connecting…")
+        opts = _base_opts(host=host, cookiefile=cookie_path)
         hooks = [hook] if progress_cb else []
         opts.update(
             {
@@ -661,7 +714,7 @@ class DownloadManager:
                 )
 
             info, prepared, title = self._extract_with_format_fallback(
-                opts, url, title_hint
+                opts, url, title_hint, job_cookies=job_cookies
             )
 
             files = sorted(
@@ -752,12 +805,20 @@ class DownloadManager:
                 mode=mode,
                 quality=quality,
             )
+        finally:
+            for jar in job_cookies:
+                try:
+                    if jar.is_file() and "cookies.job_" in jar.name:
+                        jar.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _extract_with_format_fallback(
         self,
         opts: dict[str, Any],
         url: str,
         title_hint: str,
+        job_cookies: list[Path] | None = None,
     ) -> tuple[dict[str, Any], str, str]:
         """
         Try preferred format first; on failure retry progressive/safe fallbacks.
@@ -769,6 +830,7 @@ class DownloadManager:
         formats = [primary]
         if primary != "b/best":
             formats.append("b/best")
+        tracked = job_cookies if job_cookies is not None else []
 
         strategies: list[dict[str, Any]] = [{}]  # default opts as-is
         if is_yt:
@@ -838,9 +900,10 @@ class DownloadManager:
                 if strat.get("use_cookies") is False:
                     attempt_opts.pop("cookiefile", None)
                 elif strat.get("use_cookies") is True or strat.get("refresh_cookies"):
-                    # Fresh jar each cookie strategy so failed auth cannot strip LOGIN_INFO
-                    jar = _refresh_cookie_runtime()
+                    # Fresh per-attempt jar (never share across concurrent jobs)
+                    jar = _cookie_jar_for_job()
                     if jar is not None:
+                        tracked.append(jar)
                         attempt_opts["cookiefile"] = str(jar)
                 if strat.get("drop_impersonate"):
                     attempt_opts.pop("impersonate", None)

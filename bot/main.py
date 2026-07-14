@@ -189,12 +189,26 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
+    # Private + group messages
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
-    # Also accept captions with links on forwarded media
+    # Captions with links on media
     app.add_handler(
         MessageHandler(filters.CAPTION & ~filters.COMMAND, handle_message)
+    )
+    # Channel posts (bot must be admin with Post messages)
+    app.add_handler(
+        MessageHandler(
+            filters.UpdateType.CHANNEL_POSTS & filters.TEXT & ~filters.COMMAND,
+            handle_message,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.UpdateType.CHANNEL_POSTS & filters.CAPTION & ~filters.COMMAND,
+            handle_message,
+        )
     )
 
     app.add_error_handler(on_error)

@@ -19,8 +19,8 @@ ADMIN_IDS: set[int] = {
     if x.strip().isdigit()
 }
 
-# Keep low on small VPS (1GB RAM)
-MAX_CONCURRENT_DOWNLOADS: int = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
+# Parallel user jobs (5 is fine if MemoryMax ~700M+ and progressive formats)
+MAX_CONCURRENT_DOWNLOADS: int = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "5"))
 MAX_FILE_SIZE_MB: float = float(os.getenv("MAX_FILE_SIZE_MB", "49"))
 MAX_FILE_SIZE_BYTES: int = int(MAX_FILE_SIZE_MB * 1024 * 1024)
 

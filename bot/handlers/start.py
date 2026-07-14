@@ -21,18 +21,15 @@ WELCOME = f"""
 {__bot_bio__}
 
 <b>How to use</b>
-1️⃣ Send any media link (or multiple links)
-2️⃣ Pick format: Video · Video+Subs · Audio · Image
-3️⃣ Choose quality (480p / 720p / 1080p / Max)
-4️⃣ Get your file instantly
+• <b>Private chat:</b> paste a link → choose format &amp; quality
+• <b>Groups:</b> paste a link → downloads automatically (best quality)
 
 <b>Pro tips</b>
-• Works with YouTube, Instagram, TikTok, X, Facebook, Pinterest &amp; 1000+ sites
-• Audio extraction in MP3 / M4A / Opus
-• Subtitles embedded when available
-• Smart quality picker shows only real options
+• YouTube / IG / TikTok / X / Facebook / Pinterest &amp; 1000+ sites
+• Audio · subtitles · images supported in private wizard
+• Bot needs to see group messages (@BotFather → /setprivacy → Disable)
 
-Just paste a link to begin 👇
+Just paste a link 👇
 """.strip()
 
 

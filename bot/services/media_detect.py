@@ -89,9 +89,10 @@ def detect_mode(url: str) -> str:
     if "pinterest." in low or "pin.it/" in low:
         return _detect_pinterest(url)
 
-    # Instagram posts can be photo or reel — probe lightly via yt-dlp
-    if "instagram.com/p/" in low:
-        return _detect_via_ytdlp(url)
+    # Instagram: reels/TV are video; /p/ may be photo — try video first (fast),
+    # image fallback in downloader handles photo posts without a second probe.
+    if "instagram.com/" in low:
+        return "video"
 
     return "video"
 
@@ -122,7 +123,9 @@ def _detect_via_ytdlp(url: str) -> str:
 
         from bot.services.downloader import _base_opts
 
-        opts = _base_opts()
+        from urllib.parse import urlparse as _up
+
+        opts = _base_opts(host=_up(url).netloc.lower())
         opts.update(
             {
                 "skip_download": True,
@@ -131,6 +134,7 @@ def _detect_via_ytdlp(url: str) -> str:
                 "ignoreerrors": True,
             }
         )
+        opts.pop("progress_hooks", None)
         # Don't need format selection for type probe
         opts.pop("format", None)
         with yt_dlp.YoutubeDL(opts) as ydl:

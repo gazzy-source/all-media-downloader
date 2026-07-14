@@ -123,22 +123,71 @@ def _esc(text: str) -> str:
     )
 
 
-def _base_opts() -> dict[str, Any]:
+# Resolve once per process (avoid logging / path scans every download)
+_COOKIE_PATH: Path | None = None
+_COOKIE_RESOLVED = False
+_FFMPEG_DIR: str | None = None
+_FFMPEG_RESOLVED = False
+_IMPERSONATE = None
+_IMPERSONATE_RESOLVED = False
+
+
+def _resolved_cookie() -> Path | None:
+    global _COOKIE_PATH, _COOKIE_RESOLVED
+    if _COOKIE_RESOLVED:
+        return _COOKIE_PATH
+    _COOKIE_RESOLVED = True
+    if COOKIES_FILE and Path(COOKIES_FILE).exists():
+        _COOKIE_PATH = Path(COOKIES_FILE).resolve()
+    elif Path("cookies.txt").is_file():
+        _COOKIE_PATH = Path("cookies.txt").resolve()
+    return _COOKIE_PATH
+
+
+def _resolved_ffmpeg_dir() -> str | None:
+    global _FFMPEG_DIR, _FFMPEG_RESOLVED
+    if _FFMPEG_RESOLVED:
+        return _FFMPEG_DIR
+    _FFMPEG_RESOLVED = True
+    _FFMPEG_DIR = ffmpeg_location_dir()
+    return _FFMPEG_DIR
+
+
+def _resolved_impersonate():
+    global _IMPERSONATE, _IMPERSONATE_RESOLVED
+    if _IMPERSONATE_RESOLVED:
+        return _IMPERSONATE
+    _IMPERSONATE_RESOLVED = True
+    try:
+        import curl_cffi  # noqa: F401
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+
+        _IMPERSONATE = ImpersonateTarget.from_str("chrome")
+    except Exception:
+        _IMPERSONATE = None
+    return _IMPERSONATE
+
+
+def _base_opts(*, host: str = "") -> dict[str, Any]:
+    """Lean yt-dlp options tuned for small VPS + speed."""
+    is_yt = "youtu" in host
+    is_ig = "instagram" in host or "instagr.am" in host
+
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        "socket_timeout": 30,
-        "retries": 5,
-        "fragment_retries": 8,
-        "file_access_retries": 3,
-        "concurrent_fragment_downloads": 4,
+        "socket_timeout": 20,
+        "retries": 3,
+        "fragment_retries": 5,
+        "file_access_retries": 2,
+        # 1 fragment stream = less RAM on 1GB VPS (was 4)
+        "concurrent_fragment_downloads": 1,
         "nocheckcertificate": True,
         "geo_bypass": True,
         "noplaylist": True,
         "ignoreerrors": False,
         "extract_flat": False,
-        # Referer required for many googlevideo CDN URLs
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -146,40 +195,42 @@ def _base_opts() -> dict[str, Any]:
                 "Chrome/131.0.0.0 Safari/537.36"
             ),
             "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.youtube.com/",
-            "Origin": "https://www.youtube.com",
         },
-        # Prefer web/tv when cookies are used (android/ios ignore cookies → 403)
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["web", "tv", "mweb"],
-                "player_skip": ["webpage"],
-            },
-            "youtubetab": {"skip": ["webpage"]},
-        },
-        # EJS challenge solver (Deno/Node must be on PATH)
-        "remote_components": ["ejs:github"],
     }
-    # Browser TLS impersonation (curl_cffi) — must be ImpersonateTarget, not a bare str
-    try:
-        import curl_cffi  # noqa: F401
-        from yt_dlp.networking.impersonate import ImpersonateTarget
 
-        target = ImpersonateTarget.from_str("chrome")
-        opts["impersonate"] = target
-    except Exception as e:
-        logger.debug("impersonate unavailable: %s", e)
+    if is_yt:
+        opts["http_headers"]["Referer"] = "https://www.youtube.com/"
+        opts["http_headers"]["Origin"] = "https://www.youtube.com"
+        # Single client = fewer API round-trips (tv works well with cookies+deno)
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["tv"],
+                "player_skip": ["webpage", "configs"],
+            },
+        }
+        # EJS scripts already installed via yt_dlp_ejs — only fetch if missing
+        opts["remote_components"] = ["ejs:github"]
+    elif is_ig:
+        opts["http_headers"]["Referer"] = "https://www.instagram.com/"
+        # Instagram: keep it simple — no multi-client thrash
+    else:
+        opts["http_headers"]["Referer"] = f"https://{host}/" if host else "https://www.google.com/"
 
-    cookie_path = None
-    if COOKIES_FILE and Path(COOKIES_FILE).exists():
-        cookie_path = Path(COOKIES_FILE)
-    elif Path("cookies.txt").is_file():
-        cookie_path = Path("cookies.txt").resolve()
-    if cookie_path:
-        opts["cookiefile"] = str(cookie_path.resolve())
-        logger.info("Using cookies file: %s", cookie_path)
+    cookie = _resolved_cookie()
+    if cookie:
+        opts["cookiefile"] = str(cookie)
+
+    imp = _resolved_impersonate()
+    if imp is not None:
+        opts["impersonate"] = imp
+
     if PROXY:
         opts["proxy"] = PROXY
+
+    ff = _resolved_ffmpeg_dir()
+    if ff:
+        opts["ffmpeg_location"] = ff
+
     return opts
 
 
@@ -470,53 +521,43 @@ class DownloadManager:
                 total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
                 done = d.get("downloaded_bytes") or 0
                 pct = (done / total * 100) if total else 0
-                # Throttle UI updates
-                if abs(pct - last_pct["v"]) < 3 and pct < 99:
+                # Heavy throttle — Telegram edits are slow/expensive
+                if abs(pct - last_pct["v"]) < 15 and pct < 95:
                     return
                 last_pct["v"] = pct
                 speed = d.get("speed")
-                eta = d.get("eta")
                 speed_s = format_size(speed) + "/s" if speed else "—"
-                eta_s = format_duration(eta) if eta else "—"
-                _emit(pct, f"⬇ Downloading… {pct:.0f}% · {speed_s} · ETA {eta_s}")
+                _emit(pct, f"⬇ {pct:.0f}% · {speed_s}")
             elif status == "finished":
-                _emit(100, "⚙️ Processing / merging…")
+                _emit(100, "⚙️ Finishing…")
 
-        opts = _base_opts()
+        host = urlparse(url).netloc.lower()
+        opts = _base_opts(host=host)
+        hooks = [hook] if progress_cb else []
         opts.update(
             {
                 "outtmpl": outtmpl,
-                "progress_hooks": [hook],
+                "progress_hooks": hooks,
                 "noplaylist": True,
-                "merge_output_format": "mp4",
                 "writethumbnail": False,
             }
         )
-
-        # Prefer ffmpeg if available (WinGet often installs off-PATH)
-        ff_dir = ffmpeg_location_dir()
-        if ff_dir:
-            opts["ffmpeg_location"] = ff_dir
-        elif not find_ffmpeg():
-            logger.warning("Proceeding without FFmpeg — merge/audio convert may fail")
 
         try:
             if mode == "audio":
                 opts.update(
                     {
-                        "format": f"bestaudio/best/{FORMAT_FALLBACK}",
+                        "format": "bestaudio/best",
                         "postprocessors": [
                             {
                                 "key": "FFmpegExtractAudio",
                                 "preferredcodec": audio_format,
                                 "preferredquality": "192",
                             },
-                            {"key": "FFmpegMetadata"},
                         ],
                     }
                 )
             elif mode == "image":
-                # Dedicated image pipeline — skip slow yt-dlp video format loops
                 return self._download_image_page(
                     url=url,
                     work_dir=work_dir,
@@ -525,28 +566,28 @@ class DownloadManager:
                     loop=loop,
                 )
             elif mode == "video_subs":
-                q = QUALITY_MAP.get(quality, QUALITY_MAP["720"])
+                q = QUALITY_MAP.get(quality, QUALITY_MAP["1080"])
                 lang = subtitle_lang or "en.*"
                 opts.update(
                     {
                         "format": q["format"],
+                        "merge_output_format": "mp4",
                         "writesubtitles": True,
                         "writeautomaticsub": True,
-                        "subtitleslangs": [lang, "en", "en-US", "en-GB"],
+                        "subtitleslangs": [lang, "en"],
                         "subtitlesformat": "srt/best",
                         "embedsubtitles": True,
                         "postprocessors": [
                             {"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False},
-                            {"key": "FFmpegMetadata"},
                         ],
                     }
                 )
-            else:  # video
-                q = QUALITY_MAP.get(quality, QUALITY_MAP["720"])
+            else:  # video — no FFmpegMetadata (saves CPU); merge only if needed
+                q = QUALITY_MAP.get(quality, QUALITY_MAP["1080"])
                 opts.update(
                     {
                         "format": q["format"],
-                        "postprocessors": [{"key": "FFmpegMetadata"}],
+                        "merge_output_format": "mp4",
                     }
                 )
 
@@ -653,38 +694,16 @@ class DownloadManager:
         Try preferred format first; on failure retry progressive/safe fallbacks.
         Fails fast on pure image extractors (Pinterest photo pins).
         """
-        host = urlparse(url).netloc.lower()
-        is_youtube = "youtu" in host
-        # Short chain for most sites; YouTube gets progressive retries for 403
-        if is_youtube:
-            format_chain = [
-                opts.get("format") or FORMAT_FALLBACK,
-                "b[ext=mp4]/b",
-                "18/22/best",
-            ]
-        else:
-            format_chain = [
-                opts.get("format") or FORMAT_FALLBACK,
-                "b/best",
-            ]
-
-        formats: list[str] = []
-        seen: set[str] = set()
-        for f in format_chain:
-            if f and f not in seen:
-                seen.add(f)
-                formats.append(f)
+        # Prefer one successful attempt: primary format, then single progressive fallback
+        primary = opts.get("format") or FORMAT_FALLBACK
+        formats = [primary]
+        if primary != "b/best":
+            formats.append("b/best")
 
         last_err: Exception | None = None
         for i, fmt in enumerate(formats):
             attempt_opts = dict(opts)
             attempt_opts["format"] = fmt
-            if i > 0 and is_youtube:
-                ea = dict(attempt_opts.get("extractor_args") or {})
-                yt = dict(ea.get("youtube") or {})
-                yt["player_client"] = ["web", "tv", "mweb"]
-                ea["youtube"] = yt
-                attempt_opts["extractor_args"] = ea
             try:
                 with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
@@ -692,28 +711,21 @@ class DownloadManager:
                         raise RuntimeError("Download returned no data.")
                     prepared = ydl.prepare_filename(info)
                     title = str(info.get("title") or title_hint)[:200]
-                    if i > 0:
-                        logger.info("Download succeeded with fallback format: %s", fmt)
                     return info, prepared, title
             except yt_dlp.utils.DownloadError as e:
                 last_err = e
                 err = str(e).lower()
-                # Image-only extractors: stop immediately (image path handles it)
                 if "no video formats" in err or "only images" in err:
                     raise
                 retryable = (
                     "format is not available" in err
                     or "requested format" in err
                     or "http error 403" in err
-                    or "403: forbidden" in err
+                    or "403" in err
                     or "unable to download video data" in err
-                    or "forbidden" in err
                 )
                 if retryable and i < len(formats) - 1:
-                    logger.warning(
-                        "Format failed (%s); trying fallback…",
-                        str(e).split("\n")[-1][:100],
-                    )
+                    logger.warning("Retry progressive format…")
                     continue
                 raise
         if last_err:

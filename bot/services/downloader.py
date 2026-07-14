@@ -8,6 +8,8 @@ import logging
 import os
 import re
 import shutil
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -20,6 +22,7 @@ from bot.config import (
     COOKIES_FILE,
     FORMAT_FALLBACK,
     MAX_CONCURRENT_DOWNLOADS,
+    META_CACHE_TTL,
     PROXY,
     QUALITY_MAP,
     TEMP_DIR,
@@ -135,7 +138,12 @@ _IMPERSONATE_RESOLVED = False
 
 # Sticky YouTube strategy winner — next jobs try the fast path first
 _YT_WINNER_SI: int = 0
-_YT_WINNER_LOCK = __import__("threading").Lock()
+_YT_WINNER_LOCK = threading.Lock()
+
+# Short-lived metadata cache (speeds DM wizard re-analyzes / back buttons)
+_META_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_META_CACHE_LOCK = threading.Lock()
+_META_CACHE_MAX = 64
 
 
 def _resolved_cookie_source() -> Path | None:
@@ -214,14 +222,33 @@ def _resolved_impersonate():
     return _IMPERSONATE
 
 
+def _platform_flags(host: str) -> dict[str, bool]:
+    h = (host or "").lower()
+    return {
+        "yt": "youtu" in h,
+        "ig": "instagram" in h or "instagr.am" in h,
+        "tt": "tiktok" in h,
+        "x": "twitter." in h or h.endswith("x.com") or ".x.com" in h or h == "x.com",
+        "fb": "facebook." in h or "fb.watch" in h or h.endswith("fb.com"),
+        "pin": "pinterest." in h or "pin.it" in h or "pinimg." in h,
+        "rd": "reddit." in h or "redd.it" in h,
+    }
+
+
 def _base_opts(
     *,
     host: str = "",
     cookiefile: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Lean yt-dlp options tuned for small VPS + speed."""
-    is_yt = "youtu" in host
-    is_ig = "instagram" in host or "instagr.am" in host
+    """Lean yt-dlp options tuned for small VPS + all major platforms."""
+    flags = _platform_flags(host)
+    is_yt = flags["yt"]
+    is_ig = flags["ig"]
+    is_tt = flags["tt"]
+    is_x = flags["x"]
+    is_fb = flags["fb"]
+    is_pin = flags["pin"]
+    is_rd = flags["rd"]
 
     opts: dict[str, Any] = {
         "quiet": True,
@@ -231,7 +258,6 @@ def _base_opts(
         "retries": 3,
         "fragment_retries": 6,
         "file_access_retries": 2,
-        # Parallel DASH fragments — speeds multi-format YT without huge RAM hit
         "concurrent_fragment_downloads": 4,
         "buffersize": 1024 * 256,
         "http_chunk_size": 1024 * 1024 * 10,
@@ -240,6 +266,11 @@ def _base_opts(
         "noplaylist": True,
         "ignoreerrors": False,
         "extract_flat": False,
+        # Skip extras that only slow extraction/download
+        "writethumbnail": False,
+        "writeinfojson": False,
+        "writesubtitles": False,
+        "writeautomaticsub": False,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -253,29 +284,38 @@ def _base_opts(
     if is_yt:
         opts["http_headers"]["Referer"] = "https://www.youtube.com/"
         opts["http_headers"]["Origin"] = "https://www.youtube.com"
-        # Use local Deno/EJS only — remote github fetch adds multi-second latency
     elif is_ig:
         opts["http_headers"]["Referer"] = "https://www.instagram.com/"
         opts["http_headers"]["Origin"] = "https://www.instagram.com"
+        opts["concurrent_fragment_downloads"] = 3
+    elif is_tt:
+        opts["http_headers"]["Referer"] = "https://www.tiktok.com/"
+        opts["concurrent_fragment_downloads"] = 3
+    elif is_x:
+        opts["http_headers"]["Referer"] = "https://x.com/"
+        opts["concurrent_fragment_downloads"] = 3
+    elif is_fb:
+        opts["http_headers"]["Referer"] = "https://www.facebook.com/"
+        opts["concurrent_fragment_downloads"] = 2
+    elif is_pin:
+        opts["http_headers"]["Referer"] = "https://www.pinterest.com/"
+        opts["concurrent_fragment_downloads"] = 2
+    elif is_rd:
+        opts["http_headers"]["Referer"] = "https://www.reddit.com/"
         opts["concurrent_fragment_downloads"] = 3
     else:
         if host:
             opts["http_headers"]["Referer"] = f"https://{host.split(':')[0]}/"
 
-    # Prefer caller-supplied cookie jar (per-job). Else shared source for non-YT.
+    # Prefer caller-supplied cookie jar (per-job). Never hand yt-dlp the immutable source.
     cookie: Path | None = None
     if cookiefile is not None:
         cookie = Path(cookiefile) if cookiefile else None
-    elif is_yt:
-        cookie = None  # YT jobs should pass a unique jar from DownloadManager
-    else:
-        cookie = _resolved_cookie_source()
     if cookie and cookie.is_file():
         opts["cookiefile"] = str(cookie)
 
     if is_yt:
         if cookie:
-            # Single fast client first (tv is usually quickest with cookies)
             opts["extractor_args"] = {
                 "youtube": {"player_client": ["tv"]},
             }
@@ -286,9 +326,13 @@ def _base_opts(
                     "player_skip": ["configs", "webpage"],
                 },
             }
+    elif is_tt:
+        # Prefer mobile-friendly extraction when available
+        opts.setdefault("extractor_args", {})
 
     imp = _resolved_impersonate()
     if imp is not None:
+        # Chrome impersonation helps YT/IG/FB bot walls; safe elsewhere
         opts["impersonate"] = imp
 
     if PROXY:
@@ -299,6 +343,37 @@ def _base_opts(
         opts["ffmpeg_location"] = ff
 
     return opts
+
+
+def _video_format_for_host(host: str, quality: str) -> str:
+    """Progressive-first formats tuned per platform (fast + reliable)."""
+    q = QUALITY_MAP.get(quality, QUALITY_MAP["1080"])
+    h = int(q.get("height") or 1080)
+    flags = _platform_flags(host)
+
+    if flags["yt"]:
+        return q["format"]
+    if flags["ig"]:
+        # Reels are usually single progressive streams
+        if h >= 9999:
+            return "b/best"
+        return f"b[height<={h}]/best[height<={h}]/b/best"
+    if flags["tt"]:
+        return "b/best"
+    if flags["x"]:
+        return "b/best"
+    if flags["fb"]:
+        if h >= 9999:
+            return "b/best"
+        return f"b[height<={h}]/best"
+    if flags["rd"]:
+        return "b/best"
+    if flags["pin"]:
+        return "b/best"
+    # Generic: progressive under cap, then merge, then anything
+    if h >= 9999:
+        return FORMAT_FALLBACK
+    return f"b[height<={h}]/bv*[height<={h}]+ba/b/best"
 
 
 def _parse_formats(info: dict[str, Any]) -> tuple[bool, bool, bool, list[int], list[tuple[int, int]], dict[str, int]]:
@@ -490,17 +565,48 @@ def _remember_yt_strategy(original_index: int) -> None:
         _YT_WINNER_SI = original_index
 
 
+def _meta_cache_get(url: str) -> dict[str, Any] | None:
+    key = url.strip()
+    now = time.time()
+    with _META_CACHE_LOCK:
+        hit = _META_CACHE.get(key)
+        if not hit:
+            return None
+        ts, info = hit
+        if now - ts > META_CACHE_TTL:
+            _META_CACHE.pop(key, None)
+            return None
+        return info
+
+
+def _meta_cache_put(url: str, info: dict[str, Any]) -> None:
+    key = url.strip()
+    with _META_CACHE_LOCK:
+        if len(_META_CACHE) >= _META_CACHE_MAX:
+            # Drop oldest ~25%
+            items = sorted(_META_CACHE.items(), key=lambda kv: kv[1][0])
+            for k, _ in items[: max(1, _META_CACHE_MAX // 4)]:
+                _META_CACHE.pop(k, None)
+        _META_CACHE[key] = (time.time(), info)
+
+
 def _extract_info_sync(url: str) -> dict[str, Any]:
     """
-    Metadata-only extract (wizard / rare sites).
-    Uses cookies + lean YT strategies; major platforms usually skip this via DM_FAST_AUTO.
+    Metadata-only extract for the DM button wizard.
+    Cached briefly; cookies + lean strategies on YouTube; single fast pass elsewhere.
     """
+    cached = _meta_cache_get(url)
+    if cached is not None:
+        return cached
+
     host = urlparse(url).netloc.lower()
-    is_yt = "youtu" in host
+    flags = _platform_flags(host)
+    is_yt = flags["yt"]
     job_cookies: list[Path] = []
     try:
-        cookie = _cookie_jar_for_job() if is_yt else _resolved_cookie_source()
-        if cookie and is_yt:
+        # Disposable jar when cookies exist (safe concurrent + never mutates source)
+        cookie = _cookie_jar_for_job()
+        if cookie:
             job_cookies.append(cookie)
 
         base = _base_opts(host=host, cookiefile=cookie)
@@ -513,12 +619,35 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
             }
         )
 
-        if not is_yt:
-            with yt_dlp.YoutubeDL(base) as ydl:
+        def _run(opts: dict[str, Any]) -> dict[str, Any]:
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             if info is None:
                 raise RuntimeError("Could not extract media information from this URL.")
             return _normalize_info_dict(url, info)
+
+        if not is_yt:
+            # Fast single pass; one cookieless retry on login walls
+            try:
+                info = _run(base)
+                _meta_cache_put(url, info)
+                return info
+            except yt_dlp.utils.DownloadError as e:
+                err = str(e).lower()
+                if cookie and (
+                    "login" in err
+                    or "private" in err
+                    or "cookies" in err
+                    or "403" in err
+                    or "rate" in err
+                ):
+                    opts = dict(base)
+                    opts.pop("cookiefile", None)
+                    opts.pop("impersonate", None)
+                    info = _run(opts)
+                    _meta_cache_put(url, info)
+                    return info
+                raise
 
         strats = _ordered_yt_strategies(has_cookies=bool(cookie))
         last_err: Exception | None = None
@@ -537,15 +666,10 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
             if strat.get("drop_impersonate"):
                 opts.pop("impersonate", None)
             try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                if info is None:
-                    raise RuntimeError(
-                        "Could not extract media information from this URL."
-                    )
-                # Map ordered index back roughly for sticky (best-effort)
+                info = _run(opts)
                 _remember_yt_strategy(0 if si == 0 else si)
-                return _normalize_info_dict(url, info)
+                _meta_cache_put(url, info)
+                return info
             except yt_dlp.utils.DownloadError as e:
                 last_err = e
                 err = str(e).lower()
@@ -786,9 +910,11 @@ class DownloadManager:
                 _emit(100, "⚙️ Finishing…")
 
         host = urlparse(url).netloc.lower()
-        is_yt = "youtu" in host
-        cookie_path = _cookie_jar_for_job() if is_yt else _resolved_cookie_source()
-        if cookie_path and is_yt:
+        flags = _platform_flags(host)
+        is_yt = flags["yt"]
+        # Disposable jar for every download so concurrent jobs never corrupt cookies
+        cookie_path = _cookie_jar_for_job()
+        if cookie_path:
             job_cookies.append(cookie_path)
 
         _emit(2, "Resolving…")
@@ -807,7 +933,7 @@ class DownloadManager:
             if mode == "audio":
                 opts.update(
                     {
-                        "format": "bestaudio/best",
+                        "format": "bestaudio[ext=m4a]/bestaudio/best",
                         "postprocessors": [
                             {
                                 "key": "FFmpegExtractAudio",
@@ -826,11 +952,10 @@ class DownloadManager:
                     loop=loop,
                 )
             elif mode == "video_subs":
-                q = QUALITY_MAP.get(quality, QUALITY_MAP["1080"])
                 lang = subtitle_lang or "en.*"
                 opts.update(
                     {
-                        "format": q["format"],
+                        "format": _video_format_for_host(host, quality),
                         "merge_output_format": "mp4",
                         "writesubtitles": True,
                         "writeautomaticsub": True,
@@ -842,19 +967,10 @@ class DownloadManager:
                         ],
                     }
                 )
-            else:  # video — progressive-first; merge only when needed
-                q = QUALITY_MAP.get(quality, QUALITY_MAP["1080"])
-                fmt = q["format"]
-                # Instagram: single best under cap (reels rarely need multi-format)
-                if "instagram" in host or "instagr.am" in host:
-                    h = q.get("height", 1080)
-                    if h >= 9999:
-                        fmt = "b/best"
-                    else:
-                        fmt = f"b[height<={h}]/best"
+            else:  # video — progressive-first per platform
                 opts.update(
                     {
-                        "format": fmt,
+                        "format": _video_format_for_host(host, quality),
                         "merge_output_format": "mp4",
                     }
                 )
@@ -971,7 +1087,8 @@ class DownloadManager:
         Sticky YouTube strategy winner for subsequent jobs.
         """
         host = urlparse(url).netloc.lower()
-        is_yt = "youtu" in host
+        flags = _platform_flags(host)
+        is_yt = flags["yt"]
         primary = opts.get("format") or FORMAT_FALLBACK
         tracked = job_cookies if job_cookies is not None else []
         initial_cookie = opts.get("cookiefile")
@@ -986,6 +1103,16 @@ class DownloadManager:
             else:
                 strategies = list(base_strats)
                 orig_indices = list(range(len(base_strats)))
+        elif flags["ig"] or flags["fb"] or flags["x"]:
+            # Cookie pass first, then cookieless (public posts still work)
+            strategies = [
+                {"use_cookies": True, "refresh_cookies": False},
+                {
+                    "use_cookies": False,
+                    "drop_impersonate": True,
+                },
+            ]
+            orig_indices = [0, 1]
         else:
             strategies = [{}]
             orig_indices = [0]

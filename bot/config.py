@@ -51,13 +51,15 @@ AUTO_DOWNLOAD_ALWAYS: bool = os.getenv("AUTO_DOWNLOAD_ALWAYS", "0").strip() in (
     "True",
     "yes",
 )
-# Private chat: skip slow metadata wizard for major platforms (instant like groups)
-DM_FAST_AUTO: bool = os.getenv("DM_FAST_AUTO", "1").strip() not in (
-    "0",
-    "false",
-    "False",
-    "no",
+# Private chat: 0 = mode/quality buttons (default). 1 = auto-download like groups.
+DM_FAST_AUTO: bool = os.getenv("DM_FAST_AUTO", "0").strip() in (
+    "1",
+    "true",
+    "True",
+    "yes",
 )
+# Metadata extract cache TTL (seconds) — speeds repeated DM analyzes
+META_CACHE_TTL: int = int(os.getenv("META_CACHE_TTL", "180"))
 AUTO_QUALITY: str = (os.getenv("AUTO_QUALITY", "1080") or "1080").strip().lower()
 if AUTO_QUALITY not in ("480", "720", "1080", "max"):
     AUTO_QUALITY = "1080"

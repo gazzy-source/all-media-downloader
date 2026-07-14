@@ -125,7 +125,8 @@ def _esc(text: str) -> str:
 
 
 # Resolve once per process (avoid logging / path scans every download)
-_COOKIE_PATH: Path | None = None
+_COOKIE_PATH: Path | None = None  # runtime jar passed to yt-dlp (mutable)
+_COOKIE_SOURCE: Path | None = None  # sanitized/source jar (immutable)
 _COOKIE_RESOLVED = False
 _FFMPEG_DIR: str | None = None
 _FFMPEG_RESOLVED = False
@@ -134,11 +135,12 @@ _IMPERSONATE_RESOLVED = False
 
 
 def _resolved_cookie() -> Path | None:
-    global _COOKIE_PATH, _COOKIE_RESOLVED
+    """Return a writable runtime cookie jar (never the uploaded cookies.txt)."""
+    global _COOKIE_PATH, _COOKIE_SOURCE, _COOKIE_RESOLVED
     if _COOKIE_RESOLVED:
         return _COOKIE_PATH
     _COOKIE_RESOLVED = True
-    from bot.utils.cookies import prepare_cookies
+    from bot.utils.cookies import make_runtime_cookie_copy, prepare_cookies
 
     candidates: list[Path] = []
     if COOKIES_FILE:
@@ -149,16 +151,44 @@ def _resolved_cookie() -> Path | None:
     # Sanitized jar: fewer domains → faster + more reliable yt-dlp
     dest = BASE_DIR / "data" / "cookies.sanitized.txt"
     filtered = prepare_cookies(candidates, dest)
-    if filtered:
-        _COOKIE_PATH = filtered
-    else:
+    source: Path | None = filtered
+    if source is None:
         for p in candidates:
             try:
-                if p.is_file():
-                    _COOKIE_PATH = p.resolve()
+                if p.is_file() and p.stat().st_size > 50:
+                    source = p.resolve()
                     break
             except OSError:
                 continue
+    _COOKIE_SOURCE = source
+    if source is not None:
+        runtime = BASE_DIR / "data" / "cookies.runtime.txt"
+        _COOKIE_PATH = make_runtime_cookie_copy(source, runtime) or source
+        logger.info("Cookies ready: source=%s runtime=%s", source, _COOKIE_PATH)
+    return _COOKIE_PATH
+
+
+def _refresh_cookie_runtime() -> Path | None:
+    """
+    Reset the runtime jar from the immutable source.
+
+    Call before each YouTube download that uses cookies so a failed attempt
+    cannot permanently strip LOGIN_INFO for later retries.
+    """
+    global _COOKIE_PATH
+    from bot.utils.cookies import make_runtime_cookie_copy
+
+    source = _COOKIE_SOURCE
+    if source is None:
+        # Ensure resolve ran once
+        path = _resolved_cookie()
+        source = _COOKIE_SOURCE
+        if path is None or source is None:
+            return path
+    runtime = BASE_DIR / "data" / "cookies.runtime.txt"
+    refreshed = make_runtime_cookie_copy(source, runtime)
+    if refreshed is not None:
+        _COOKIE_PATH = refreshed
     return _COOKIE_PATH
 
 
@@ -221,14 +251,7 @@ def _base_opts(*, host: str = "") -> dict[str, Any]:
     if is_yt:
         opts["http_headers"]["Referer"] = "https://www.youtube.com/"
         opts["http_headers"]["Origin"] = "https://www.youtube.com"
-        # Minimal clients for speed; EJS (Deno) still used for JS challenges
-        opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["tv", "web"],
-                "player_skip": ["configs", "webpage"],
-            },
-        }
-        # Only request remote EJS if package scripts missing (set once globally cheaper)
+        # EJS (Deno) for JS challenges. Prefer webpage when cookies exist.
         opts["remote_components"] = ["ejs:github"]
     elif is_ig:
         opts["http_headers"]["Referer"] = "https://www.instagram.com/"
@@ -239,9 +262,24 @@ def _base_opts(*, host: str = "") -> dict[str, Any]:
         if host:
             opts["http_headers"]["Referer"] = f"https://{host.split(':')[0]}/"
 
-    cookie = _resolved_cookie()
+    # For YT, refresh runtime jar so prior failed auth cannot strip LOGIN_INFO
+    cookie = _refresh_cookie_runtime() if is_yt else _resolved_cookie()
     if cookie:
         opts["cookiefile"] = str(cookie)
+
+    if is_yt:
+        if cookie:
+            # Cookies need full webpage session — do NOT player_skip webpage
+            opts["extractor_args"] = {
+                "youtube": {"player_client": ["tv", "web", "mweb"]},
+            }
+        else:
+            opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": ["android", "ios", "tv"],
+                    "player_skip": ["configs", "webpage"],
+                },
+            }
 
     imp = _resolved_impersonate()
     if imp is not None:
@@ -738,18 +776,34 @@ class DownloadManager:
                 # 1) cookies + common clients (full webpage for session)
                 {
                     "use_cookies": True,
+                    "refresh_cookies": True,
                     "extractor_args": {
                         "youtube": {"player_client": ["tv", "web", "mweb"]}
                     },
                 },
-                # 2) cookies + web only
+                # 2) cookies + embedded players (often softer bot checks)
                 {
                     "use_cookies": True,
+                    "refresh_cookies": True,
+                    "extractor_args": {
+                        "youtube": {
+                            "player_client": [
+                                "web_embedded",
+                                "tv_embedded",
+                                "web",
+                            ]
+                        }
+                    },
+                },
+                # 3) cookies + web only
+                {
+                    "use_cookies": True,
+                    "refresh_cookies": True,
                     "extractor_args": {
                         "youtube": {"player_client": ["web"]}
                     },
                 },
-                # 3) cookieless mobile clients (public videos; cookies often invalid on DC IPs)
+                # 4) cookieless mobile (public videos; DC IPs often still blocked)
                 {
                     "use_cookies": False,
                     "extractor_args": {
@@ -760,11 +814,13 @@ class DownloadManager:
                     },
                     "drop_impersonate": True,
                 },
-                # 4) cookieless tv
+                # 5) cookieless embedded / tv
                 {
                     "use_cookies": False,
                     "extractor_args": {
-                        "youtube": {"player_client": ["tv"]}
+                        "youtube": {
+                            "player_client": ["tv_embedded", "tv", "web_embedded"]
+                        }
                     },
                     "drop_impersonate": True,
                 },
@@ -781,6 +837,11 @@ class DownloadManager:
                     attempt_opts["extractor_args"] = strat["extractor_args"]
                 if strat.get("use_cookies") is False:
                     attempt_opts.pop("cookiefile", None)
+                elif strat.get("use_cookies") is True or strat.get("refresh_cookies"):
+                    # Fresh jar each cookie strategy so failed auth cannot strip LOGIN_INFO
+                    jar = _refresh_cookie_runtime()
+                    if jar is not None:
+                        attempt_opts["cookiefile"] = str(jar)
                 if strat.get("drop_impersonate"):
                     attempt_opts.pop("impersonate", None)
 

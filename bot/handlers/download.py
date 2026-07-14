@@ -59,44 +59,6 @@ def _should_auto_download(update: Update) -> bool:
     return AUTO_DOWNLOAD_GROUPS and _is_group_chat(update)
 
 
-def _is_fast_auto_url(url: str) -> bool:
-    """Major platforms: skip metadata wizard → download immediately."""
-    u = (url or "").lower()
-    return any(
-        x in u
-        for x in (
-            "youtu.be/",
-            "youtube.com/",
-            "music.youtube.com/",
-            "instagram.com/",
-            "instagr.am/",
-            "tiktok.com/",
-            "vm.tiktok.com/",
-            "facebook.com/",
-            "fb.watch/",
-            "fb.com/",
-            "x.com/",
-            "twitter.com/",
-            "reddit.com/",
-            "v.redd.it/",
-            "pinterest.",
-            "pin.it/",
-            "vimeo.com/",
-            "twitch.tv/",
-            "soundcloud.com/",
-        )
-    )
-
-
-def _should_fast_auto(update: Update, url: str) -> bool:
-    """Group auto, or private DM fast-path for known platforms."""
-    if _should_auto_download(update):
-        return True
-    if DM_FAST_AUTO and not _is_group_chat(update) and _is_fast_auto_url(url):
-        return True
-    return False
-
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message or not update.effective_user:
         return
@@ -120,14 +82,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # Groups + DM fast-path: skip metadata wizard, download immediately
-    fast = [u for u in urls if _should_fast_auto(update, u)]
-    wizard = [u for u in urls if u not in fast]
-    if fast:
-        batch = fast[:5]
-        if len(fast) > 5:
+    # Groups (or DM_FAST_AUTO=1): download immediately in parallel
+    if _should_auto_download(update) or (
+        DM_FAST_AUTO and not _is_group_chat(update)
+    ):
+        batch = urls[:5]
+        if len(urls) > 5:
             await update.effective_message.reply_text(
-                f"📎 {len(fast)} links — starting first <b>5</b> in parallel.",
+                f"📎 {len(urls)} links — starting first <b>5</b> in parallel.",
                 parse_mode=ParseMode.HTML,
             )
         elif len(batch) > 1:
@@ -139,10 +101,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             *[auto_download_flow(update, context, u) for u in batch],
             return_exceptions=True,
         )
-    if wizard:
-        # Unknown / rare sites still use the quality wizard (one at a time)
-        await start_url_flow(update, context, wizard[0])
-    return
+        return
+
+    # Private DM (default): mode / quality / format button wizard
+    if len(urls) > 1:
+        await update.effective_message.reply_text(
+            f"📎 Found <b>{len(urls)}</b> links. Starting with the first one.\n"
+            f"Send the others again after this finishes — or use a group for multi-link auto.",
+            parse_mode=ParseMode.HTML,
+        )
+    await start_url_flow(update, context, urls[0])
 
 
 async def auto_download_flow(
@@ -344,7 +312,7 @@ async def start_url_flow(
         return
 
     status = await msg.reply_text(
-        "🔍 Analyzing link…\n<code>Fetching metadata &amp; available formats</code>",
+        "🔍 <b>Analyzing…</b>\n<code>Getting title, formats &amp; options</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -358,8 +326,9 @@ async def start_url_flow(
         friendly = DownloadManager._friendly_error(str(e))
         await status.edit_text(
             f"❌ <b>Could not read this link</b>\n\n{_esc(friendly)}\n\n"
-            "Tips: ensure the post is public, try another URL, or refresh cookies.",
+            "Tips: post must be public, try another URL, or refresh cookies on the VPS.",
             parse_mode=ParseMode.HTML,
+            reply_markup=main_reply_keyboard(),
         )
         return
 

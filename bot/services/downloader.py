@@ -723,42 +723,110 @@ class DownloadManager:
     ) -> tuple[dict[str, Any], str, str]:
         """
         Try preferred format first; on failure retry progressive/safe fallbacks.
-        Fails fast on pure image extractors (Pinterest photo pins).
+        YouTube: multi-strategy (cookies+clients, then cookieless clients).
         """
-        # Prefer one successful attempt: primary format, then single progressive fallback
+        host = urlparse(url).netloc.lower()
+        is_yt = "youtu" in host
         primary = opts.get("format") or FORMAT_FALLBACK
         formats = [primary]
         if primary != "b/best":
             formats.append("b/best")
 
+        strategies: list[dict[str, Any]] = [{}]  # default opts as-is
+        if is_yt:
+            strategies = [
+                # 1) cookies + common clients (full webpage for session)
+                {
+                    "use_cookies": True,
+                    "extractor_args": {
+                        "youtube": {"player_client": ["tv", "web", "mweb"]}
+                    },
+                },
+                # 2) cookies + web only
+                {
+                    "use_cookies": True,
+                    "extractor_args": {
+                        "youtube": {"player_client": ["web"]}
+                    },
+                },
+                # 3) cookieless mobile clients (public videos; cookies often invalid on DC IPs)
+                {
+                    "use_cookies": False,
+                    "extractor_args": {
+                        "youtube": {
+                            "player_client": ["android", "ios"],
+                            "player_skip": ["webpage"],
+                        }
+                    },
+                    "drop_impersonate": True,
+                },
+                # 4) cookieless tv
+                {
+                    "use_cookies": False,
+                    "extractor_args": {
+                        "youtube": {"player_client": ["tv"]}
+                    },
+                    "drop_impersonate": True,
+                },
+            ]
+
         last_err: Exception | None = None
-        for i, fmt in enumerate(formats):
-            attempt_opts = dict(opts)
-            attempt_opts["format"] = fmt
-            try:
-                with yt_dlp.YoutubeDL(attempt_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    if info is None:
-                        raise RuntimeError("Download returned no data.")
-                    prepared = ydl.prepare_filename(info)
-                    title = str(info.get("title") or title_hint)[:200]
-                    return info, prepared, title
-            except yt_dlp.utils.DownloadError as e:
-                last_err = e
-                err = str(e).lower()
-                if "no video formats" in err or "only images" in err:
+        for si, strat in enumerate(strategies):
+            for fi, fmt in enumerate(formats):
+                attempt_opts = dict(opts)
+                attempt_opts["format"] = fmt
+                attempt_opts["http_headers"] = dict(opts.get("http_headers") or {})
+
+                if strat.get("extractor_args"):
+                    attempt_opts["extractor_args"] = strat["extractor_args"]
+                if strat.get("use_cookies") is False:
+                    attempt_opts.pop("cookiefile", None)
+                if strat.get("drop_impersonate"):
+                    attempt_opts.pop("impersonate", None)
+
+                try:
+                    with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        if info is None:
+                            raise RuntimeError("Download returned no data.")
+                        prepared = ydl.prepare_filename(info)
+                        title = str(info.get("title") or title_hint)[:200]
+                        if si or fi:
+                            logger.info(
+                                "YT strategy ok si=%s fmt=%s cookies=%s",
+                                si,
+                                fmt[:40],
+                                bool(attempt_opts.get("cookiefile")),
+                            )
+                        return info, prepared, title
+                except yt_dlp.utils.DownloadError as e:
+                    last_err = e
+                    err = str(e).lower()
+                    if "no video formats" in err or "only images" in err:
+                        # not a YT bot-check issue
+                        if not is_yt:
+                            raise
+                    bot_check = (
+                        "not a bot" in err
+                        or "sign in to confirm" in err
+                        or "cookies are no longer valid" in err
+                        or "login required" in err
+                    )
+                    retryable = bot_check or (
+                        "format is not available" in err
+                        or "requested format" in err
+                        or "http error 403" in err
+                        or "unable to download video data" in err
+                    )
+                    if retryable:
+                        logger.warning(
+                            "Attempt failed (si=%s fi=%s): %s",
+                            si,
+                            fi,
+                            str(e).split("\n")[-1][:120],
+                        )
+                        continue
                     raise
-                retryable = (
-                    "format is not available" in err
-                    or "requested format" in err
-                    or "http error 403" in err
-                    or "403" in err
-                    or "unable to download video data" in err
-                )
-                if retryable and i < len(formats) - 1:
-                    logger.warning("Retry progressive format…")
-                    continue
-                raise
         if last_err:
             raise last_err
         raise RuntimeError("Download failed with all format selectors.")
@@ -919,11 +987,17 @@ class DownloadManager:
             or "confirm you're not a bot" in low
             or "confirm you are not a bot" in low
             or "not a bot" in low
+            or "cookies are no longer valid" in low
         ):
             return (
-                "YouTube is blocking the server (bot check). "
-                "Export browser cookies to cookies.txt on the VPS "
-                "(see docs/COOKIES.md) and set COOKIES_FILE=cookies.txt."
+                "YouTube blocked this server / cookies expired.\n\n"
+                "Fix (takes ~1 min):\n"
+                "1. Chrome → open youtube.com (logged in)\n"
+                "2. Export cookies with “Get cookies.txt LOCALLY”\n"
+                "3. Save as cookies.txt (do NOT open YouTube again after export)\n"
+                "4. Upload to VPS and restart the bot\n\n"
+                "Note: Google often invalidates cookies when a VPS IP uses them. "
+                "Re-export if it breaks again."
             )
         if "private" in low or "login required" in low or "sign in" in low:
             return (

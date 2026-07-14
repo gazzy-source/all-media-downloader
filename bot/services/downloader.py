@@ -129,9 +129,10 @@ def _base_opts() -> dict[str, Any]:
         "no_warnings": True,
         "noprogress": True,
         "socket_timeout": 30,
-        "retries": 8,
-        "fragment_retries": 15,
-        "file_access_retries": 5,
+        "retries": 5,
+        "fragment_retries": 8,
+        "file_access_retries": 3,
+        "concurrent_fragment_downloads": 4,
         "nocheckcertificate": True,
         "geo_bypass": True,
         "noplaylist": True,
@@ -515,24 +516,13 @@ class DownloadManager:
                     }
                 )
             elif mode == "image":
-                # Pinterest / pure image pages: yt-dlp often cannot "download" them.
-                # Use dedicated image pipeline (og:image / pinimg / thumbnails).
-                img_result = self._download_image_page(
+                # Dedicated image pipeline — skip slow yt-dlp video format loops
+                return self._download_image_page(
                     url=url,
                     work_dir=work_dir,
                     title_hint=title_hint,
                     progress_cb=progress_cb,
                     loop=loop,
-                )
-                if img_result.success:
-                    return img_result
-                # Fall through to yt-dlp best-effort
-                opts.update(
-                    {
-                        "format": "best",
-                        "writethumbnail": True,
-                        "skip_download": False,
-                    }
                 )
             elif mode == "video_subs":
                 q = QUALITY_MAP.get(quality, QUALITY_MAP["720"])
@@ -635,7 +625,11 @@ class DownloadManager:
             )
         except yt_dlp.utils.DownloadError as e:
             msg = str(e).split("\n")[-1][:300]
-            logger.exception("Download error for %s", url)
+            # Expected failures: keep logs light for speed/noise
+            if self._looks_like_image_only_error(msg) or "403" in msg.lower():
+                logger.warning("Download error for %s: %s", url[:80], msg[:160])
+            else:
+                logger.exception("Download error for %s", url)
             self._cleanup_dir(work_dir)
             return DownloadResult(success=False, error=self._friendly_error(msg), mode=mode, quality=quality)
         except Exception as e:
@@ -656,16 +650,24 @@ class DownloadManager:
         title_hint: str,
     ) -> tuple[dict[str, Any], str, str]:
         """
-        Try preferred format first; on 'format not available' retry with FORMAT_FALLBACK.
-        Instagram/Facebook often expose progressive-only formats that miss height filters.
+        Try preferred format first; on failure retry progressive/safe fallbacks.
+        Fails fast on pure image extractors (Pinterest photo pins).
         """
-        format_chain = [
-            opts.get("format") or FORMAT_FALLBACK,
-            FORMAT_FALLBACK,
-            "b[ext=mp4]/b",  # progressive only — best 403 antidote
-            "18/22/best",  # classic progressive itags
-            "worst",
-        ]
+        host = urlparse(url).netloc.lower()
+        is_youtube = "youtu" in host
+        # Short chain for most sites; YouTube gets progressive retries for 403
+        if is_youtube:
+            format_chain = [
+                opts.get("format") or FORMAT_FALLBACK,
+                "b[ext=mp4]/b",
+                "18/22/best",
+            ]
+        else:
+            format_chain = [
+                opts.get("format") or FORMAT_FALLBACK,
+                "b/best",
+            ]
+
         formats: list[str] = []
         seen: set[str] = set()
         for f in format_chain:
@@ -677,8 +679,7 @@ class DownloadManager:
         for i, fmt in enumerate(formats):
             attempt_opts = dict(opts)
             attempt_opts["format"] = fmt
-            # On later attempts, force progressive-friendly YouTube clients
-            if i > 0:
+            if i > 0 and is_youtube:
                 ea = dict(attempt_opts.get("extractor_args") or {})
                 yt = dict(ea.get("youtube") or {})
                 yt["player_client"] = ["web", "tv", "mweb"]
@@ -697,11 +698,12 @@ class DownloadManager:
             except yt_dlp.utils.DownloadError as e:
                 last_err = e
                 err = str(e).lower()
+                # Image-only extractors: stop immediately (image path handles it)
+                if "no video formats" in err or "only images" in err:
+                    raise
                 retryable = (
                     "format is not available" in err
                     or "requested format" in err
-                    or "no video formats" in err
-                    or "only images" in err
                     or "http error 403" in err
                     or "403: forbidden" in err
                     or "unable to download video data" in err
@@ -709,9 +711,8 @@ class DownloadManager:
                 )
                 if retryable and i < len(formats) - 1:
                     logger.warning(
-                        "Format %r failed (%s); trying fallback…",
-                        fmt[:80],
-                        str(e).split("\n")[-1][:120],
+                        "Format failed (%s); trying fallback…",
+                        str(e).split("\n")[-1][:100],
                     )
                     continue
                 raise
@@ -737,7 +738,11 @@ class DownloadManager:
                 except Exception:
                     pass
 
-            candidates = self._discover_image_urls(url)
+            # Reuse media_detect HTML cache when available
+            from bot.services.media_detect import _fetch_html_cached
+
+            html = _fetch_html_cached(url) if url else ""
+            candidates = self._discover_image_urls(url, html=html or None)
             if not candidates:
                 return DownloadResult(
                     success=False,
@@ -794,26 +799,27 @@ class DownloadManager:
             logger.exception("image page download failed")
             return DownloadResult(success=False, error=str(e)[:300], mode="image")
 
-    def _discover_image_urls(self, page_url: str) -> list[str]:
+    def _discover_image_urls(
+        self, page_url: str, html: str | None = None
+    ) -> list[str]:
         """Find direct image URLs from a social/image page (Pinterest, etc.)."""
         found: list[str] = []
-        # Direct image link
         if any(page_url.lower().endswith(f".{e}") for e in IMAGE_EXTS):
             return [page_url]
 
-        html = self._fetch_text(page_url)
+        if html is None:
+            from bot.services.media_detect import _fetch_html_cached
+
+            html = _fetch_html_cached(page_url)
         if not html:
             return found
 
         patterns = [
             r'property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
             r'content=["\']([^"\']+)["\']\s+property=["\']og:image["\']',
-            r'property=["\']og:image:secure_url["\']\s+content=["\']([^"\']+)["\']',
-            r'"image_spec_url"\s*:\s*"([^"]+)"',
             r'"url"\s*:\s*"(https://i\.pinimg\.com/originals/[^"]+)"',
             r'(https://i\.pinimg\.com/originals/[a-f0-9/._-]+\.(?:jpg|jpeg|png|webp|gif))',
-            r'(https://i\.pinimg\.com/(?:736x|564x|474x|236x)/[a-f0-9/._-]+\.(?:jpg|jpeg|png|webp|gif))',
-            r'(https://[^"\'\s>]+\.(?:jpg|jpeg|png|webp|gif)(?:\?[^"\'\s>]*)?)',
+            r'(https://i\.pinimg\.com/(?:736x|564x)/[a-f0-9/._-]+\.(?:jpg|jpeg|png|webp|gif))',
         ]
         for pat in patterns:
             for m in re.findall(pat, html, flags=re.I):
@@ -821,42 +827,15 @@ class DownloadManager:
                 u = u.split(")")[0].split("}")[0].rstrip("\\")
                 if not u.startswith("http"):
                     continue
-                # Skip tiny icons / tracking
                 low = u.lower()
                 if any(x in low for x in ("favicon", "sprite", "logo", "1x1", "pixel")):
                     continue
-                if "pinimg.com" in low or "og:image" in pat or low.endswith(
-                    (".jpg", ".jpeg", ".png", ".webp", ".gif")
-                ):
-                    found.append(u)
+                found.append(u)
 
-        # Prefer pinimg originals uniquely
         pin_orig = [u for u in found if "pinimg.com/originals/" in u]
         if pin_orig:
-            return pin_orig
-        return found
-
-    def _fetch_text(self, url: str) -> str | None:
-        try:
-            import urllib.request
-
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/131.0.0.0 Safari/537.36"
-                    ),
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept": "text/html,application/xhtml+xml",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=45) as resp:
-                return resp.read().decode("utf-8", "replace")
-        except Exception:
-            logger.exception("Failed to fetch page %s", url)
-            return None
+            return list(dict.fromkeys(pin_orig))
+        return list(dict.fromkeys(found))
 
     @staticmethod
     def _guess_image_ext(url: str) -> str:

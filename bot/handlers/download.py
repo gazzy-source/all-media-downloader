@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from pathlib import Path
@@ -31,6 +32,7 @@ from bot.keyboards.menus import (
 )
 from bot.services.downloader import download_manager
 from bot.services.history import record_download
+from bot.services.media_detect import detect_mode
 from bot.services.rate_limit import rate_limiter
 from bot.services.session import DownloadSession, sessions
 from bot.utils.helpers import (
@@ -48,23 +50,6 @@ def _is_group_chat(update: Update) -> bool:
     if not chat:
         return False
     return chat.type in ("group", "supergroup")
-
-
-def _url_looks_like_image_host(url: str) -> bool:
-    """Heuristic: Pinterest pins / direct image links often have no video."""
-    low = (url or "").lower()
-    if any(low.endswith(f".{e}") for e in ("jpg", "jpeg", "png", "webp", "gif")):
-        return True
-    return any(
-        h in low
-        for h in (
-            "pinterest.com/pin/",
-            "pin.it/",
-            "i.pinimg.com/",
-            "imgur.com/",
-            "i.imgur.com/",
-        )
-    )
 
 
 def _should_auto_download(update: Update) -> bool:
@@ -135,8 +120,7 @@ async def auto_download_flow(
     quality = AUTO_QUALITY
     q_label = QUALITY_MAP.get(quality, {}).get("label", quality)
     status = await msg.reply_text(
-        f"⚡ <b>Auto-download</b> · {q_label}\n"
-        f"<code>Fetching best available…</code>",
+        "⚡ <b>Auto-download</b>\n<code>Detecting media type…</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -144,7 +128,7 @@ async def auto_download_flow(
 
     async def on_progress(pct: float, text: str) -> None:
         now = time.time()
-        if now - last_edit["t"] < 2.5 and pct < 99:
+        if now - last_edit["t"] < 3.0 and pct < 99:
             return
         last_edit["t"] = now
         try:
@@ -158,8 +142,18 @@ async def auto_download_flow(
 
     try:
         await context.bot.send_chat_action(chat.id, ChatAction.UPLOAD_DOCUMENT)
-        # Prefer video; auto-falls back to image for Pinterest pins / photo posts
-        mode = "image" if _url_looks_like_image_host(url) else "video"
+        # Smart detect: video pins vs image pins (never force all Pinterest → image)
+        mode = await asyncio.get_running_loop().run_in_executor(
+            None, detect_mode, url
+        )
+        kind = "🖼 Image" if mode == "image" else f"🎥 Video · {q_label}"
+        try:
+            await status.edit_text(
+                f"⚡ <b>Auto-download</b> · {kind}\n<code>Starting…</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
         result = await download_manager.download(
             url=url,
             mode=mode,

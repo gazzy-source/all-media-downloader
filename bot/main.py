@@ -23,8 +23,10 @@ from bot.config import (
     ADMIN_IDS,
     BASE_DIR,
     BOT_TOKEN,
+    COOKIES_FILE,
     TEMP_DIR,
     TEMP_CLEANUP_HOURS,
+    TELEGRAM_API_URL,
 )
 from bot.handlers.download import handle_callback, handle_message
 from bot.handlers.start import (
@@ -101,6 +103,8 @@ async def post_init(app: Application) -> None:
     logger.info("Logged in as @%s (id=%s)", me.username, me.id)
     logger.info("Admins: %s", ADMIN_IDS or "(none)")
     logger.info("FFmpeg: %s", ff if ff else "NOT FOUND")
+    logger.info("Cookies: %s", COOKIES_FILE if COOKIES_FILE else "none")
+    logger.info("Telegram API: %s", TELEGRAM_API_URL or "https://api.telegram.org (default)")
     logger.info("=" * 50)
 
     # Command menu only — do NOT overwrite name/description/about from BotFather
@@ -147,7 +151,7 @@ def build_app() -> Application:
         sys.exit(1)
 
     # Long write/read timeouts — media uploads (10–50 MB) often need minutes
-    app = (
+    builder = (
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
@@ -161,8 +165,19 @@ def build_app() -> Application:
         .get_updates_write_timeout(30.0)
         .get_updates_pool_timeout(30.0)
         .media_write_timeout(300.0)
-        .build()
     )
+    # Local Bot API server (optional) for larger uploads (~2GB)
+    if TELEGRAM_API_URL:
+        # e.g. http://127.0.0.1:8081/bot  → base_url http://127.0.0.1:8081/bot
+        # PTB expects base_url ending with /bot
+        base = TELEGRAM_API_URL.rstrip("/")
+        if not base.endswith("/bot"):
+            base = base + "/bot"
+        builder = builder.base_url(base + "/")
+        builder = builder.base_file_url(base.replace("/bot", "/file/bot") + "/")
+        logger.info("Using custom Telegram API base: %s", base)
+
+    app = builder.build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))

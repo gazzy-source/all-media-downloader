@@ -20,6 +20,8 @@ ADMIN_IDS: set[int] = {
 }
 
 MAX_CONCURRENT_DOWNLOADS: int = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
+# Soft cap for refusing uploads. Official api.telegram.org is ~50MB unless you
+# run a local Bot API server (then set TELEGRAM_API_URL + raise this to e.g. 1900).
 MAX_FILE_SIZE_MB: float = float(os.getenv("MAX_FILE_SIZE_MB", "49"))
 MAX_FILE_SIZE_BYTES: int = int(MAX_FILE_SIZE_MB * 1024 * 1024)
 
@@ -27,9 +29,42 @@ DOWNLOAD_DIR: Path = Path(os.getenv("DOWNLOAD_DIR", str(BASE_DIR / "downloads"))
 TEMP_DIR: Path = Path(os.getenv("TEMP_DIR", str(BASE_DIR / "temp")))
 DATA_DIR: Path = BASE_DIR / "data"
 
-COOKIES_FILE: str | None = os.getenv("COOKIES_FILE") or None
+# Cookies (Netscape format). Empty env → try ./cookies.txt if present.
+_cookies_env = (os.getenv("COOKIES_FILE") or "").strip()
+if _cookies_env:
+    COOKIES_FILE: str | None = _cookies_env
+elif (BASE_DIR / "cookies.txt").is_file():
+    COOKIES_FILE = str(BASE_DIR / "cookies.txt")
+else:
+    COOKIES_FILE = None
+
 PROXY: str | None = os.getenv("PROXY") or None
 RATE_LIMIT_PER_HOUR: int = int(os.getenv("RATE_LIMIT_PER_HOUR", "30"))
+
+# Group / auto behaviour
+# In groups & supergroups: paste link → download immediately (no wizard)
+AUTO_DOWNLOAD_GROUPS: bool = os.getenv("AUTO_DOWNLOAD_GROUPS", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "no",
+)
+# Force instant download even in private chats
+AUTO_DOWNLOAD_ALWAYS: bool = os.getenv("AUTO_DOWNLOAD_ALWAYS", "0").strip() in (
+    "1",
+    "true",
+    "True",
+    "yes",
+)
+# Quality used for auto mode: 480 | 720 | 1080 | max
+AUTO_QUALITY: str = (os.getenv("AUTO_QUALITY", "max") or "max").strip().lower()
+if AUTO_QUALITY not in ("480", "720", "1080", "max"):
+    AUTO_QUALITY = "max"
+
+# Local Telegram Bot API (optional) — raises file size limit to ~2GB
+# Example: http://127.0.0.1:8081/bot
+TELEGRAM_API_URL: str | None = (os.getenv("TELEGRAM_API_URL") or "").strip() or None
+TELEGRAM_LOCAL_MODE: bool = bool(TELEGRAM_API_URL)
 
 # Optional profile overrides (leave empty to keep @BotFather settings)
 BOT_NAME_OVERRIDE: str | None = os.getenv("BOT_NAME", "").strip() or None

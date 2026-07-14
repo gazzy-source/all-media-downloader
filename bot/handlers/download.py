@@ -11,7 +11,14 @@ from telegram.constants import ChatAction, ParseMode
 from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import ContextTypes
 
-from bot.config import ADMIN_IDS, MAX_FILE_SIZE_BYTES, QUALITY_MAP
+from bot.config import (
+    ADMIN_IDS,
+    AUTO_DOWNLOAD_ALWAYS,
+    AUTO_DOWNLOAD_GROUPS,
+    AUTO_QUALITY,
+    MAX_FILE_SIZE_BYTES,
+    QUALITY_MAP,
+)
 from bot.keyboards.menus import (
     after_download_keyboard,
     audio_format_keyboard,
@@ -36,19 +43,35 @@ from bot.utils.helpers import (
 logger = logging.getLogger(__name__)
 
 
+def _is_group_chat(update: Update) -> bool:
+    chat = update.effective_chat
+    if not chat:
+        return False
+    return chat.type in ("group", "supergroup")
+
+
+def _should_auto_download(update: Update) -> bool:
+    if AUTO_DOWNLOAD_ALWAYS:
+        return True
+    return AUTO_DOWNLOAD_GROUPS and _is_group_chat(update)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message or not update.effective_user:
         return
 
-    # Reply keyboard menus
+    # Reply keyboard menus (private UX only)
     from bot.handlers.start import text_menu_router
 
-    if await text_menu_router(update, context):
+    if not _is_group_chat(update) and await text_menu_router(update, context):
         return
 
     text = update.effective_message.text or update.effective_message.caption or ""
     urls = extract_urls(text)
     if not urls:
+        # Groups: stay quiet on normal chat noise
+        if _is_group_chat(update):
+            return
         await update.effective_message.reply_text(
             "🔗 Please send a valid media URL.\n\n"
             "Example: a YouTube, Instagram, TikTok, X, Facebook, or Pinterest link.",
@@ -56,15 +79,167 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # Process first URL fully; queue note for extras
-    if len(urls) > 1:
+    if len(urls) > 1 and not _is_group_chat(update):
         await update.effective_message.reply_text(
             f"📎 Found <b>{len(urls)}</b> links. Starting with the first one.\n"
             f"Send the others again after this download finishes.",
             parse_mode=ParseMode.HTML,
         )
 
+    # Groups (or AUTO_DOWNLOAD_ALWAYS): instant download, no wizard
+    if _should_auto_download(update):
+        await auto_download_flow(update, context, urls[0])
+        return
+
     await start_url_flow(update, context, urls[0])
+
+
+async def auto_download_flow(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, url: str
+) -> None:
+    """
+    Group / instant mode: download immediately at AUTO_QUALITY (default max).
+    No mode/quality wizard.
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not user or not chat or not msg:
+        return
+
+    allowed, retry = rate_limiter.allow(user.id)
+    if not allowed and user.id not in ADMIN_IDS:
+        await msg.reply_text(
+            f"⏳ Rate limit — try again in {retry}s.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    quality = AUTO_QUALITY
+    q_label = QUALITY_MAP.get(quality, {}).get("label", quality)
+    status = await msg.reply_text(
+        f"⚡ <b>Auto-download</b> · {q_label}\n"
+        f"<code>Fetching best available…</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    last_edit = {"t": 0.0}
+
+    async def on_progress(pct: float, text: str) -> None:
+        now = time.time()
+        if now - last_edit["t"] < 2.5 and pct < 99:
+            return
+        last_edit["t"] = now
+        try:
+            await status.edit_text(
+                f"⚡ <b>Auto-download</b> · {q_label}\n"
+                f"{progress_bar(pct)}\n<code>{_esc(text)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+
+    try:
+        await context.bot.send_chat_action(chat.id, ChatAction.UPLOAD_DOCUMENT)
+        # Prefer video; if site is image-only downloader still falls back via format chain
+        result = await download_manager.download(
+            url=url,
+            mode="video",
+            quality=quality,
+            title_hint="media",
+            progress_cb=on_progress,
+        )
+    except Exception as e:
+        logger.exception("auto download crashed")
+        record_download(user.id, url, "", "?", "video", quality, False, error=str(e))
+        try:
+            await status.edit_text(
+                f"❌ Download failed:\n<code>{_esc(str(e)[:280])}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+        return
+
+    if not result.success or not result.primary:
+        record_download(
+            user.id,
+            url,
+            result.title or "",
+            "?",
+            "video",
+            quality,
+            False,
+            error=result.error,
+        )
+        try:
+            await status.edit_text(
+                f"❌ <b>Download failed</b>\n\n{_esc(result.error or 'Unknown error')}",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+        return
+
+    path = result.primary
+    size = result.file_size or path.stat().st_size
+    try:
+        await status.edit_text(
+            f"📤 Uploading… ({format_size(size)})",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError:
+        pass
+
+    # Minimal caption for groups
+    title = _esc((result.title or "Media")[:100])
+    caption = (
+        f"🎬 <b>{title}</b>\n"
+        f"📐 {q_label} · 💾 {format_size(size)}\n"
+        f"⚡ All-Media Downloader · Gazzy Labs"
+    )
+    actions = after_download_keyboard(url, user_id=user.id)
+
+    try:
+        if size > MAX_FILE_SIZE_BYTES:
+            await status.edit_text(
+                f"⚠️ File is <b>{format_size(size)}</b> (limit "
+                f"~{format_size(MAX_FILE_SIZE_BYTES)}). Try a shorter video.",
+                parse_mode=ParseMode.HTML,
+            )
+            record_download(
+                user.id, url, result.title or "", "?", "video", quality, False,
+                file_size=size, error="File too large",
+            )
+            download_manager.cleanup_result_files(result)
+            return
+
+        await _send_media(context, chat.id, path, result, caption, reply_markup=actions)
+        record_download(
+            user.id, url, result.title or "", "?", "video", quality, True, file_size=size
+        )
+        try:
+            await status.delete()
+        except TelegramError:
+            try:
+                await status.edit_text(f"✅ Sent · {format_size(size)}")
+            except TelegramError:
+                pass
+    except TelegramError as e:
+        logger.exception("auto upload failed")
+        record_download(
+            user.id, url, result.title or "", "?", "video", quality, False,
+            file_size=size, error=str(e),
+        )
+        try:
+            await status.edit_text(
+                f"❌ Upload failed:\n<code>{_esc(str(e)[:200])}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+    finally:
+        download_manager.cleanup_result_files(result)
 
 
 async def start_url_flow(
@@ -74,6 +249,11 @@ async def start_url_flow(
     chat = update.effective_chat
     msg = update.effective_message
     if not user or not chat or not msg:
+        return
+
+    # Groups always auto (safety if called from again: callback)
+    if _should_auto_download(update):
+        await auto_download_flow(update, context, url)
         return
 
     allowed, retry = rate_limiter.allow(user.id)

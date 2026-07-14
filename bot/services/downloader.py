@@ -127,8 +127,9 @@ def _base_opts() -> dict[str, Any]:
         "no_warnings": True,
         "noprogress": True,
         "socket_timeout": 30,
-        "retries": 3,
-        "fragment_retries": 5,
+        "retries": 5,
+        "fragment_retries": 10,
+        "file_access_retries": 3,
         "nocheckcertificate": True,
         "geo_bypass": True,
         "noplaylist": True,
@@ -143,9 +144,21 @@ def _base_opts() -> dict[str, Any]:
             ),
             "Accept-Language": "en-US,en;q=0.9",
         },
+        # Reduce YouTube "Sign in to confirm you're not a bot" without cookies
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "tv", "mweb", "web"],
+                "player_skip": ["webpage"],
+            },
+            "youtubetab": {"skip": ["webpage"]},
+        },
     }
+    cookie_path = None
     if COOKIES_FILE and Path(COOKIES_FILE).exists():
-        opts["cookiefile"] = COOKIES_FILE
+        cookie_path = Path(COOKIES_FILE)
+    if cookie_path:
+        opts["cookiefile"] = str(cookie_path)
+        logger.debug("Using cookies file: %s", cookie_path)
     if PROXY:
         opts["proxy"] = PROXY
     return opts
@@ -637,7 +650,18 @@ class DownloadManager:
     @staticmethod
     def _friendly_error(msg: str) -> str:
         low = msg.lower()
-        if "private" in low or "login" in low or "sign in" in low:
+        if (
+            "sign in to confirm" in low
+            or "confirm you're not a bot" in low
+            or "confirm you are not a bot" in low
+            or "not a bot" in low
+        ):
+            return (
+                "YouTube is blocking the server (bot check). "
+                "Export browser cookies to cookies.txt on the VPS "
+                "(see docs/COOKIES.md) and set COOKIES_FILE=cookies.txt."
+            )
+        if "private" in low or "login required" in low or "sign in" in low:
             return (
                 "This content is private or requires login. "
                 "Add a cookies.txt file for authenticated downloads."

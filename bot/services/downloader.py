@@ -157,13 +157,15 @@ def _base_opts() -> dict[str, Any]:
         # EJS challenge solver (Deno/Node must be on PATH)
         "remote_components": ["ejs:github"],
     }
-    # Browser TLS impersonation (curl_cffi) — strong fix for CDN 403
+    # Browser TLS impersonation (curl_cffi) — must be ImpersonateTarget, not a bare str
     try:
         import curl_cffi  # noqa: F401
+        from yt_dlp.networking.impersonate import ImpersonateTarget
 
-        opts["impersonate"] = "chrome"
-    except Exception:
-        pass
+        target = ImpersonateTarget.from_str("chrome")
+        opts["impersonate"] = target
+    except Exception as e:
+        logger.debug("impersonate unavailable: %s", e)
 
     cookie_path = None
     if COOKIES_FILE and Path(COOKIES_FILE).exists():
@@ -171,7 +173,7 @@ def _base_opts() -> dict[str, Any]:
     elif Path("cookies.txt").is_file():
         cookie_path = Path("cookies.txt").resolve()
     if cookie_path:
-        opts["cookiefile"] = str(cookie_path)
+        opts["cookiefile"] = str(cookie_path.resolve())
         logger.info("Using cookies file: %s", cookie_path)
     if PROXY:
         opts["proxy"] = PROXY
@@ -583,7 +585,13 @@ class DownloadManager:
         except Exception as e:
             logger.exception("Unexpected download failure for %s", url)
             self._cleanup_dir(work_dir)
-            return DownloadResult(success=False, error=str(e)[:300], mode=mode, quality=quality)
+            raw = str(e).strip() or f"{type(e).__name__}: {e!r}"
+            return DownloadResult(
+                success=False,
+                error=self._friendly_error(raw) if raw else f"{type(e).__name__}",
+                mode=mode,
+                quality=quality,
+            )
 
     def _extract_with_format_fallback(
         self,

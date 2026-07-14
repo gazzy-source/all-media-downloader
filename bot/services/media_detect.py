@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import re
 from functools import lru_cache
-from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from bot.utils.helpers import IMAGE_EXTS
@@ -18,7 +17,7 @@ _UA = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-# Strong video signals only (avoid generic page JS false positives like "videos")
+# Strong video signals only (avoid generic page JS false positives)
 _VIDEO_RE = re.compile(
     r"(?:"
     r"pinimg\.com/videos/"
@@ -34,17 +33,16 @@ _VIDEO_RE = re.compile(
 )
 
 _IMAGE_PIN_RE = re.compile(
-    r"i\.pinimg\.com/(?:originals|736x|564x)/[a-f0-9/._-]+\.(?:jpg|jpeg|png|webp|gif)",
+    r"i\.pinimg\.com/(?:originals|736x|564x|474x|236x)/[a-f0-9/._-]+\.(?:jpg|jpeg|png|webp|gif)",
     re.I,
 )
 
-# Direct video hosts / paths
+# Platforms that are almost always video — skip HTML probe
 _VIDEO_HOST_HINTS = (
     "youtube.com",
     "youtu.be",
     "tiktok.com",
     "instagram.com/reel",
-    "instagram.com/p/",  # can be carousel; still try video first
     "instagram.com/tv",
     "facebook.com",
     "fb.watch",
@@ -62,20 +60,18 @@ _IMAGE_HOST_HINTS = (
     "i.pinimg.com/",
     "i.imgur.com/",
     "pbs.twimg.com/media",
-    "cdninstagram.com",
 )
 
 
 def detect_mode(url: str) -> str:
     """
     Return 'video' or 'image' for auto-download.
-    Prefers video when unsure (except clear image URLs).
+    Uses HTML signals + yt-dlp probe for ambiguous Pinterest pins.
     """
     if not url:
         return "video"
     low = url.lower().split("?")[0]
 
-    # Direct file extensions win
     for e in IMAGE_EXTS:
         if low.endswith("." + e):
             return "image"
@@ -83,45 +79,95 @@ def detect_mode(url: str) -> str:
         if low.endswith("." + e):
             return "video"
 
-    # Clear image CDNs
     if any(h in low for h in _IMAGE_HOST_HINTS):
         return "image"
 
-    # Known video platforms
     if any(h in low for h in _VIDEO_HOST_HINTS):
         return "video"
 
-    # Pinterest / pin.it — inspect page (video pins exist)
+    # Pinterest / pin.it — reliable detect
     if "pinterest." in low or "pin.it/" in low:
         return _detect_pinterest(url)
 
-    # Default: try video first (image fallback still exists in downloader)
+    # Instagram posts can be photo or reel — probe lightly via yt-dlp
+    if "instagram.com/p/" in low:
+        return _detect_via_ytdlp(url)
+
     return "video"
 
 
 def _detect_pinterest(url: str) -> str:
     html = _fetch_html_cached(url)
-    if not html:
-        # Unknown — video first; downloader falls back to image if needed
+    has_video = bool(html and _VIDEO_RE.search(html))
+    has_image = bool(html and _IMAGE_PIN_RE.search(html))
+
+    if has_video:
+        logger.info("Pinterest VIDEO (html): %s", url[:80])
         return "video"
-    has_video = bool(_VIDEO_RE.search(html))
-    has_image = bool(_IMAGE_PIN_RE.search(html))
-    if has_video and not has_image:
-        logger.info("Pinterest pin VIDEO: %s", url[:80])
-        return "video"
-    if has_video and has_image:
-        # Video pins also embed poster images — prefer video
-        logger.info("Pinterest pin VIDEO(+poster): %s", url[:80])
-        return "video"
-    if has_image:
-        logger.info("Pinterest pin IMAGE: %s", url[:80])
+    if has_image and not has_video:
+        logger.info("Pinterest IMAGE (html): %s", url[:80])
         return "image"
-    return "video"
+
+    # HTML shell often has no pin media — ask yt-dlp (skip_download)
+    return _detect_via_ytdlp(url)
 
 
-@lru_cache(maxsize=64)
+def _detect_via_ytdlp(url: str) -> str:
+    """
+    One lightweight extract_info(download=False).
+    No formats → image. Formats with vcodec → video.
+    """
+    try:
+        import yt_dlp
+
+        from bot.services.downloader import _base_opts
+
+        opts = _base_opts()
+        opts.update(
+            {
+                "skip_download": True,
+                "quiet": True,
+                "no_warnings": True,
+                "ignoreerrors": True,
+            }
+        )
+        # Don't need format selection for type probe
+        opts.pop("format", None)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if not info:
+            logger.info("probe empty → image: %s", url[:80])
+            return "image"
+        formats = info.get("formats") or []
+        has_vid = any(
+            (f.get("vcodec") or "none") != "none" and (f.get("height") or f.get("url"))
+            for f in formats
+        )
+        # duration / ext hints
+        if info.get("duration") or has_vid:
+            logger.info("probe VIDEO: %s", url[:80])
+            return "video"
+        ext = (info.get("ext") or "").lower()
+        if ext in IMAGE_EXTS or info.get("thumbnail"):
+            logger.info("probe IMAGE: %s", url[:80])
+            return "image"
+        # No usable video formats
+        if not formats or not has_vid:
+            logger.info("probe no formats → IMAGE: %s", url[:80])
+            return "image"
+        return "video"
+    except Exception as e:
+        err = str(e).lower()
+        if "no video formats" in err or "only images" in err:
+            logger.info("probe exception → IMAGE: %s", url[:80])
+            return "image"
+        logger.warning("probe failed (%s) → video default: %s", e, url[:80])
+        return "video"
+
+
+@lru_cache(maxsize=128)
 def _fetch_html_cached(url: str) -> str:
-    """Cache short HTML probes within process lifetime."""
+    """Cache HTML probes (full page up to 1.5MB)."""
     try:
         req = Request(
             url,
@@ -131,9 +177,8 @@ def _fetch_html_cached(url: str) -> str:
                 "Accept": "text/html,application/xhtml+xml",
             },
         )
-        with urlopen(req, timeout=12) as resp:
-            # Only need first ~400KB for embedded JSON
-            data = resp.read(400_000)
+        with urlopen(req, timeout=15) as resp:
+            data = resp.read(1_500_000)
         return data.decode("utf-8", "replace")
     except Exception as e:
         logger.warning("media probe failed for %s: %s", url[:80], e)

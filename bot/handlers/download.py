@@ -53,27 +53,51 @@ def _is_group_chat(update: Update) -> bool:
     return chat.type in ("group", "supergroup")
 
 
+def _is_channel_chat(update: Update) -> bool:
+    chat = update.effective_chat
+    return bool(chat and chat.type == "channel")
+
+
+def _is_auto_chat(update: Update) -> bool:
+    """Groups, supergroups, and channels use auto-download (no wizard)."""
+    return _is_group_chat(update) or _is_channel_chat(update)
+
+
+def _actor_id(update: Update) -> int | None:
+    """User id, or channel id when the post has no from-user."""
+    user = update.effective_user
+    if user:
+        return user.id
+    chat = update.effective_chat
+    if chat and chat.type == "channel":
+        return chat.id
+    return None
+
+
 def _should_auto_download(update: Update) -> bool:
     if AUTO_DOWNLOAD_ALWAYS:
         return True
-    return AUTO_DOWNLOAD_GROUPS and _is_group_chat(update)
+    return AUTO_DOWNLOAD_GROUPS and _is_auto_chat(update)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_message or not update.effective_user:
+    if not update.effective_message:
+        return
+    # Channel posts often have no effective_user — still process them
+    if not update.effective_user and not _is_channel_chat(update):
         return
 
-    # Reply keyboard menus (private UX only)
+    # Reply keyboard menus (private UX only — not groups/channels)
     from bot.handlers.start import text_menu_router
 
-    if not _is_group_chat(update) and await text_menu_router(update, context):
+    if not _is_auto_chat(update) and await text_menu_router(update, context):
         return
 
     text = update.effective_message.text or update.effective_message.caption or ""
     urls = extract_urls(text)
     if not urls:
-        # Groups: stay quiet on normal chat noise
-        if _is_group_chat(update):
+        # Groups/channels: stay quiet on normal posts
+        if _is_auto_chat(update):
             return
         await update.effective_message.reply_text(
             "🔗 Please send a valid media URL.\n\n"
@@ -82,9 +106,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # Groups (or DM_FAST_AUTO=1): download immediately in parallel
+    # Groups / channels (or DM_FAST_AUTO=1): download immediately in parallel
     if _should_auto_download(update) or (
-        DM_FAST_AUTO and not _is_group_chat(update)
+        DM_FAST_AUTO and not _is_auto_chat(update)
     ):
         batch = urls[:5]
         if len(urls) > 5:
@@ -107,7 +131,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if len(urls) > 1:
         await update.effective_message.reply_text(
             f"📎 Found <b>{len(urls)}</b> links. Starting with the first one.\n"
-            f"Send the others again after this finishes — or use a group for multi-link auto.",
+            f"Send the others again after this finishes — or use a group/channel for multi-link auto.",
             parse_mode=ParseMode.HTML,
         )
     await start_url_flow(update, context, urls[0])
@@ -117,21 +141,25 @@ async def auto_download_flow(
     update: Update, context: ContextTypes.DEFAULT_TYPE, url: str
 ) -> None:
     """
-    Group / instant mode: download immediately at AUTO_QUALITY (default max).
+    Group / channel / instant mode: download immediately at AUTO_QUALITY.
     No mode/quality wizard.
     """
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
-    if not user or not chat or not msg:
+    actor = _actor_id(update)
+    if not chat or not msg or actor is None:
         return
 
-    allowed, retry = rate_limiter.allow(user.id)
-    if not allowed and user.id not in ADMIN_IDS:
-        await msg.reply_text(
-            f"⏳ Rate limit — try again in {retry}s.",
-            parse_mode=ParseMode.HTML,
-        )
+    allowed, retry = rate_limiter.allow(actor)
+    if not allowed and actor not in ADMIN_IDS:
+        try:
+            await msg.reply_text(
+                f"⏳ Rate limit — try again in {retry}s.",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
         return
 
     quality = AUTO_QUALITY
@@ -196,7 +224,7 @@ async def auto_download_flow(
         )
     except Exception as e:
         logger.exception("auto download crashed")
-        record_download(user.id, url, "", "?", "video", quality, False, error=str(e))
+        record_download(actor, url, "", "?", "video", quality, False, error=str(e))
         try:
             await status.edit_text(
                 f"❌ Download failed:\n<code>{_esc(str(e)[:280])}</code>",
@@ -208,7 +236,7 @@ async def auto_download_flow(
 
     if not result.success or not result.primary:
         record_download(
-            user.id,
+            actor,
             url,
             result.title or "",
             "?",
@@ -236,7 +264,7 @@ async def auto_download_flow(
     except TelegramError:
         pass
 
-    # Minimal caption for groups
+    # Minimal caption for groups/channels
     title = _esc((result.title or "Media")[:100])
     kind = "🖼 Image" if result.is_image else f"📐 {q_label}"
     caption = (
@@ -244,7 +272,8 @@ async def auto_download_flow(
         f"{kind} · 💾 {format_size(size)}\n"
         f"⚡ All-Media Downloader · Gazzy Labs"
     )
-    actions = after_download_keyboard(url, user_id=user.id)
+    # Inline buttons work in channels when the bot posts the media
+    actions = after_download_keyboard(url, user_id=actor)
 
     try:
         if size > MAX_FILE_SIZE_BYTES:
@@ -254,7 +283,7 @@ async def auto_download_flow(
                 parse_mode=ParseMode.HTML,
             )
             record_download(
-                user.id, url, result.title or "", "?", "video", quality, False,
+                actor, url, result.title or "", "?", "video", quality, False,
                 file_size=size, error="File too large",
             )
             download_manager.cleanup_result_files(result)
@@ -262,7 +291,7 @@ async def auto_download_flow(
 
         await _send_media(context, chat.id, path, result, caption, reply_markup=actions)
         record_download(
-            user.id, url, result.title or "", "?", "video", quality, True, file_size=size
+            actor, url, result.title or "", "?", "video", quality, True, file_size=size
         )
         try:
             await status.delete()
@@ -274,7 +303,7 @@ async def auto_download_flow(
     except TelegramError as e:
         logger.exception("auto upload failed")
         record_download(
-            user.id, url, result.title or "", "?", "video", quality, False,
+            actor, url, result.title or "", "?", "video", quality, False,
             file_size=size, error=str(e),
         )
         try:
@@ -297,9 +326,12 @@ async def start_url_flow(
     if not user or not chat or not msg:
         return
 
-    # Groups always auto (safety if called from again: callback)
+    # Groups / channels always auto (safety if called from again: callback)
     if _should_auto_download(update):
         await auto_download_flow(update, context, url)
+        return
+
+    if not user:
         return
 
     allowed, retry = rate_limiter.allow(user.id)

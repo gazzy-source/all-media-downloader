@@ -22,12 +22,13 @@ WELCOME = f"""
 
 <b>How to use</b>
 • <b>Private chat:</b> paste a link → pick type &amp; quality (buttons)
-• <b>Groups:</b> paste a link → auto-download (up to 1080p)
+• <b>Groups / channels:</b> paste a link → auto-download (up to 1080p)
 
 <b>Pro tips</b>
 • YouTube / IG / TikTok / X / Facebook / Pinterest &amp; 1000+ sites
 • Audio · subtitles · images via the private-chat buttons
-• Bot needs to see group messages (@BotFather → /setprivacy → Disable)
+• Groups: @BotFather → /setprivacy → Disable
+• Channels: add bot as <b>admin</b> with <b>Post messages</b>
 
 Just paste a link 👇
 """.strip()

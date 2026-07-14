@@ -57,9 +57,10 @@ AUTO_DOWNLOAD_ALWAYS: bool = os.getenv("AUTO_DOWNLOAD_ALWAYS", "0").strip() in (
     "yes",
 )
 # Quality used for auto mode: 480 | 720 | 1080 | max
-AUTO_QUALITY: str = (os.getenv("AUTO_QUALITY", "max") or "max").strip().lower()
+# Default 1080 — never auto-pick above 1080p (saves bandwidth / Telegram size)
+AUTO_QUALITY: str = (os.getenv("AUTO_QUALITY", "1080") or "1080").strip().lower()
 if AUTO_QUALITY not in ("480", "720", "1080", "max"):
-    AUTO_QUALITY = "max"
+    AUTO_QUALITY = "1080"
 
 # Local Telegram Bot API (optional) — raises file size limit to ~2GB
 # Example: http://127.0.0.1:8081/bot
@@ -134,9 +135,11 @@ QUALITY_MAP = {
     "1080": {
         "label": "1080p",
         "height": 1080,
+        # Cap at 1080p even if source is 1440p/4K — still fall back if lower only
         "format": (
             "bv*[height<=1080]+ba/b[height<=1080]/"
-            "best[height<=1080]/bestvideo*+bestaudio/best"
+            "best[height<=1080]/bestvideo*[height<=1080]+bestaudio/"
+            "best"
         ),
     },
     "max": {

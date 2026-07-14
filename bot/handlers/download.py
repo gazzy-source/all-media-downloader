@@ -81,18 +81,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    if len(urls) > 1 and not _is_group_chat(update):
+    # Groups / auto: process up to 5 links concurrently
+    if _should_auto_download(update):
+        batch = urls[:5]
+        if len(urls) > 5:
+            await update.effective_message.reply_text(
+                f"📎 {len(urls)} links — starting first <b>5</b> in parallel.",
+                parse_mode=ParseMode.HTML,
+            )
+        elif len(batch) > 1:
+            await update.effective_message.reply_text(
+                f"📎 Starting <b>{len(batch)}</b> downloads…",
+                parse_mode=ParseMode.HTML,
+            )
+        await asyncio.gather(
+            *[auto_download_flow(update, context, u) for u in batch],
+            return_exceptions=True,
+        )
+        return
+
+    if len(urls) > 1:
         await update.effective_message.reply_text(
             f"📎 Found <b>{len(urls)}</b> links. Starting with the first one.\n"
             f"Send the others again after this download finishes.",
             parse_mode=ParseMode.HTML,
         )
-
-    # Groups (or AUTO_DOWNLOAD_ALWAYS): instant download, no wizard
-    if _should_auto_download(update):
-        await auto_download_flow(update, context, urls[0])
-        return
-
     await start_url_flow(update, context, urls[0])
 
 

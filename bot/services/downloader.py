@@ -144,14 +144,16 @@ def _base_opts() -> dict[str, Any]:
             ),
             "Accept-Language": "en-US,en;q=0.9",
         },
-        # Reduce YouTube "Sign in to confirm you're not a bot" without cookies
+        # YouTube: cookies + EJS (Deno/Node on PATH) solve JS challenges
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "tv", "mweb", "web"],
+                "player_client": ["tv", "web", "mweb", "android", "ios"],
                 "player_skip": ["webpage"],
             },
             "youtubetab": {"skip": ["webpage"]},
         },
+        # Allow downloading EJS challenge solver scripts when needed
+        "remote_components": ["ejs:github"],
     }
     cookie_path = None
     if COOKIES_FILE and Path(COOKIES_FILE).exists():

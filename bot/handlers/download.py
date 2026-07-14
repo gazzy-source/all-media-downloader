@@ -316,10 +316,12 @@ async def start_url_flow(
         info = await download_manager.extract_info(url)
     except Exception as e:
         logger.exception("extract_info failed")
-        err = str(e)[:250]
+        from bot.services.downloader import DownloadManager
+
+        friendly = DownloadManager._friendly_error(str(e))
         await status.edit_text(
-            f"❌ <b>Could not read this link</b>\n\n<code>{_esc(err)}</code>\n\n"
-            "Tips: ensure the post is public, try another URL, or update yt-dlp.",
+            f"❌ <b>Could not read this link</b>\n\n{_esc(friendly)}\n\n"
+            "Tips: ensure the post is public, try another URL, or refresh cookies.",
             parse_mode=ParseMode.HTML,
         )
         return

@@ -155,7 +155,8 @@ async def auto_download_flow(
 
     kind = "🖼 Image" if mode == "image" else f"🎥 {q_label}"
     status = await msg.reply_text(
-        f"⚡ <b>Downloading</b> · {kind}",
+        f"⚡ <b>Starting</b> · {kind}\n"
+        f"<code>{download_manager.active}/{download_manager.max_concurrent} parallel</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -163,13 +164,17 @@ async def auto_download_flow(
 
     async def on_progress(pct: float, text: str) -> None:
         now = time.time()
+        is_status = pct < 5 or "Queued" in text or "Starting" in text or "Connecting" in text
         # Light UI updates only — don't slow the download path
-        if now - last_edit["t"] < 4.0 and pct < 95:
+        if not is_status and now - last_edit["t"] < 3.0 and pct < 95:
             return
         last_edit["t"] = now
         try:
+            label = "Queued" if "Queued" in text else "Downloading"
             await status.edit_text(
-                f"⚡ <b>Downloading</b> · {kind}\n{progress_bar(pct)}",
+                f"⚡ <b>{label}</b> · {kind}\n"
+                f"{progress_bar(pct)}\n"
+                f"<code>{_esc(text)}</code>",
                 parse_mode=ParseMode.HTML,
             )
         except TelegramError:
@@ -593,7 +598,10 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         summary += f"Format: <b>{session.audio_format.upper()}</b>\n"
     if mode == "video_subs":
         summary += f"Subtitles: <b>{_esc(session.subtitle_lang or 'auto')}</b>\n"
-    summary += f"\n{progress_bar(0)}\n<code>Queued…</code>"
+    summary += (
+        f"\n{progress_bar(0)}\n"
+        f"<code>Starting… ({download_manager.active}/{download_manager.max_concurrent} parallel)</code>"
+    )
 
     try:
         await query.edit_message_text(summary, parse_mode=ParseMode.HTML)
@@ -604,7 +612,9 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
 
     async def on_progress(pct: float, msg: str) -> None:
         now = time.time()
-        if now - last_edit["t"] < 2.0 and pct < 99:
+        # Always show queue / start messages; throttle mid-download %
+        is_status = pct < 5 or "Queued" in msg or "Starting" in msg or "Connecting" in msg
+        if not is_status and now - last_edit["t"] < 2.0 and pct < 99:
             return
         last_edit["t"] = now
         text = (

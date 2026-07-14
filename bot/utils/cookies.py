@@ -8,14 +8,27 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Noise to always drop (even if under google.com)
+_DROP_SUBSTR = (
+    "mail.google",
+    "chromewebstore",
+    "chrome.google",
+    "contacts.google",
+    "tasks.google",
+    "myaccount.google",
+    "play.google",
+    "ogs.google",
+    "gds.google",
+    "getadblock",
+    "adblock",
+)
+
 # Domains that help downloads (substring match on cookie domain column)
 KEEP_DOMAIN_SUBSTR = (
     "youtube.com",
     "googlevideo.com",
     "ytimg.com",
     "ggpht.com",
-    "google.com",  # YT auth often needs .google.com SID/SAPISID
-    "google.co.",  # country TLDs e.g. google.co.in
     "instagram.com",
     "cdninstagram.com",
     "facebook.com",
@@ -32,8 +45,16 @@ KEEP_DOMAIN_SUBSTR = (
 
 
 def _keep_domain(domain: str) -> bool:
-    d = domain.lower().lstrip(".")
-    return any(k in d or d.endswith(k.lstrip(".")) for k in KEEP_DOMAIN_SUBSTR)
+    raw = domain.lower()
+    d = raw.lstrip(".")
+    if any(x in d for x in _DROP_SUBSTR):
+        return False
+    # Keep bare google auth hosts only (not every *.google.* product)
+    if d == "google.com" or d.startswith("google.co.") or d == "accounts.google.com":
+        return True
+    if raw in (".google.com", ".google.co.in") or raw.startswith(".google.co."):
+        return True
+    return any(k in d for k in KEEP_DOMAIN_SUBSTR)
 
 
 def sanitize_cookie_file(src: Path, dest: Path) -> Path | None:

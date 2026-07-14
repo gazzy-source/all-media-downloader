@@ -150,8 +150,8 @@ async def auto_download_flow(
 
     async def on_progress(pct: float, text: str) -> None:
         now = time.time()
-        # Minimal Telegram edits (rate limits + CPU)
-        if now - last_edit["t"] < 5.0 and pct < 95:
+        # Light UI updates only — don't slow the download path
+        if now - last_edit["t"] < 4.0 and pct < 95:
             return
         last_edit["t"] = now
         try:
@@ -790,12 +790,12 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         sessions.remove(session.session_id)
 
 
-# Per-request timeouts for large media (seconds)
+# Per-request timeouts for large media (seconds) — long write for multi-MB uploads
 _UPLOAD_KW = {
-    "read_timeout": 300,
-    "write_timeout": 300,
-    "connect_timeout": 60,
-    "pool_timeout": 60,
+    "read_timeout": 180,
+    "write_timeout": 600,
+    "connect_timeout": 30,
+    "pool_timeout": 30,
 }
 
 

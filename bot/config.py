@@ -119,38 +119,44 @@ QUALITY_MAP = {
     "480": {
         "label": "480p",
         "height": 480,
+        # Prefer progressive (single-file) first — fewer YouTube 403s on CDN
         "format": (
+            "b[height<=480][ext=mp4]/"
+            "b[height<=480]/"
             "bv*[height<=480]+ba/b[height<=480]/"
-            "best[height<=480]/bestvideo*+bestaudio/best"
+            "best[height<=480]/best"
         ),
     },
     "720": {
         "label": "720p",
         "height": 720,
         "format": (
+            "b[height<=720][ext=mp4]/"
+            "b[height<=720]/"
             "bv*[height<=720]+ba/b[height<=720]/"
-            "best[height<=720]/bestvideo*+bestaudio/best"
+            "best[height<=720]/best"
         ),
     },
     "1080": {
         "label": "1080p",
         "height": 1080,
-        # Cap at 1080p even if source is 1440p/4K — still fall back if lower only
+        # Cap at 1080p; progressive first to avoid googlevideo 403
         "format": (
+            "b[height<=1080][ext=mp4]/"
+            "b[height<=1080]/"
             "bv*[height<=1080]+ba/b[height<=1080]/"
-            "best[height<=1080]/bestvideo*[height<=1080]+bestaudio/"
-            "best"
+            "best[height<=1080]/best"
         ),
     },
     "max": {
         "label": "Max Quality",
         "height": 9999,
-        "format": "bestvideo*+bestaudio/best/bv*+ba/b",
+        "format": "b[ext=mp4]/b/bestvideo*+bestaudio/best",
     },
 }
 
-# Ultra-safe fallback when a site rejects the quality selector
-FORMAT_FALLBACK = "bestvideo*+bestaudio/best/bestvideo/bestaudio/best"
+# Ultra-safe fallback when a site rejects the quality selector / 403
+FORMAT_FALLBACK = "b[ext=mp4]/b/best/bestvideo*+bestaudio/worst"
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)

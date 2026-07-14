@@ -127,15 +127,15 @@ def _base_opts() -> dict[str, Any]:
         "no_warnings": True,
         "noprogress": True,
         "socket_timeout": 30,
-        "retries": 5,
-        "fragment_retries": 10,
-        "file_access_retries": 3,
+        "retries": 8,
+        "fragment_retries": 15,
+        "file_access_retries": 5,
         "nocheckcertificate": True,
         "geo_bypass": True,
         "noplaylist": True,
         "ignoreerrors": False,
         "extract_flat": False,
-        # Prefer mobile UA for some social platforms
+        # Referer required for many googlevideo CDN URLs
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -143,24 +143,36 @@ def _base_opts() -> dict[str, Any]:
                 "Chrome/131.0.0.0 Safari/537.36"
             ),
             "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.youtube.com/",
+            "Origin": "https://www.youtube.com",
         },
-        # YouTube: cookies + EJS (Deno/Node on PATH) solve JS challenges
+        # Prefer web/tv when cookies are used (android/ios ignore cookies → 403)
         "extractor_args": {
             "youtube": {
-                "player_client": ["tv", "web", "mweb", "android", "ios"],
+                "player_client": ["web", "tv", "mweb"],
                 "player_skip": ["webpage"],
             },
             "youtubetab": {"skip": ["webpage"]},
         },
-        # Allow downloading EJS challenge solver scripts when needed
+        # EJS challenge solver (Deno/Node must be on PATH)
         "remote_components": ["ejs:github"],
     }
+    # Browser TLS impersonation (curl_cffi) — strong fix for CDN 403
+    try:
+        import curl_cffi  # noqa: F401
+
+        opts["impersonate"] = "chrome"
+    except Exception:
+        pass
+
     cookie_path = None
     if COOKIES_FILE and Path(COOKIES_FILE).exists():
         cookie_path = Path(COOKIES_FILE)
+    elif Path("cookies.txt").is_file():
+        cookie_path = Path("cookies.txt").resolve()
     if cookie_path:
         opts["cookiefile"] = str(cookie_path)
-        logger.debug("Using cookies file: %s", cookie_path)
+        logger.info("Using cookies file: %s", cookie_path)
     if PROXY:
         opts["proxy"] = PROXY
     return opts
@@ -586,7 +598,8 @@ class DownloadManager:
         format_chain = [
             opts.get("format") or FORMAT_FALLBACK,
             FORMAT_FALLBACK,
-            "best",
+            "b[ext=mp4]/b",  # progressive only — best 403 antidote
+            "18/22/best",  # classic progressive itags
             "worst",
         ]
         formats: list[str] = []
@@ -600,7 +613,13 @@ class DownloadManager:
         for i, fmt in enumerate(formats):
             attempt_opts = dict(opts)
             attempt_opts["format"] = fmt
-            # Don't re-run heavy postprocessors that need a real download on dry fails
+            # On later attempts, force progressive-friendly YouTube clients
+            if i > 0:
+                ea = dict(attempt_opts.get("extractor_args") or {})
+                yt = dict(ea.get("youtube") or {})
+                yt["player_client"] = ["web", "tv", "mweb"]
+                ea["youtube"] = yt
+                attempt_opts["extractor_args"] = ea
             try:
                 with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
@@ -619,6 +638,10 @@ class DownloadManager:
                     or "requested format" in err
                     or "no video formats" in err
                     or "only images" in err
+                    or "http error 403" in err
+                    or "403: forbidden" in err
+                    or "unable to download video data" in err
+                    or "forbidden" in err
                 )
                 if retryable and i < len(formats) - 1:
                     logger.warning(
@@ -690,6 +713,12 @@ class DownloadManager:
             return "The download timed out. Please try again."
         if "rate-limit" in low or "rate limit" in low or "too many requests" in low:
             return "The platform rate-limited the bot. Wait a minute and try again."
+        if "403" in low or "forbidden" in low:
+            return (
+                "YouTube blocked the media stream (HTTP 403). "
+                "Refresh cookies.txt (export while logged into YouTube) "
+                "and try again. The bot now retries safer formats automatically."
+            )
         return msg or "Download failed for an unknown reason."
 
     @staticmethod

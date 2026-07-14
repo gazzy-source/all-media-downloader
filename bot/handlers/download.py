@@ -264,24 +264,34 @@ async def auto_download_flow(
     except TelegramError:
         pass
 
-    # Minimal caption for groups/channels
-    title = _esc((result.title or "Media")[:100])
-    kind = "🖼 Image" if result.is_image else f"📐 {q_label}"
-    caption = (
-        f"🎬 <b>{title}</b>\n"
-        f"{kind} · 💾 {format_size(size)}\n"
-        f"⚡ All-Media Downloader · Gazzy Labs"
-    )
-    # Inline buttons work in channels when the bot posts the media
-    actions = after_download_keyboard(url, user_id=actor)
+    # Channels: clean media only (no caption, no buttons). Groups keep a short caption.
+    is_channel = chat.type == "channel"
+    if is_channel:
+        caption = ""
+        actions = None
+    else:
+        title = _esc((result.title or "Media")[:100])
+        kind = "🖼 Image" if result.is_image else f"📐 {q_label}"
+        caption = (
+            f"🎬 <b>{title}</b>\n"
+            f"{kind} · 💾 {format_size(size)}\n"
+            f"⚡ All-Media Downloader · Gazzy Labs"
+        )
+        actions = after_download_keyboard(url, user_id=actor)
 
     try:
         if size > MAX_FILE_SIZE_BYTES:
-            await status.edit_text(
-                f"⚠️ File is <b>{format_size(size)}</b> (limit "
-                f"~{format_size(MAX_FILE_SIZE_BYTES)}). Try a shorter video.",
-                parse_mode=ParseMode.HTML,
-            )
+            if is_channel:
+                try:
+                    await status.delete()
+                except TelegramError:
+                    pass
+            else:
+                await status.edit_text(
+                    f"⚠️ File is <b>{format_size(size)}</b> (limit "
+                    f"~{format_size(MAX_FILE_SIZE_BYTES)}). Try a shorter video.",
+                    parse_mode=ParseMode.HTML,
+                )
             record_download(
                 actor, url, result.title or "", "?", "video", quality, False,
                 file_size=size, error="File too large",
@@ -296,10 +306,11 @@ async def auto_download_flow(
         try:
             await status.delete()
         except TelegramError:
-            try:
-                await status.edit_text(f"✅ Sent · {format_size(size)}")
-            except TelegramError:
-                pass
+            if not is_channel:
+                try:
+                    await status.edit_text(f"✅ Sent · {format_size(size)}")
+                except TelegramError:
+                    pass
     except TelegramError as e:
         logger.exception("auto upload failed")
         record_download(
@@ -931,6 +942,14 @@ async def _send_media_once(
     reply_markup=None,
 ) -> None:
     kw = dict(_UPLOAD_KW)
+    # Empty caption → omit (clean channel posts)
+    cap = (caption or "").strip()
+    cap_kw: dict = {}
+    if cap:
+        cap_kw["caption"] = cap
+        cap_kw["parse_mode"] = ParseMode.HTML
+    if reply_markup is not None:
+        cap_kw["reply_markup"] = reply_markup
 
     if result.is_audio:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
@@ -938,11 +957,9 @@ async def _send_media_once(
             await context.bot.send_audio(
                 chat_id,
                 audio=InputFile(f, filename=filename),
-                caption=caption,
-                parse_mode=ParseMode.HTML,
                 title=result.title[:64] if result.title else None,
-                performer="All-Media Downloader Bot",
-                reply_markup=reply_markup,
+                performer="All-Media Downloader Bot" if cap else None,
+                **cap_kw,
                 **kw,
             )
         return
@@ -954,9 +971,7 @@ async def _send_media_once(
                 await context.bot.send_photo(
                     chat_id,
                     photo=InputFile(f, filename=filename),
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup,
+                    **cap_kw,
                     **kw,
                 )
             except TelegramError:
@@ -964,9 +979,7 @@ async def _send_media_once(
                 await context.bot.send_document(
                     chat_id,
                     document=InputFile(f, filename=filename),
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup,
+                    **cap_kw,
                     **kw,
                 )
         return
@@ -978,10 +991,8 @@ async def _send_media_once(
                 await context.bot.send_video(
                     chat_id,
                     video=InputFile(f, filename=filename),
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
                     supports_streaming=True,
-                    reply_markup=reply_markup,
+                    **cap_kw,
                     **kw,
                 )
                 return
@@ -993,9 +1004,7 @@ async def _send_media_once(
                 await context.bot.send_document(
                     chat_id,
                     document=InputFile(f, filename=filename),
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup,
+                    **cap_kw,
                     **kw,
                 )
                 return
@@ -1005,9 +1014,7 @@ async def _send_media_once(
         await context.bot.send_document(
             chat_id,
             document=InputFile(f, filename=filename),
-            caption=caption,
-            parse_mode=ParseMode.HTML,
-            reply_markup=reply_markup,
+            **cap_kw,
             **kw,
         )
 

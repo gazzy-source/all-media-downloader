@@ -13,6 +13,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/gazzy-source/all-media-downloader/actions/workflows/ci.yml"><img src="https://github.com/gazzy-source/all-media-downloader/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI status" /></a>
   <a href="#-why-this-isnt-just-another-ytdlp-wrapper"><img src="https://img.shields.io/badge/design-guided%20wizard-7C3AED?style=flat-square" alt="Guided wizard" /></a>
   <a href="#-features"><img src="https://img.shields.io/badge/platforms-1000%2B-0EA5E9?style=flat-square" alt="1000+ platforms" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22C55E?style=flat-square" alt="MIT" /></a>

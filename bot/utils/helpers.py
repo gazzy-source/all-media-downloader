@@ -46,7 +46,12 @@ def extract_urls(text: str) -> list[str]:
 
 
 def _expand_short_url(url: str) -> str:
-    """Resolve pin.it / tiny redirects quickly (one HEAD/GET, short timeout)."""
+    """Resolve pin.it / t.co / bit.ly redirects quickly (short timeout).
+
+    NOTE: runs synchronously inside async handlers, so it must stay cheap —
+    each attempt is bounded to 2s. yt-dlp follows any remaining redirects
+    itself, so a failed expansion is harmless (original URL is returned).
+    """
     low = url.lower()
     if "pin.it/" not in low and "t.co/" not in low and "bit.ly/" not in low:
         return url
@@ -58,7 +63,7 @@ def _expand_short_url(url: str) -> str:
             method="HEAD",
             headers={"User-Agent": "Mozilla/5.0"},
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=2) as resp:
             final = resp.geturl()
             if final and final.startswith("http"):
                 return final
@@ -67,7 +72,7 @@ def _expand_short_url(url: str) -> str:
             import urllib.request
 
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=2) as resp:
                 final = resp.geturl()
                 if final and final.startswith("http"):
                     return final

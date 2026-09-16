@@ -89,11 +89,12 @@ def sanitize_cookie_file(src: Path, dest: Path) -> Path | None:
         if not raw or raw.startswith("#"):
             continue
         # Netscape: domain, flag, path, secure, expiry, name, value
-        # Some exporters use spaces; normalize tabs
-        if "\t" not in raw and "  " in raw:
-            parts = raw.split()
-        else:
+        # Some exporters emit space-separated rows (single or double spaces);
+        # only trust whitespace splitting when the row has no tabs at all.
+        if "\t" in raw:
             parts = raw.split("\t")
+        else:
+            parts = raw.split()
         if len(parts) < 7:
             continue
         domain, flag, path, secure, expiry_s, name, value = (

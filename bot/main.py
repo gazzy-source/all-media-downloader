@@ -56,9 +56,11 @@ logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled error: %s", context.error)
-    if isinstance(update, Update) and update.effective_message:
+    # Duck-typed access: works for Update and any object carrying effective_message
+    msg = getattr(update, "effective_message", None)
+    if msg is not None:
         try:
-            await update.effective_message.reply_text(
+            await msg.reply_text(
                 "⚠️ Something went wrong. Please try again or /cancel."
             )
         except Exception:

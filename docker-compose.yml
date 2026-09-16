@@ -5,9 +5,23 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      # PO-token provider reachable by container name (no cookies needed)
+      POT_PROVIDER_URL: http://bgutil-provider:4416
+    depends_on:
+      - bgutil-provider
     volumes:
       - ./downloads:/app/downloads
+      - ./compose-data:/app/data
       - ./temp:/app/temp
-      - ./data:/app/data
-      # Optional: mount cookies for private/age-restricted content
+      # Optional: only needed for private/age-restricted content now
       # - ./cookies.txt:/app/cookies.txt:ro
+
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-provider
+    restart: unless-stopped
+    # No ports published — only the bot container talks to it (isolated network)
+    # To use with host-installed yt-dlp outside compose, uncomment:
+    # ports:
+    #   - "127.0.0.1:4416:4416"

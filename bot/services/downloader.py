@@ -23,6 +23,7 @@ from bot.config import (
     FORMAT_FALLBACK,
     MAX_CONCURRENT_DOWNLOADS,
     META_CACHE_TTL,
+    POT_PROVIDER_URL,
     PROXY,
     QUALITY_MAP,
     TEMP_DIR,
@@ -282,8 +283,9 @@ def _base_opts(
     }
 
     if is_yt:
-        opts["http_headers"]["Referer"] = "https://www.youtube.com/"
-        opts["http_headers"]["Origin"] = "https://www.youtube.com"
+        # No custom headers for YouTube — vanilla yt-dlp behavior (its own
+        # client rotation + UAs) is the proven cookieless path.
+        pass
     elif is_ig:
         opts["http_headers"]["Referer"] = "https://www.instagram.com/"
         opts["http_headers"]["Origin"] = "https://www.instagram.com"
@@ -314,26 +316,28 @@ def _base_opts(
     if cookie and cookie.is_file():
         opts["cookiefile"] = str(cookie)
 
-    if is_yt:
-        if cookie:
-            opts["extractor_args"] = {
-                "youtube": {"player_client": ["tv"]},
-            }
-        else:
-            opts["extractor_args"] = {
-                "youtube": {
-                    "player_client": ["tv_embedded", "android"],
-                    "player_skip": ["configs", "webpage"],
-                },
-            }
-    elif is_tt:
+    # NOTE: no forced YouTube player clients here — see _yt_strategies().
+    # Forcing "tv"/"tv_embedded" breaks cookieless extraction on current
+    # yt-dlp (client unsupported / "page needs to be reloaded").
+    if is_tt:
         # Prefer mobile-friendly extraction when available
         opts.setdefault("extractor_args", {})
 
     imp = _resolved_impersonate()
-    if imp is not None:
-        # Chrome impersonation helps YT/IG/FB bot walls; safe elsewhere
+    if imp is not None and not is_yt:
+        # Chrome impersonation defeats IG/FB bot walls WITHOUT cookies.
+        # YouTube extraction is most reliable with vanilla yt-dlp behavior.
         opts["impersonate"] = imp
+
+    if is_yt:
+        # YouTube heavily throttles datacenter IPs without PO tokens (403s,
+        # "Sign in to confirm you're not a bot") — no cookies needed when a
+        # bgutil provider is reachable. The plugin defaults to 127.0.0.1:4416;
+        # docker-compose points us at the provider container by name.
+        base = (POT_PROVIDER_URL or "http://127.0.0.1:4416").rstrip("/")
+        opts["extractor_args"] = {
+            "youtubepot-bgutilhttp": {"base_url": f"{base}"},
+        }
 
     if PROXY:
         opts["proxy"] = PROXY
@@ -446,6 +450,13 @@ def _parse_formats(info: dict[str, Any]) -> tuple[bool, bool, bool, list[int], l
     if not has_video and any((f.get("acodec") or "none") != "none" for f in formats):
         has_audio = True
 
+    # Some extractors emit codec == "unknown" for direct links — that is still
+    # real media and must not be misclassified as having no video/audio.
+    if not has_video and any(
+        (f.get("vcodec") or "none") not in ("none", None) for f in formats
+    ):
+        has_video = True
+
     # Fallback: if we have a duration and formats, treat as video/audio
     if formats and not has_video and not has_audio and not has_image:
         has_video = True
@@ -494,69 +505,48 @@ def _normalize_info_dict(url: str, info: dict[str, Any]) -> dict[str, Any]:
 
 def _yt_strategies(*, has_cookies: bool) -> list[dict[str, Any]]:
     """
-    Lean YouTube attempts: fast path first, few fallbacks.
-    Sticky winner is reordered to index 0 by the caller.
+    Cookieless-first YouTube strategies.
+
+    yt-dlp's own default client rotation (tv, web, mweb, android, ios) is the
+    most reliable cookieless path — hardcoding clients (e.g. "tv_embedded",
+    removed in yt-dlp >= 2026.x) breaks extraction. Strategy 0 is vanilla
+    yt-dlp with no cookies; narrow fallbacks sit behind it.
     """
     if has_cookies:
         return [
-            # 0) Fast path — single client, reuse job cookie jar
-            {
-                "use_cookies": True,
-                "refresh_cookies": False,
-                "extractor_args": {"youtube": {"player_client": ["tv"]}},
-            },
-            # 1) Web clients
-            {
-                "use_cookies": True,
-                "refresh_cookies": True,
-                "extractor_args": {
-                    "youtube": {"player_client": ["web", "mweb"]}
-                },
-            },
-            # 2) Embedded
-            {
-                "use_cookies": True,
-                "refresh_cookies": True,
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["web_embedded", "tv_embedded"]
-                    }
-                },
-            },
-            # 3) Cookieless last resort
+            # 0) Default rotation, cookieless — public videos work here
+            {"use_cookies": False},
+            # 1) Default rotation + cookies (age-restricted content)
+            {"use_cookies": True},
+            # 2) android_vr: rarely throttled, no PO token required
             {
                 "use_cookies": False,
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["tv_embedded", "android"],
-                        "player_skip": ["webpage"],
-                    }
-                },
+                "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
+                "drop_impersonate": True,
+            },
+            # 3) mweb: last resort when the default rotation is bot-walled
+            {
+                "use_cookies": False,
+                "extractor_args": {"youtube": {"player_client": ["mweb"]}},
                 "drop_impersonate": True,
             },
         ]
     return [
+        # 0) Default rotation, cookieless — public videos work here
+        {"use_cookies": False},
+        # 1) android_vr: rarely throttled, no PO token required
         {
             "use_cookies": False,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["tv_embedded", "android", "ios"],
-                    "player_skip": ["webpage"],
-                }
-            },
+            "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
+            "drop_impersonate": True,
+        },
+        # 2) mweb: last resort when the default rotation is bot-walled
+        {
+            "use_cookies": False,
+            "extractor_args": {"youtube": {"player_client": ["mweb"]}},
             "drop_impersonate": True,
         },
     ]
-
-
-def _ordered_yt_strategies(*, has_cookies: bool) -> list[dict[str, Any]]:
-    """Put last successful strategy first for sticky speed."""
-    strats = _yt_strategies(has_cookies=has_cookies)
-    with _YT_WINNER_LOCK:
-        wi = _YT_WINNER_SI
-    if 0 < wi < len(strats):
-        return [strats[wi], *strats[:wi], *strats[wi + 1 :]]
-    return strats
 
 
 def _remember_yt_strategy(original_index: int) -> None:
@@ -649,7 +639,18 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                     return info
                 raise
 
-        strats = _ordered_yt_strategies(has_cookies=bool(cookie))
+        base_strats = _yt_strategies(has_cookies=bool(cookie))
+        with _YT_WINNER_LOCK:
+            wi = _YT_WINNER_SI
+        if 0 < wi < len(base_strats):
+            strats = [base_strats[wi], *base_strats[:wi], *base_strats[wi + 1 :]]
+            # Track original indices so a win on the reordered first slot
+            # still remembers the correct base strategy (mirrors
+            # _extract_with_format_fallback below).
+            orig_indices = [wi, *range(0, wi), *range(wi + 1, len(base_strats))]
+        else:
+            strats = list(base_strats)
+            orig_indices = list(range(len(base_strats)))
         last_err: Exception | None = None
         for si, strat in enumerate(strats):
             opts = dict(base)
@@ -667,23 +668,29 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 opts.pop("impersonate", None)
             try:
                 info = _run(opts)
-                _remember_yt_strategy(0 if si == 0 else si)
+                _remember_yt_strategy(orig_indices[si])
                 _meta_cache_put(url, info)
                 return info
             except yt_dlp.utils.DownloadError as e:
                 last_err = e
                 err = str(e).lower()
                 if (
-                    "not a bot" in err
-                    or "sign in to confirm" in err
-                    or "cookies are no longer valid" in err
+                    "video unavailable" in err
+                    or "private video" in err
+                    or "has been removed" in err
+                    or "unsupported url" in err
                 ):
-                    logger.warning(
-                        "extract_info attempt failed: %s",
-                        str(e).split("\n")[-1][:120],
-                    )
-                    continue
-                raise
+                    # Permanent for every player client — fail fast
+                    raise
+                # Any other client-specific failure (bot wall, page reload,
+                # throttling, transient 5xx) is worth a retry with the next
+                # strategy — different clients genuinely fail differently.
+                logger.warning(
+                    "extract_info attempt %s failed: %s",
+                    si,
+                    str(e).split("\n")[-1][:120],
+                )
+                continue
         if last_err:
             raise last_err
         raise RuntimeError("Could not extract media information from this URL.")
@@ -1104,15 +1111,14 @@ class DownloadManager:
                 strategies = list(base_strats)
                 orig_indices = list(range(len(base_strats)))
         elif flags["ig"] or flags["fb"] or flags["x"]:
-            # Cookie pass first, then cookieless (public posts still work)
+            # Cookieless-first: impersonated pass (public posts work without
+            # cookies), then without cookies, then without impersonation.
             strategies = [
-                {"use_cookies": True, "refresh_cookies": False},
-                {
-                    "use_cookies": False,
-                    "drop_impersonate": True,
-                },
+                {"use_cookies": True},
+                {"use_cookies": False},
+                {"use_cookies": False, "drop_impersonate": True},
             ]
-            orig_indices = [0, 1]
+            orig_indices = [0, 1, 2]
         else:
             strategies = [{}]
             orig_indices = [0]
@@ -1402,7 +1408,7 @@ class DownloadManager:
             return "This media is blocked due to copyright or platform restrictions."
         if "unsupported url" in low or "no suitable extractor" in low:
             return "This URL is not supported yet. Try another link from a major platform."
-        if "ffmpeg" in low:
+        if "ffmpeg" in low or "ffprobe" in low:
             return "FFmpeg is required for this format. Install FFmpeg and try again."
         if "timed out" in low or "timeout" in low:
             return "The download timed out. Please try again."

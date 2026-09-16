@@ -296,7 +296,6 @@ async def auto_download_flow(
                 actor, url, result.title or "", "?", "video", quality, False,
                 file_size=size, error="File too large",
             )
-            download_manager.cleanup_result_files(result)
             return
 
         await _send_media(context, chat.id, path, result, caption, reply_markup=actions)
@@ -340,9 +339,6 @@ async def start_url_flow(
     # Groups / channels always auto (safety if called from again: callback)
     if _should_auto_download(update):
         await auto_download_flow(update, context, url)
-        return
-
-    if not user:
         return
 
     allowed, retry = rate_limiter.allow(user.id)
@@ -434,7 +430,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     if not query or not query.data or not update.effective_user:
         return
-    await query.answer()
+    # Answer exactly once, right away — every later query.answer() would raise
+    # BadRequest ("query is too old / already answered"). Feedback that used to
+    # be an alert is sent as a normal message below instead.
+    try:
+        await query.answer()
+    except TelegramError:
+        pass  # stale/old query — still process the action
     data = query.data
     user_id = update.effective_user.id
 
@@ -455,10 +457,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if token.startswith("http"):
                 url = token
             else:
-                await query.answer(
-                    "Link expired. Please paste the URL again.",
-                    show_alert=True,
-                )
+                if query.message:
+                    await query.message.reply_text(
+                        "🔗 Link expired. Please paste the URL again."
+                    )
                 return
         await query.message.reply_text(  # type: ignore[union-attr]
             f"🔄 Re-analyzing…\n<code>{_esc(url[:100])}</code>",
@@ -479,7 +481,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     if session.user_id != user_id and user_id not in ADMIN_IDS:
-        await query.answer("This isn't your download session.", show_alert=True)
+        if query.message:
+            await query.message.reply_text(
+                "⛔ This isn't your download session."
+            )
         return
 
     if action == "cancel":
@@ -911,9 +916,9 @@ async def _send_media(
             )
             if attempt < attempts:
                 await _sleep(2 * attempt)
-                # Next attempt: force document (often more reliable than send_video)
-                result.is_video = False
-                result.is_audio = result.is_audio  # keep audio as-is
+                # Retry the SAME media send — switching upload type mid-retry
+                # would bypass the caller's per-type semantics (streaming,
+                # caption handling) and mask the real timeout.
         except NetworkError as e:
             last_err = e
             logger.warning("Network error on upload (attempt %s): %s", attempt, e)
@@ -927,8 +932,6 @@ async def _send_media(
 
 
 async def _sleep(seconds: float) -> None:
-    import asyncio
-
     await asyncio.sleep(seconds)
 
 
@@ -996,6 +999,10 @@ async def _send_media_once(
                     **kw,
                 )
                 return
+            except RetryAfter:
+                # Flood control must be waited out by the retry loop —
+                # falling back to document here would hit the same limit again.
+                raise
             except TimedOut:
                 raise
             except TelegramError as e:

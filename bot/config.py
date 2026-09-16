@@ -67,6 +67,11 @@ if AUTO_QUALITY not in ("480", "720", "1080", "max"):
 TELEGRAM_API_URL: str | None = (os.getenv("TELEGRAM_API_URL") or "").strip() or None
 TELEGRAM_LOCAL_MODE: bool = bool(TELEGRAM_API_URL)
 
+# YouTube PO-token provider (bgutil) — lets yt-dlp download WITHOUT cookies.
+# Leave empty to use the default local endpoint (http://127.0.0.1:4416).
+# In docker-compose set POT_PROVIDER_URL=http://bgutil-provider:4416
+POT_PROVIDER_URL: str | None = (os.getenv("POT_PROVIDER_URL") or "").strip() or None
+
 # Profile overrides
 BOT_NAME_OVERRIDE: str | None = os.getenv("BOT_NAME", "").strip() or None
 BOT_DESCRIPTION: str | None = os.getenv("BOT_DESCRIPTION", "").strip() or None

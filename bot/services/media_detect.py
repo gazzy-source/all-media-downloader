@@ -159,7 +159,7 @@ def _detect_via_ytdlp(url: str) -> str:
         if not formats or not has_vid:
             logger.info("probe no formats → IMAGE: %s", url[:80])
             return "image"
-        return "video"
+        return "video"  # pragma: no cover — unreachable (has_vid ⇒ returned above)
     except Exception as e:
         err = str(e).lower()
         if "no video formats" in err or "only images" in err:

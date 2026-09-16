@@ -33,3 +33,11 @@ Issues = "https://github.com/gazzy-source/all-media-downloader/issues"
 
 [tool.setuptools.packages.find]
 include = ["bot*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+  "live: hits real network (YouTube/Vimeo/Pinterest); only runs with RUN_LIVE_TESTS=1",
+]

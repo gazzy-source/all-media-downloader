@@ -41,3 +41,19 @@ addopts = "-q"
 markers = [
   "live: hits real network (YouTube/Vimeo/Pinterest); only runs with RUN_LIVE_TESTS=1",
 ]
+
+[tool.coverage.run]
+source = ["bot"]
+branch = true
+omit = ["tests/*"]
+
+[tool.coverage.report]
+precision = 1
+show_missing = true
+skip_empty = true
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "if __name__ == .__main__.:",
+]

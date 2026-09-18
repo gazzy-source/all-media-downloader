@@ -1177,3 +1177,85 @@ class TestMetadataHasAShortLeash:
         opts = dl._base_opts(host="www.youtube.com")
         assert opts["socket_timeout"] >= 15
         assert opts["retries"] >= 3
+
+
+class TestMetadataPoolIsolation:
+    """
+    Production: two 45s timeouts on a URL this same code extracts in 2-4s
+    standalone. Cause was pool starvation, not the URL.
+
+    asyncio.wait_for cancels the await, never the thread — a run_in_executor
+    task that has started cannot be cancelled. Every extraction that blew the
+    cap therefore kept its worker until yt-dlp finished on its own, so slow
+    links ratcheted the pool closed and made the NEXT request time out too.
+    """
+
+    def test_metadata_has_its_own_pool(self):
+        m = dl.download_manager
+        assert m._meta_executor is not m._executor, (
+            "sharing one pool makes Analyzing… queue behind downloads"
+        )
+
+    def test_extract_info_uses_the_metadata_pool(self):
+        import inspect
+        src = inspect.getsource(dl.DownloadManager.extract_info)
+        assert "_meta_executor" in src
+        assert "self._executor" not in src, "must not fall back to the download pool"
+
+    def test_downloads_still_use_the_download_pool(self):
+        import inspect
+        src = inspect.getsource(dl.DownloadManager.download)
+        assert "_meta_executor" not in src
+
+    def test_in_thread_deadline_is_inside_the_async_cap(self):
+        """
+        The thread must give up BEFORE wait_for does, or the worker leaks —
+        which is precisely what turned one slow link into a starved pool.
+        """
+        from bot.config import EXTRACT_TIMEOUT
+        deadline = max(5, EXTRACT_TIMEOUT - 5)
+        assert deadline < EXTRACT_TIMEOUT
+
+    def test_deadline_stops_further_strategies(self, monkeypatch):
+        """A slow first strategy must not let the loop run past the deadline."""
+        calls = {"n": 0}
+
+        class SlowYDL:
+            def __init__(self, opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def extract_info(self, url, download=False):
+                calls["n"] += 1
+                raise dl.yt_dlp.utils.DownloadError("unable to download video data")
+
+            def prepare_filename(self, info):
+                return "x.mp4"
+
+        monkeypatch.setattr(dl.yt_dlp, "YoutubeDL", SlowYDL)
+        monkeypatch.setattr(dl, "_cookie_jar_for_job", lambda: None)
+        monkeypatch.setattr(dl, "_resolved_cookie_source", lambda: None)
+        monkeypatch.setattr(dl, "_resolved_ffmpeg_dir", lambda: None)
+        monkeypatch.setattr(dl, "_resolved_impersonate", lambda: None)
+        monkeypatch.setattr(dl, "EXTRACT_TIMEOUT", 5)  # deadline = max(5, 0) = 5
+        # Pretend a lot of time has already passed after the first attempt.
+        real = dl.time.monotonic
+        state = {"n": 0}
+
+        def creeping():
+            state["n"] += 1
+            return real() + (state["n"] * 100)
+
+        monkeypatch.setattr(dl.time, "monotonic", creeping)
+        dl._META_CACHE.clear()
+        with pytest.raises(Exception):
+            dl._extract_info_sync("https://www.youtube.com/watch?v=abc")
+        assert calls["n"] < 4, (
+            f"deadline ignored: tried {calls['n']} strategies past the budget"
+        )
+        dl._META_CACHE.clear()

@@ -20,6 +20,7 @@ import yt_dlp
 from bot.config import (
     BASE_DIR,
     COOKIES_FILE,
+    EXTRACT_TIMEOUT,
     FORMAT_FALLBACK,
     MAX_CONCURRENT_DOWNLOADS,
     META_CACHE_TTL,
@@ -852,7 +853,20 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
         base_strats = _yt_strategies(has_cookies=bool(cookie))
         strats, orig_indices = _order_yt_strategies(base_strats, download=False)
         last_err: Exception | None = None
+        # Self-imposed deadline, slightly inside the caller's asyncio cap.
+        # asyncio.wait_for cannot cancel a thread that is already running, so
+        # without this an extraction that blew the cap kept its worker busy and
+        # starved the pool for the next request. Stop trying more strategies
+        # while there is still time to return.
+        deadline = time.monotonic() + max(5, EXTRACT_TIMEOUT - 5)
         for si, strat in enumerate(strats):
+            if si and time.monotonic() > deadline:
+                logger.warning(
+                    "Metadata deadline hit after %s strategies for %s",
+                    si,
+                    url[:80],
+                )
+                break
             opts = dict(base)
             opts["http_headers"] = dict(base.get("http_headers") or {})
             if strat.get("extractor_args"):
@@ -1050,6 +1064,20 @@ class DownloadManager:
             max_workers=self.max_concurrent + 2,
             thread_name_prefix="yt-dl",
         )
+        # Metadata gets its OWN pool, deliberately.
+        #
+        # Sharing one pool made "Analyzing…" wait behind downloads, and worse:
+        # asyncio.wait_for cancels the *await*, never the thread — a
+        # run_in_executor task that has started cannot be cancelled. So every
+        # extraction that hit the 45s cap kept occupying its worker until
+        # yt-dlp finished on its own. A few slow links in a row therefore
+        # starved the pool, which made the NEXT extraction queue and time out
+        # too: a ratchet, not a one-off. Observed in production as two 45s
+        # timeouts on a URL this same code extracts in 2-4s standalone.
+        self._meta_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="yt-meta",
+        )
 
     @property
     def free_slots(self) -> int:
@@ -1057,7 +1085,9 @@ class DownloadManager:
 
     async def extract_info(self, url: str) -> MediaInfo:
         loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(self._executor, _extract_info_sync, url)
+        info = await loop.run_in_executor(
+            self._meta_executor, _extract_info_sync, url
+        )
         return build_media_info(url, info)
 
     async def download(

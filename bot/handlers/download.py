@@ -370,13 +370,25 @@ async def start_url_flow(
         from bot.services.downloader import DownloadManager
 
         friendly = DownloadManager._friendly_error(str(e))
-        await status.edit_text(
+        body = (
             f"❌ <b>Could not read this link</b>\n\n{_esc(friendly)}\n\n"
             "Tips: the post must be public, the link must not be a story/private "
-            "account, and some platforms block datacenter IPs.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_reply_keyboard(),
+            "account, and some platforms block datacenter IPs."
         )
+        # editMessageText accepts an INLINE keyboard only. Passing the
+        # persistent reply keyboard here raised BadRequest("Inline keyboard
+        # expected"), which escaped to the global handler — so every link the
+        # bot could not read answered "Something went wrong" instead of saying
+        # why. The reply keyboard is persistent anyway and needs no re-sending;
+        # it only goes on the reply_text fallback.
+        try:
+            await status.edit_text(body, parse_mode=ParseMode.HTML)
+        except TelegramError:
+            await msg.reply_text(
+                body,
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_reply_keyboard(),
+            )
         return
 
     if info.is_live:

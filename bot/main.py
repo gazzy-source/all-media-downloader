@@ -72,6 +72,11 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         for p in sorted(TEMP_DIR.rglob("*"), reverse=True):
             try:
+                # Never sweep away dotfiles: temp/.gitkeep is tracked in git, so
+                # deleting it leaves every deployment with a dirty working tree
+                # and makes the next `git pull` refuse to fast-forward.
+                if p.name.startswith("."):
+                    continue
                 if p.is_file() and p.stat().st_mtime < cutoff:
                     p.unlink(missing_ok=True)
                     removed_files += 1

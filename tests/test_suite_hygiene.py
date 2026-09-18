@@ -60,3 +60,38 @@ class TestNoShadowedTests:
             if "def test_" not in src:
                 empty.append(path.name)
         assert not empty, f"test modules with no tests: {empty}"
+
+
+class TestTempCleanupKeepsGitkeep:
+    """
+    The periodic cleanup swept temp/.gitkeep — a tracked file — leaving every
+    deployment with a dirty working tree and breaking `git pull --ff-only`.
+    """
+
+    async def test_gitkeep_survives_cleanup(self, tmp_path, monkeypatch):
+        import time as _t
+        import bot.main as bm
+
+        monkeypatch.setattr(bm, "TEMP_DIR", tmp_path)
+        old = _t.time() - 10 * 3600
+
+        keep = tmp_path / ".gitkeep"
+        keep.write_text("")
+        junk = tmp_path / "dl_abc.mp4"
+        junk.write_bytes(b"x")
+        nested = tmp_path / "dl_dir"
+        nested.mkdir()
+        nested_junk = nested / "old.part"
+        nested_junk.write_bytes(b"x")
+        for f in (keep, junk, nested_junk):
+            import os
+            os.utime(f, (old, old))
+
+        class Ctx:
+            pass
+
+        await bm.cleanup_job(Ctx())
+
+        assert keep.exists(), "temp/.gitkeep must not be deleted"
+        assert not junk.exists(), "stale downloads must still be cleaned"
+        assert not nested_junk.exists(), "nested stale files must still be cleaned"

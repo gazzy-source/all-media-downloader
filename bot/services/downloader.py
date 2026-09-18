@@ -904,8 +904,9 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 # throttling, transient 5xx) is worth a retry with the next
                 # strategy — different clients genuinely fail differently.
                 logger.warning(
-                    "extract_info attempt %s failed: %s",
+                    "extract_info attempt %s failed after %.1fs: %s",
                     si,
+                    time.monotonic() - attempt_started,
                     str(e).split("\n")[-1][:120],
                 )
                 continue
@@ -1085,10 +1086,28 @@ class DownloadManager:
 
     async def extract_info(self, url: str) -> MediaInfo:
         loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(
-            self._meta_executor, _extract_info_sync, url
+        # Timed in three parts so a slow "Analyzing…" can be attributed rather
+        # than guessed at: queue = waiting for a pool worker (starvation),
+        # work = yt-dlp itself, build = our own parsing.
+        queued_at = time.monotonic()
+        started = {}
+
+        def _run(u: str):
+            started["t"] = time.monotonic()
+            return _extract_info_sync(u)
+
+        info = await loop.run_in_executor(self._meta_executor, _run, url)
+        done = time.monotonic()
+        result = build_media_info(url, info)
+        wait = (started.get("t", queued_at) - queued_at)
+        work = done - started.get("t", queued_at)
+        total = time.monotonic() - queued_at
+        level = logger.warning if total > 8 else logger.info
+        level(
+            "analyze %.1fs (queue %.1fs + work %.1fs + build %.1fs) %s",
+            total, wait, work, time.monotonic() - done, url[:90],
         )
-        return build_media_info(url, info)
+        return result
 
     async def download(
         self,

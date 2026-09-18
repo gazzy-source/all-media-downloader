@@ -24,6 +24,7 @@ from bot.config import (
     META_CACHE_TTL,
     POT_PROVIDER_URL,
     PROXY,
+    PROXY_HOSTS,
     QUALITY_MAP,
     SB_GUARD,
     TEMP_DIR,
@@ -437,7 +438,7 @@ def _base_opts(
                 opts.get("extractor_args"), pot
             )
 
-    if PROXY:
+    if PROXY and _should_proxy(host):
         opts["proxy"] = PROXY
 
     ff = _resolved_ffmpeg_dir()
@@ -445,6 +446,20 @@ def _base_opts(
         opts["ffmpeg_location"] = ff
 
     return opts
+
+
+def _should_proxy(host: str) -> bool:
+    """
+    Whether this host's traffic goes through PROXY.
+
+    With PROXY_HOSTS unset the proxy applies to everything. With it set, only
+    matching hosts are proxied — so a metered residential proxy is spent on the
+    platforms that actually block the server's IP, not on every video.
+    """
+    if not PROXY_HOSTS:
+        return True
+    h = (host or "").lower()
+    return any(p in h for p in PROXY_HOSTS)
 
 
 def _video_format_for_host(host: str, quality: str) -> str:

@@ -161,6 +161,7 @@ Open your bot in Telegram → `/start` → paste a link.
 | `COOKIES_FILE` | — | Optional. Netscape cookies, only for private/age-walled posts |
 | `POT_PROVIDER_URL` | auto-detect | bgutil PO-token provider. Unlocks full-quality YouTube without cookies |
 | `PROXY` | — | `http://` or `socks5://` proxy |
+| `PROXY_HOSTS` | all | Comma-separated hosts to route through `PROXY`. Empty = everything |
 | `FFMPEG_LOCATION` | auto | Folder containing `ffmpeg` binary |
 | `BOT_NAME` | — | Optional API override (leave empty to keep BotFather) |
 | `BOT_DESCRIPTION` | — | Optional full description override |
@@ -221,6 +222,40 @@ An unset `POT_PROVIDER_URL` is probed once at startup against
 
 `cookies.txt` remains optional and is only needed for private, members-only, or
 age-restricted content.
+
+---
+
+## Running on a VPS (datacenter IP)
+
+Several platforms rate the server's IP, not the request. Measured on an Oracle
+Cloud VPS with this code and no cookies, all five of these failed while the same
+code passed them from a residential IP:
+
+| Platform | What the server gets |
+|----------|----------------------|
+| YouTube | `Sign in to confirm you're not a bot` on **every** player client |
+| Reddit | `Account authentication is required` |
+| SoundCloud | `This video is DRM protected` |
+| Tumblr | HTTP 403 |
+| Bilibili | HTTP 412 |
+
+These are not extractor bugs, and a PO-token provider does **not** fix them: the
+provider mints tokens successfully from that host, yet YouTube still refuses
+every client, because the block lands on the initial player request.
+
+Everything else works from the same host — X/Twitter, Instagram, Facebook,
+Pinterest, Twitch, Rumble, VK, Snapchat and LinkedIn all download normally.
+
+The reliable fix is a residential or mobile proxy. Since those bill per GB and
+video is heavy, route only the blocked platforms through it:
+
+```dotenv
+PROXY=socks5://user:pass@proxy-host:1080
+PROXY_HOSTS=youtube.com,youtu.be,reddit.com,redd.it,soundcloud.com,tumblr.com,bilibili.com
+```
+
+Everything not listed in `PROXY_HOSTS` continues to go out directly, so the
+proxy is only spent where it is actually needed.
 
 ---
 

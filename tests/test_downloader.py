@@ -762,3 +762,54 @@ class TestInternalErrorMasking:
         out = dl.DownloadManager._friendly_error("Video unavailable")
         assert "unavailable" in out.lower()
         assert "extractor failed" not in out.lower()
+
+
+class TestSelectiveProxy:
+    """PROXY_HOSTS keeps a metered residential proxy off every video download."""
+
+    def test_no_proxy_configured(self, monkeypatch):
+        monkeypatch.setattr(dl, "PROXY", None)
+        assert "proxy" not in dl._base_opts(host="youtube.com")
+
+    def test_empty_allowlist_proxies_everything(self, monkeypatch):
+        monkeypatch.setattr(dl, "PROXY", "http://p:8080")
+        monkeypatch.setattr(dl, "PROXY_HOSTS", ())
+        for host in ("youtube.com", "x.com", "example.org"):
+            assert dl._base_opts(host=host).get("proxy") == "http://p:8080", host
+
+    def test_allowlist_limits_proxy_to_blocked_hosts(self, monkeypatch):
+        monkeypatch.setattr(dl, "PROXY", "http://p:8080")
+        monkeypatch.setattr(dl, "PROXY_HOSTS", ("youtube.com", "reddit.com"))
+        assert dl._base_opts(host="www.youtube.com").get("proxy") == "http://p:8080"
+        assert dl._base_opts(host="v.redd.it").get("proxy") is None
+        assert dl._base_opts(host="old.reddit.com").get("proxy") == "http://p:8080"
+        # Hosts that work direct must NOT burn proxy bandwidth
+        for host in ("x.com", "instagram.com", "pinterest.com", "clips.twitch.tv"):
+            assert "proxy" not in dl._base_opts(host=host), host
+
+    def test_matching_is_case_insensitive(self, monkeypatch):
+        monkeypatch.setattr(dl, "PROXY", "socks5://p:1080")
+        monkeypatch.setattr(dl, "PROXY_HOSTS", ("youtube.com",))
+        assert dl._base_opts(host="WWW.YouTube.COM").get("proxy") == "socks5://p:1080"
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (None, ()),
+            ("", ()),
+            ("  ", ()),
+            ("youtube.com", ("youtube.com",)),
+            (" YouTube.com , reddit.com ,, ", ("youtube.com", "reddit.com")),
+        ],
+    )
+    def test_env_parsing(self, raw, expected, monkeypatch):
+        if raw is None:
+            monkeypatch.delenv("PROXY_HOSTS", raising=False)
+        else:
+            monkeypatch.setenv("PROXY_HOSTS", raw)
+        parsed = tuple(
+            h.strip().lower()
+            for h in (os.getenv("PROXY_HOSTS") or "").split(",")
+            if h.strip()
+        )
+        assert parsed == expected

@@ -1280,15 +1280,24 @@ class DownloadManager:
                 "progress_hooks": hooks,
                 "noplaylist": True,
                 "writethumbnail": False,
-                # Abort before pulling bytes we can never deliver. The size
-                # guard used to run only after the download finished, so an
-                # oversized job spent the full transfer — measured at 134.7MB
-                # and 48s for a 1080p YouTube video against a 49MB Telegram
-                # cap — and then told the user it was too large. yt-dlp checks
-                # this against the format's reported size up front. Headroom
-                # because a merge writes two streams and the container adds a
-                # little; the exact post-merge size is still checked later.
-                "max_filesize": int(MAX_FILE_SIZE_BYTES * 1.30),
+                # NOTE: max_filesize is deliberately NOT set here.
+                #
+                # Aborting early looks obviously right — an oversized 1080p job
+                # pulls 134.7MB over 48s only to be rejected by the 49MB cap.
+                # But max_filesize makes yt-dlp SKIP oversized formats and keep
+                # walking the selector chain, and the chain ends in `b`, which
+                # happily matches an audio-only format once every video format
+                # has been skipped. Measured: a 1080p request came back as a
+                # 10.2MB webm containing one opus AUDIO stream and no video,
+                # while still reporting h=1080.
+                #
+                # Silently handing back audio for a video request is worse than
+                # wasting bandwidth, so the size guard stays after the download.
+                # A safe version needs the selector to refuse audio-only
+                # results, and `[vcodec!=none]` is not that guard — yt-dlp
+                # filters drop formats whose field is MISSING, which would
+                # exclude the real videos that report an unknown vcodec
+                # (Twitch, Rumble, X). See _parse_formats for that trap.
             }
         )
 

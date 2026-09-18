@@ -1259,41 +1259,41 @@ class TestMetadataPoolIsolation:
         dl._META_CACHE.clear()
 
 
-class TestOversizedDownloadsAbortEarly:
+class TestVideoRequestNeverReturnsAudioOnly:
     """
-    The 49MB Telegram cap was enforced only after the file finished. Measured:
-    a 1080p YouTube video pulled 134.7MB over 48s and was then rejected. The
-    bytes, the time and the user's patience were all already spent.
+    Regression guard for an optimisation that had to be reverted.
+
+    Setting yt-dlp's max_filesize to abort oversized downloads early made it
+    SKIP the big video formats and keep walking the selector chain, which ends
+    in `b` — and `b` matches an audio-only format once the video ones are gone.
+    A 1080p request came back as a 10.2MB webm with one opus audio stream and
+    no video, still reporting h=1080. Handing back audio for a video request is
+    worse than wasting bandwidth.
     """
 
-    def test_max_filesize_is_set_on_downloads(self):
+    def test_max_filesize_is_not_set_on_downloads(self):
         import inspect
         src = inspect.getsource(dl.DownloadManager._download_sync)
-        assert "max_filesize" in src, "downloads must refuse oversized formats up front"
-
-    def test_headroom_is_above_the_cap_but_not_wild(self):
-        """Merges write two streams, so a little slack — but not 2x."""
-        import re
-        import inspect
-        src = inspect.getsource(dl.DownloadManager._download_sync)
-        m = re.search(r"max_filesize.*?MAX_FILE_SIZE_BYTES \* ([\d.]+)", src, re.S)
-        assert m, "expected max_filesize derived from MAX_FILE_SIZE_BYTES"
-        factor = float(m.group(1))
-        assert 1.0 < factor <= 1.5, f"headroom {factor} is implausible"
-
-    def test_the_abort_is_explained_not_dumped(self):
-        out = dl.DownloadManager._friendly_error(
-            "ERROR: File is larger than max-filesize (134217728 bytes > 66846720 bytes)"
+        active = [
+            ln for ln in src.splitlines()
+            if "max_filesize" in ln and not ln.strip().startswith("#")
+        ]
+        assert not active, (
+            "max_filesize lets the selector fall through to an audio-only "
+            f"format for a video request: {active}"
         )
-        assert "bytes" not in out, "raw byte counts help nobody"
-        assert "limit" in out.lower()
-        assert "480p" in out or "lower quality" in out.lower(), "must say what to do"
 
-    def test_post_download_size_guard_still_exists(self):
-        """
-        max_filesize works off the format's REPORTED size, which can be absent
-        or wrong, so the real check after the fact must stay.
-        """
+    def test_the_post_download_size_guard_is_still_there(self):
+        """It is the only thing enforcing the Telegram cap now."""
         import inspect
         src = inspect.getsource(dl)
         assert "MAX_FILE_SIZE_BYTES" in src
+
+    def test_video_selectors_still_prefer_a_merge_over_bare_audio(self):
+        """Every video selector must be able to reach a video+audio merge."""
+        for host in ("www.youtube.com", "x.com", "reddit.com", "example.org"):
+            for q in ("480", "720", "1080", "max"):
+                f = dl._video_format_for_host(host, q)
+                assert "bv*+ba" in f, f"{host}/{q}: {f}"
+
+

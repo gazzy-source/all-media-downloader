@@ -255,6 +255,7 @@ async def auto_download_flow(
             )
         except TelegramError:
             pass
+        inflight_remove(chat.id, status.message_id)
         return
 
     if not result.success or not result.primary:
@@ -275,6 +276,7 @@ async def auto_download_flow(
             )
         except TelegramError:
             pass
+        inflight_remove(chat.id, status.message_id)
         return
 
     path = result.primary
@@ -319,6 +321,7 @@ async def auto_download_flow(
                 actor, url, result.title or "", "?", "video", quality, False,
                 file_size=size, error="File too large",
             )
+            inflight_remove(chat.id, status.message_id)
             return
 
         if is_channel and CHANNEL_REPLACE_LINK and getattr(msg, "message_id", None):

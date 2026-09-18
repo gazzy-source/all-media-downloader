@@ -806,17 +806,15 @@ class TestSelectiveProxy:
             (" YouTube.com , reddit.com ,, ", ("youtube.com", "reddit.com")),
         ],
     )
-    def test_env_parsing(self, raw, expected, monkeypatch):
-        if raw is None:
-            monkeypatch.delenv("PROXY_HOSTS", raising=False)
-        else:
-            monkeypatch.setenv("PROXY_HOSTS", raw)
-        parsed = tuple(
-            h.strip().lower()
-            for h in (os.getenv("PROXY_HOSTS") or "").split(",")
-            if h.strip()
-        )
-        assert parsed == expected
+    def test_env_parsing(self, raw, expected):
+        """
+        Calls the REAL parser. This test used to re-implement the split inside
+        itself and assert the copy against the expectation, so it passed no
+        matter what bot/config.py did — it could not fail.
+        """
+        from bot.config import parse_proxy_hosts
+
+        assert parse_proxy_hosts(raw) == expected
 
 
 class TestBotWallAdviceMatchesSetup:
@@ -1259,3 +1257,43 @@ class TestMetadataPoolIsolation:
             f"deadline ignored: tried {calls['n']} strategies past the budget"
         )
         dl._META_CACHE.clear()
+
+
+class TestOversizedDownloadsAbortEarly:
+    """
+    The 49MB Telegram cap was enforced only after the file finished. Measured:
+    a 1080p YouTube video pulled 134.7MB over 48s and was then rejected. The
+    bytes, the time and the user's patience were all already spent.
+    """
+
+    def test_max_filesize_is_set_on_downloads(self):
+        import inspect
+        src = inspect.getsource(dl.DownloadManager._download_sync)
+        assert "max_filesize" in src, "downloads must refuse oversized formats up front"
+
+    def test_headroom_is_above_the_cap_but_not_wild(self):
+        """Merges write two streams, so a little slack — but not 2x."""
+        import re
+        import inspect
+        src = inspect.getsource(dl.DownloadManager._download_sync)
+        m = re.search(r"max_filesize.*?MAX_FILE_SIZE_BYTES \* ([\d.]+)", src, re.S)
+        assert m, "expected max_filesize derived from MAX_FILE_SIZE_BYTES"
+        factor = float(m.group(1))
+        assert 1.0 < factor <= 1.5, f"headroom {factor} is implausible"
+
+    def test_the_abort_is_explained_not_dumped(self):
+        out = dl.DownloadManager._friendly_error(
+            "ERROR: File is larger than max-filesize (134217728 bytes > 66846720 bytes)"
+        )
+        assert "bytes" not in out, "raw byte counts help nobody"
+        assert "limit" in out.lower()
+        assert "480p" in out or "lower quality" in out.lower(), "must say what to do"
+
+    def test_post_download_size_guard_still_exists(self):
+        """
+        max_filesize works off the format's REPORTED size, which can be absent
+        or wrong, so the real check after the fact must stay.
+        """
+        import inspect
+        src = inspect.getsource(dl)
+        assert "MAX_FILE_SIZE_BYTES" in src

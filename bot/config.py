@@ -42,11 +42,12 @@ PROXY: str | None = os.getenv("PROXY") or None
 # datacenter VPS you usually want to proxy just the platforms that block the
 # server's IP and let everything else go out directly.
 # Empty/unset = proxy everything (previous behaviour).
-PROXY_HOSTS: tuple[str, ...] = tuple(
-    h.strip().lower()
-    for h in (os.getenv("PROXY_HOSTS") or "").split(",")
-    if h.strip()
-)
+def parse_proxy_hosts(raw: str | None) -> tuple[str, ...]:
+    """Split a PROXY_HOSTS value into a normalised tuple of host fragments."""
+    return tuple(h.strip().lower() for h in (raw or "").split(",") if h.strip())
+
+
+PROXY_HOSTS: tuple[str, ...] = parse_proxy_hosts(os.getenv("PROXY_HOSTS"))
 RATE_LIMIT_PER_HOUR: int = int(os.getenv("RATE_LIMIT_PER_HOUR", "30"))
 
 AUTO_DOWNLOAD_GROUPS: bool = os.getenv("AUTO_DOWNLOAD_GROUPS", "1").strip() not in (

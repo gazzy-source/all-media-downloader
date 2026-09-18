@@ -106,3 +106,54 @@ class TestStartupRescue:
             bot = None  # touching it would raise, proving we returned early
 
         await bm._rescue_interrupted_jobs(App())
+
+
+class TestFailurePathsClearTheRegistry:
+    """
+    The audit caught this: inflight_remove sat only in the final `finally`, but
+    three failure paths return before reaching it. A job that already failed
+    AND told the user would then be resurrected as "⚠️ Interrupted" on the next
+    restart — a second, contradictory message about a job that was never lost.
+    """
+
+    def test_every_return_after_inflight_add_is_covered(self):
+        """Structural: no `return` between inflight_add and its finally may
+        skip the matching inflight_remove."""
+        import ast
+        import pathlib
+
+        src = pathlib.Path("bot/handlers/download.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+
+        def check(fn_name):
+            fn = next(n for n in ast.walk(tree)
+                      if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
+                      and n.name == fn_name)
+            add_line = min(
+                n.lineno for n in ast.walk(fn)
+                if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "inflight_add"
+            )
+            removes = {n.lineno for n in ast.walk(fn)
+                       if isinstance(n, ast.Call)
+                       and getattr(n.func, "id", "") == "inflight_remove"}
+            lines = src.split("\n")
+            unguarded = []
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Return) or node.lineno <= add_line:
+                    continue
+                # the remove must be one of the few lines immediately before
+                if not any(r in range(node.lineno - 3, node.lineno) for r in removes):
+                    unguarded.append((node.lineno, lines[node.lineno - 1].strip()))
+            return unguarded
+
+        bad = check("auto_download_flow")
+        assert not bad, f"returns that leak an in-flight entry: {bad}"
+
+    def test_registry_has_a_remove_for_every_add(self):
+        import pathlib
+        src = pathlib.Path("bot/handlers/download.py").read_text(encoding="utf-8")
+        adds = src.count("inflight_add(")
+        removes = src.count("inflight_remove(")
+        assert removes >= adds, (
+            f"{adds} add sites but only {removes} remove sites — a path leaks"
+        )

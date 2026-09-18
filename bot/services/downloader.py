@@ -23,6 +23,7 @@ from bot.config import (
     EXTRACT_TIMEOUT,
     FORMAT_FALLBACK,
     MAX_CONCURRENT_DOWNLOADS,
+    MAX_FILE_SIZE_BYTES,
     META_CACHE_TTL,
     METADATA_RETRIES,
     METADATA_SOCKET_TIMEOUT,
@@ -1279,6 +1280,15 @@ class DownloadManager:
                 "progress_hooks": hooks,
                 "noplaylist": True,
                 "writethumbnail": False,
+                # Abort before pulling bytes we can never deliver. The size
+                # guard used to run only after the download finished, so an
+                # oversized job spent the full transfer — measured at 134.7MB
+                # and 48s for a 1080p YouTube video against a 49MB Telegram
+                # cap — and then told the user it was too large. yt-dlp checks
+                # this against the format's reported size up front. Headroom
+                # because a merge writes two streams and the container adds a
+                # little; the exact post-merge size is still checked later.
+                "max_filesize": int(MAX_FILE_SIZE_BYTES * 1.30),
             }
         )
 
@@ -1793,6 +1803,15 @@ class DownloadManager:
             )
         if "copyright" in low or "blocked" in low:
             return "This media is blocked due to copyright or platform restrictions."
+        # yt-dlp refused before downloading, because the format is bigger than
+        # Telegram will accept. Aborting early is the point — say what to do.
+        if "larger than max-filesize" in low or "max-filesize" in low:
+            return (
+                f"That version is bigger than Telegram's "
+                f"{int(MAX_FILE_SIZE_BYTES / 1024 / 1024)} MB limit, so the "
+                "download was stopped before wasting your time.\n\n"
+                "Pick a lower quality (480p usually fits), or 🎵 Audio."
+            )
         # Extractor broken against the live site — nothing the user can change.
         if (
             "unexpected response" in low

@@ -94,6 +94,12 @@ DM_FAST_AUTO: bool = os.getenv("DM_FAST_AUTO", "0").strip() in (
     "True",
     "yes",
 )
+# Hard ceiling on the "Analyzing…" phase. yt-dlp's socket_timeout only
+# bounds a single socket operation; with retries across several
+# strategies a flaky connection can stretch to minutes, and the user just
+# waits. Observed in production: 254s on one link. Fail fast instead.
+EXTRACT_TIMEOUT: int = int(os.getenv("EXTRACT_TIMEOUT", "45"))
+
 # Metadata extract cache TTL (seconds) — speeds repeated DM analyzes
 META_CACHE_TTL: int = int(os.getenv("META_CACHE_TTL", "180"))
 AUTO_QUALITY: str = (os.getenv("AUTO_QUALITY", "1080") or "1080").strip().lower()

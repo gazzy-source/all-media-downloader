@@ -661,3 +661,47 @@ class TestAnalysingHeartbeat:
         msg, *_ = await self._run(fx, monkeypatch, boom)
         last = msg.children[0].edits[-1][0] if msg.children[0].edits else ""
         assert "Could not read this link" in last, last[:120]
+
+
+class TestAnalysisIsTimeBounded:
+    """
+    Production showed 'Reading formats · 254s'. yt-dlp's socket_timeout only
+    bounds one socket op; retries across strategies can run for minutes and the
+    user just waits. The analysis phase now has a hard ceiling.
+    """
+
+    async def test_slow_link_gives_up_and_says_so(self, fx, monkeypatch):
+        import asyncio as _a
+        monkeypatch.setattr(hd.rate_limiter, "allow", lambda uid: (True, 0))
+        monkeypatch.setattr(hd, "EXTRACT_TIMEOUT", 0.2)
+
+        async def never(url):
+            await _a.sleep(30)
+
+        monkeypatch.setattr(hd.download_manager, "extract_info", never)
+        msg = fx.msg("https://youtu.be/x")
+        await _a.wait_for(
+            hd.start_url_flow(fx.update(msg), fx.ctx, "https://youtu.be/x"),
+            timeout=5,
+        )
+        shown = " ".join(t for t, _ in msg.replies)
+        for child in msg.children:
+            shown += " " + " ".join(t for t, _ in child.edits)
+        assert "Took too long" in shown, shown[:200]
+        assert "0.2s" in shown or "Gave up" in shown
+
+    async def test_fast_link_is_unaffected(self, fx, monkeypatch):
+        from bot.services.downloader import MediaInfo
+        monkeypatch.setattr(hd.rate_limiter, "allow", lambda uid: (True, 0))
+        monkeypatch.setattr(hd, "EXTRACT_TIMEOUT", 30)
+
+        async def quick(url):
+            return MediaInfo(url=url, title="Fast", platform="YouTube",
+                             has_video=True, available_heights=[720])
+
+        monkeypatch.setattr(hd.download_manager, "extract_info", quick)
+        msg = fx.msg("https://youtu.be/x")
+        await hd.start_url_flow(fx.update(msg), fx.ctx, "https://youtu.be/x")
+        shown = " ".join(t for c in msg.children for t, _ in c.edits)
+        assert "Took too long" not in shown
+        assert "Fast" in shown, "the wizard must still appear"

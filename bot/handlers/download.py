@@ -20,6 +20,7 @@ from bot.config import (
     AUTO_QUALITY,
     CHANNEL_REPLACE_LINK,
     DM_FAST_AUTO,
+    EXTRACT_TIMEOUT,
     MAX_FILE_SIZE_BYTES,
     QUALITY_MAP,
 )
@@ -410,7 +411,26 @@ async def start_url_flow(
     heartbeat = asyncio.create_task(_analysing_heartbeat())
     try:
         await context.bot.send_chat_action(chat.id, ChatAction.TYPING)
-        info = await download_manager.extract_info(url)
+        # Bounded: a flaky connection used to leave this running for minutes
+        # (254s seen in production) with the user simply waiting.
+        info = await asyncio.wait_for(
+            download_manager.extract_info(url), timeout=EXTRACT_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        logger.warning("extract_info timed out after %ss: %s", EXTRACT_TIMEOUT, url[:80])
+        body = (
+            "⏱ <b>Took too long to read this link</b>\n\n"
+            f"Gave up after {EXTRACT_TIMEOUT}s — the platform is slow or "
+            "blocking the server right now.\n\n"
+            "Try again, or send a different link."
+        )
+        try:
+            await status.edit_text(body, parse_mode=ParseMode.HTML)
+        except TelegramError:
+            await msg.reply_text(
+                body, parse_mode=ParseMode.HTML, reply_markup=main_reply_keyboard()
+            )
+        return
     except Exception as e:
         logger.exception("extract_info failed")
         from bot.services.downloader import DownloadManager

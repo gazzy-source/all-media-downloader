@@ -285,7 +285,10 @@ class TestStickyWinnerOrdering:
             dl._remember_yt_strategy(old, download=True)
 
 
-class TestYtStrategies:
+class TestYtStrategyLadder:
+    """Ordering and client choice (a second class named TestYtStrategies
+    used to shadow the config tests above, silently disabling them)."""
+
     def test_android_present_and_cookieless(self):
         """The one client verified to deliver bytes without cookies or a PO token."""
         for has_cookies in (False, True):

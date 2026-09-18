@@ -187,21 +187,10 @@ def image_size_keyboard(session: DownloadSession) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def confirm_keyboard(session: DownloadSession) -> InlineKeyboardMarkup:
-    sid = session.session_id
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "✅ Download Now", callback_data=f"go:{sid}"
-                )
-            ],
-            [
-                InlineKeyboardButton("⬅️ Back", callback_data=f"back_mode:{sid}"),
-                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{sid}"),
-            ],
-        ]
-    )
+# NOTE: there is no confirm_keyboard any more. Picking a quality / audio format
+# / image size / subtitle language starts the download straight away, so the
+# extra "Download Now" screen only cost a tap and a round-trip. The `go:`
+# callback is still handled for buttons sitting in older chats.
 
 
 def after_download_keyboard(url: str, user_id: int = 0) -> InlineKeyboardMarkup:

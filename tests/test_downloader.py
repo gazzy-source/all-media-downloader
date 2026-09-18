@@ -1,6 +1,7 @@
 """Unit tests for cookie sanitizer, downloader internals, and strategies."""
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -459,9 +460,27 @@ class TestConfigSanity:
         for d in (DATA_DIR, DOWNLOAD_DIR, TEMP_DIR):
             assert Path(d).exists()
 
-    def test_pot_provider_url_default(self):
-        from bot.config import POT_PROVIDER_URL
-        assert POT_PROVIDER_URL is None  # empty env -> None -> localhost default
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (None, None),
+            ("", None),
+            ("   ", None),
+            ("http://127.0.0.1:4416", "http://127.0.0.1:4416"),
+            ("  http://bgutil-provider:4416  ", "http://bgutil-provider:4416"),
+        ],
+    )
+    def test_pot_provider_url_parsing(self, raw, expected, monkeypatch):
+        """
+        Assert the parsing RULE, not the value this host happens to deploy —
+        the old test asserted `is None` and so failed on any server that
+        actually configures a provider (it broke on the production VPS).
+        """
+        if raw is None:
+            monkeypatch.delenv("POT_PROVIDER_URL", raising=False)
+        else:
+            monkeypatch.setenv("POT_PROVIDER_URL", raw)
+        assert ((os.getenv("POT_PROVIDER_URL") or "").strip() or None) == expected
 
 
 class TestStoryboardExclusion:

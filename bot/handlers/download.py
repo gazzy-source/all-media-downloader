@@ -383,6 +383,28 @@ async def start_url_flow(
         parse_mode=ParseMode.HTML,
     )
 
+    # extract_info blocks with no callbacks of its own, so without a heartbeat
+    # the message sits unchanged for the whole wait and reads as frozen. It is
+    # usually 2-5s, but a retrying platform can stretch that.
+    async def _analysing_heartbeat() -> None:
+        started = time.time()
+        try:
+            while True:
+                await asyncio.sleep(3)
+                elapsed = int(time.time() - started)
+                try:
+                    await status.edit_text(
+                        f"🔍 <b>Analyzing…</b>\n"
+                        f"{progress_bar(min(90, elapsed * 8))}\n"
+                        f"<code>Reading formats · {elapsed}s</code>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    heartbeat = asyncio.create_task(_analysing_heartbeat())
     try:
         await context.bot.send_chat_action(chat.id, ChatAction.TYPING)
         info = await download_manager.extract_info(url)
@@ -411,6 +433,10 @@ async def start_url_flow(
                 reply_markup=main_reply_keyboard(),
             )
         return
+    finally:
+        # Must stop on every path, or the ticker keeps overwriting whatever
+        # the wizard (or the error branch) just wrote.
+        heartbeat.cancel()
 
     if info.is_live:
         await status.edit_text(
@@ -517,8 +543,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     sid = parts[1]
     session = sessions.get(sid)
     if not session:
+        # Sessions live in memory, so they also vanish on a bot restart — not
+        # only on timeout. Say what to do rather than just what went wrong.
         await query.edit_message_text(
-            "⌛ This session expired. Please send the link again.",
+            "⌛ <b>This session is no longer active</b>\n\n"
+            "Wizard sessions expire after a while, and reset when the bot "
+            "restarts.\n\nJust send the link again — it only takes a moment.",
+            parse_mode=ParseMode.HTML,
         )
         return
     if session.user_id != user_id and user_id not in ADMIN_IDS:

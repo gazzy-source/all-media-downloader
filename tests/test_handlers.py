@@ -256,9 +256,18 @@ class TestHandleCallback:
         assert called["url"] == "https://youtu.be/tok"
 
     async def test_unknown_session_reports_expired(self, fx):
+        """
+        Assert the contract, not the wording: the user must learn the session
+        is unusable AND what to do about it. Sessions also vanish on restart,
+        not just on timeout, so the message says so.
+        """
         q = FakeCallbackQuery(data="mode:ghostsid:video")
         await hd.handle_callback(fx.update(callback_query=q), fx.ctx)
-        assert q.edits and "expired" in q.edits[0][0].lower()
+        assert q.edits, "an expired session must still answer the user"
+        text = q.edits[0][0].lower()
+        assert "no longer active" in text or "expired" in text
+        assert "send the link again" in text, "must say how to recover"
+        assert "restart" in text, "restarts also clear sessions — say so"
 
     async def test_foreign_session_rejected_with_message(self, fx):
         s = DownloadSession(session_id="sX", user_id=999, chat_id=1,
@@ -606,3 +615,49 @@ class TestAfterDownloadKeyboard:
         for row in kb.inline_keyboard:
             for btn in row:
                 assert len(btn.callback_data.encode()) <= 64
+
+
+class TestAnalysingHeartbeat:
+    """
+    "Getting title, formats & options" never changed while extract_info ran,
+    so any wait read as frozen. A ticker fixes that — but it must stop on every
+    path or it overwrites whatever the wizard writes next.
+    """
+
+    async def _run(self, fx, monkeypatch, extract):
+        import asyncio as _a
+        monkeypatch.setattr(hd.rate_limiter, "allow", lambda uid: (True, 0))
+        monkeypatch.setattr(hd.download_manager, "extract_info", extract)
+        msg = fx.msg("https://youtu.be/x")
+        await hd.start_url_flow(fx.update(msg), fx.ctx, "https://youtu.be/x")
+        before = len(msg.children[0].edits) if msg.children else 0
+        await _a.sleep(0.35)          # a live ticker would fire again here
+        after = len(msg.children[0].edits) if msg.children else 0
+        return msg, before, after
+
+    async def test_heartbeat_stops_after_success(self, fx, monkeypatch):
+        from bot.services.downloader import MediaInfo
+
+        async def ok(url):
+            return MediaInfo(url=url, title="T", platform="YouTube",
+                             has_video=True, available_heights=[720])
+
+        monkeypatch.setattr(hd, "_analysing_heartbeat_interval", 0.05, raising=False)
+        _, before, after = await self._run(fx, monkeypatch, ok)
+        assert before == after, "ticker kept writing after analysis finished"
+
+    async def test_heartbeat_stops_after_failure(self, fx, monkeypatch):
+        async def boom(url):
+            raise RuntimeError("Video unavailable")
+
+        _, before, after = await self._run(fx, monkeypatch, boom)
+        assert before == after, "ticker kept writing after the error was shown"
+
+    async def test_error_message_survives_the_ticker(self, fx, monkeypatch):
+        """The last thing on screen must be the error, not a stale tick."""
+        async def boom(url):
+            raise RuntimeError("Video unavailable")
+
+        msg, *_ = await self._run(fx, monkeypatch, boom)
+        last = msg.children[0].edits[-1][0] if msg.children[0].edits else ""
+        assert "Could not read this link" in last, last[:120]

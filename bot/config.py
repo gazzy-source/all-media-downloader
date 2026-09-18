@@ -117,7 +117,11 @@ BOT_SHORT_DESCRIPTION: str | None = (
 
 TELEGRAM_VIDEO_CAPTION_LIMIT = 1024
 TELEGRAM_MESSAGE_LIMIT = 4096
-SESSION_TTL = 600
+# How long a DM wizard stays usable. 10 minutes was tight: pick a link,
+# get distracted, come back to "This session expired". Sessions are a few
+# hundred bytes each and the cleanup job sweeps them, so a longer window
+# costs nothing. (They still die on restart — they live in memory only.)
+SESSION_TTL = int(os.getenv("SESSION_TTL", "1800"))
 TEMP_CLEANUP_HOURS = 1
 
 BOT_NAME = "All-Media Downloader Bot"

@@ -99,6 +99,11 @@ DM_FAST_AUTO: bool = os.getenv("DM_FAST_AUTO", "0").strip() in (
 # strategies a flaky connection can stretch to minutes, and the user just
 # waits. Observed in production: 254s on one link. Fail fast instead.
 EXTRACT_TIMEOUT: int = int(os.getenv("EXTRACT_TIMEOUT", "45"))
+# Per-request leash for the metadata pass only. Downloads keep the more
+# patient values, where waiting out a slow socket beats restarting a
+# large transfer.
+METADATA_SOCKET_TIMEOUT: int = int(os.getenv("METADATA_SOCKET_TIMEOUT", "8"))
+METADATA_RETRIES: int = int(os.getenv("METADATA_RETRIES", "1"))
 
 # Metadata extract cache TTL (seconds) — speeds repeated DM analyzes
 META_CACHE_TTL: int = int(os.getenv("META_CACHE_TTL", "180"))

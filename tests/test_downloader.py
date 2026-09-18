@@ -1120,3 +1120,60 @@ class TestNotFoundMessages:
     def test_exception_prefixes_still_survive(self):
         """Regression: the @ widening must not start eating KeyError: etc."""
         assert "KeyError" in dl._clean_extractor_message("KeyError: 'formats'")
+
+
+class TestMetadataHasAShortLeash:
+    """
+    Reported: "Reading formats · 22s" on an operation measured at ~2s.
+    Cause: the metadata pass inherited the download timeouts (socket_timeout 18,
+    retries 3), so one stalled socket bought 18s of silence before the retry
+    that succeeded. Metadata is small JSON with a person watching a spinner.
+    """
+
+    def _meta_opts(self, monkeypatch):
+        """Build the opts _extract_info_sync actually uses for metadata."""
+        captured = {}
+
+        class FakeYDL:
+            def __init__(self, opts):
+                captured.update(opts)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def extract_info(self, url, download=False):
+                return {"title": "t", "formats": []}
+
+        monkeypatch.setattr(dl.yt_dlp, "YoutubeDL", FakeYDL)
+        monkeypatch.setattr(dl, "_cookie_jar_for_job", lambda: None)
+        monkeypatch.setattr(dl, "_resolved_ffmpeg_dir", lambda: None)
+        monkeypatch.setattr(dl, "_resolved_impersonate", lambda: None)
+        dl._META_CACHE.clear()
+        dl._extract_info_sync("https://vimeo.com/123")
+        dl._META_CACHE.clear()
+        return captured
+
+    def test_metadata_uses_the_short_timeout(self, monkeypatch):
+        opts = self._meta_opts(monkeypatch)
+        assert opts["socket_timeout"] == dl.METADATA_SOCKET_TIMEOUT
+        assert opts["retries"] == dl.METADATA_RETRIES
+
+    def test_metadata_leash_is_shorter_than_the_download_one(self, monkeypatch):
+        download_opts = dl._base_opts(host="vimeo.com")
+        meta_opts = self._meta_opts(monkeypatch)
+        assert meta_opts["socket_timeout"] < download_opts["socket_timeout"]
+        assert meta_opts["retries"] <= download_opts["retries"]
+
+    def test_worst_case_request_time_is_bounded(self):
+        """socket_timeout x (retries + 1) is what a user can wait per request."""
+        worst = dl.METADATA_SOCKET_TIMEOUT * (dl.METADATA_RETRIES + 1)
+        assert worst <= 20, f"metadata request can stall {worst}s"
+
+    def test_downloads_keep_the_patient_settings(self):
+        """A 100MB transfer should ride out a slow socket, not restart."""
+        opts = dl._base_opts(host="www.youtube.com")
+        assert opts["socket_timeout"] >= 15
+        assert opts["retries"] >= 3

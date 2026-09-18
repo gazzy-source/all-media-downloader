@@ -23,6 +23,8 @@ from bot.config import (
     FORMAT_FALLBACK,
     MAX_CONCURRENT_DOWNLOADS,
     META_CACHE_TTL,
+    METADATA_RETRIES,
+    METADATA_SOCKET_TIMEOUT,
     POT_PROVIDER_URL,
     PROXY,
     PROXY_HOSTS,
@@ -794,6 +796,15 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 "noplaylist": True,
                 "quiet": True,
                 "no_warnings": True,
+                # Metadata is a handful of small JSON requests with a person
+                # watching a spinner, so it wants a short leash. The download
+                # defaults (socket_timeout 18, retries 3) are tuned for pushing
+                # a 100MB file and are far too patient here: one stalled socket
+                # cost 18s of silence before the retry that succeeded, which is
+                # exactly the 22s "Reading formats" users reported against an
+                # operation that normally takes ~2s.
+                "socket_timeout": METADATA_SOCKET_TIMEOUT,
+                "retries": METADATA_RETRIES,
             }
         )
 

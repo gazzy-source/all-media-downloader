@@ -177,6 +177,23 @@ class SimpleBundle:
 
 
 @pytest.fixture(autouse=True)
+def _neutral_network_config(monkeypatch):
+    """
+    Pin PROXY/PROXY_HOSTS to "no proxy configured" for every test.
+
+    These are read from the deployment's .env, so without this a server that
+    actually configures a proxy runs a different code path than CI and tests
+    pass locally while failing in production (exactly what happened when
+    PROXY_HOSTS was introduced). Tests that exercise proxying set both
+    explicitly.
+    """
+    import bot.services.downloader as dl
+
+    monkeypatch.setattr(dl, "PROXY", None)
+    monkeypatch.setattr(dl, "PROXY_HOSTS", ())
+
+
+@pytest.fixture(autouse=True)
 def _no_pot_probe(monkeypatch):
     """
     Pin the PO-token probe to "no provider" so tests never hit the network or

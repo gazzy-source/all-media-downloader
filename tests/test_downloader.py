@@ -420,6 +420,7 @@ class TestBaseOpts:
 
     def test_proxy_passed_through(self, monkeypatch):
         monkeypatch.setattr(dl, "PROXY", "socks5://u:p@h:1080")
+        monkeypatch.setattr(dl, "PROXY_HOSTS", ())  # empty allowlist = proxy all
         assert dl._base_opts(host="x.com")["proxy"] == "socks5://u:p@h:1080"
 
 

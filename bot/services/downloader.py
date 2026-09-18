@@ -1590,6 +1590,19 @@ class DownloadManager:
             or "not a bot" in low
             or "cookies are no longer valid" in low
         ):
+            # Don't advise running a provider when one is already running — on a
+            # bot-walled datacenter IP it mints tokens fine and YouTube still
+            # refuses every client, so the only real remedy left is a cleaner IP.
+            if pot_provider_available():
+                return (
+                    "YouTube bot-walled this server on every client it tried, "
+                    "even with a PO-token provider running.\n\n"
+                    "That means this server's IP is blocked outright — common on "
+                    "datacenter/VPS ranges. Cookies are not the issue; public "
+                    "videos need none.\n\n"
+                    "Fix: set PROXY to a residential/mobile IP (PROXY_HOSTS can "
+                    "limit it to just the platforms that need it)."
+                )
             return (
                 "YouTube bot-walled this server on every client it tried.\n\n"
                 "The bot needs no cookies for public videos — it falls back to a "

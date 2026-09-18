@@ -813,3 +813,29 @@ class TestSelectiveProxy:
             if h.strip()
         )
         assert parsed == expected
+
+
+class TestBotWallAdviceMatchesSetup:
+    """Don't tell an operator to run something they are already running."""
+
+    MSG = "Sign in to confirm you're not a bot"
+
+    def test_without_provider_suggests_running_one(self, monkeypatch):
+        monkeypatch.setattr(dl, "pot_provider_available", lambda: False)
+        out = dl.DownloadManager._friendly_error(self.MSG)
+        assert "PO-token provider" in out
+        assert "even with a PO-token provider running" not in out
+
+    def test_with_provider_points_at_the_ip_instead(self, monkeypatch):
+        """Measured on the VPS: provider mints tokens, YouTube still refuses."""
+        monkeypatch.setattr(dl, "pot_provider_available", lambda: True)
+        out = dl.DownloadManager._friendly_error(self.MSG)
+        assert "even with a PO-token provider running" in out
+        assert "PROXY" in out
+        assert "see docker-compose.yml" not in out, "stale advice for this host"
+
+    def test_never_blames_cookies_for_a_public_video(self, monkeypatch):
+        for available in (True, False):
+            monkeypatch.setattr(dl, "pot_provider_available", lambda: available)
+            out = dl.DownloadManager._friendly_error(self.MSG)
+            assert "public videos need none" in out.lower() or "no cookies" in out.lower()

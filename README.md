@@ -246,16 +246,48 @@ every client, because the block lands on the initial player request.
 Everything else works from the same host — X/Twitter, Instagram, Facebook,
 Pinterest, Twitch, Rumble, VK, Snapchat and LinkedIn all download normally.
 
-The reliable fix is a residential or mobile proxy. Since those bill per GB and
-video is heavy, route only the blocked platforms through it:
+### Fix: Cloudflare WARP as a local SOCKS proxy (free)
 
-```dotenv
-PROXY=socks5://user:pass@proxy-host:1080
-PROXY_HOSTS=youtube.com,youtu.be,reddit.com,redd.it,soundcloud.com,tumblr.com,bilibili.com
+WARP gives the host a non-datacenter egress IP at no cost and without
+credentials. In **proxy mode** it only opens a local SOCKS listener — it does
+not touch the default route, so SSH and everything else are unaffected.
+
+```bash
+curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg   | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main"   | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+sudo apt-get update && sudo apt-get install -y cloudflare-warp
+
+sudo warp-cli --accept-tos registration new
+sudo warp-cli --accept-tos mode proxy          # proxy only — no default-route change
+sudo warp-cli --accept-tos proxy port 40000
+sudo warp-cli --accept-tos connect
+sudo systemctl enable --now warp-svc           # reconnects by itself on restart
 ```
 
-Everything not listed in `PROXY_HOSTS` continues to go out directly, so the
-proxy is only spent where it is actually needed.
+Then point the bot at it, proxying only the hosts that need it so the platforms
+that already work stay off the proxy and stay fast:
+
+```dotenv
+PROXY=socks5://127.0.0.1:40000
+PROXY_HOSTS=youtube.com,youtu.be,music.youtube.com,reddit.com,redd.it,soundcloud.com
+```
+
+Measured on the same Oracle VPS after enabling it — **YouTube, Reddit and
+SoundCloud all recovered**, YouTube at the full quality ladder (1080p+ formats
+listed, a 720p merge in 6.1s):
+
+| | Before | After |
+|---|---|---|
+| Platforms working | 10 / 15 | **13 / 15** |
+| YouTube | bot-walled on every client | full ladder via WARP + PO token |
+
+`Tumblr` and `Bilibili` still fail, and a proxy will not help unless it exits in
+another country: both Oracle and free WARP egress from `IN` here, Tumblr is
+blocked in India and Bilibili geo-restricts. Free WARP cannot pick an exit
+country — these need a proxy located elsewhere.
+
+A paid residential/mobile proxy works the same way; just replace `PROXY`.
+`PROXY_HOSTS` matters more there, since those bill per GB and video is heavy.
 
 ---
 

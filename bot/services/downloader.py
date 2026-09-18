@@ -979,8 +979,12 @@ def _clean_extractor_message(msg: str) -> str:
     # Leading "<video-id>: " — but never an exception class name, or
     # "KeyError: 'formats'" would become "'formats'" and stop being
     # recognisable as an internal crash to mask.
-    text = re.sub(r"^(?!\w*(?:Error|Exception)\b)[\w.-]{1,80}:\s+", "", text)
+    # @ included so a channel handle ("@BlenderFoundation: …") is stripped too.
+    text = re.sub(r"^(?!\w*(?:Error|Exception)\b)[@\w.-]{1,80}:\s+", "", text)
     text = _YTDLP_NOISE.sub("", text)
+    # "(caused by <HTTPError 404: Not Found>)" only restates the sentence in
+    # Python's words rather than the user's.
+    text = re.sub(r"\s*\(caused by [^)]*\)\s*", " ", text)
     return " ".join(text.split()).strip(" ;,")
 
 
@@ -1710,8 +1714,17 @@ class DownloadManager:
             )
         if "geo" in low or "region" in low or "not available in your country" in low:
             return "This media is blocked in the server's region."
-        if "unavailable" in low or "has been removed" in low or "video is not available" in low:
-            return "This media is unavailable or has been removed."
+        if (
+            "unavailable" in low
+            or "has been removed" in low
+            or "video is not available" in low
+            or "404" in low
+            or "not found" in low
+        ):
+            return (
+                "This media is unavailable, private, or the link is wrong — "
+                "the platform returned nothing for it."
+            )
         if "copyright" in low or "blocked" in low:
             return "This media is blocked due to copyright or platform restrictions."
         # Extractor broken against the live site — nothing the user can change.

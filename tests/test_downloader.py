@@ -1056,3 +1056,67 @@ class TestExtractionEmitsStages:
             f"retries must be visible, got {stages}"
         )
         assert all(0 < p < 8 for p, _ in stages), "stages stay in the early band"
+
+
+class TestPlaylistExtractionIsBounded:
+    """
+    A bare playlist URL sat on "Getting title, formats & options" for minutes:
+    noplaylist only covers a video INSIDE a playlist, so a playlist/channel URL
+    still expanded and, with extract_flat off, every entry was fully extracted
+    — while only entries[0] is ever used.
+    """
+
+    def test_extraction_stops_at_the_first_entry(self):
+        for host in ("www.youtube.com", "vimeo.com", "soundcloud.com"):
+            opts = dl._base_opts(host=host)
+            assert opts.get("playlistend") == 1, host
+
+    def test_noplaylist_still_set(self):
+        """Belt and braces: a video inside a playlist must not expand either."""
+        assert dl._base_opts(host="www.youtube.com").get("noplaylist") is True
+
+    def test_playlist_count_comes_from_the_real_total(self):
+        """With playlistend=1 only one entry is fetched, so len(entries) is 1."""
+        info = dl._normalize_info_dict("u", {
+            "_type": "playlist", "title": "My List", "playlist_count": 183,
+            "entries": [{"title": "first", "formats": []}],
+        })
+        assert info["_playlist_count"] == 183, "must not report 1"
+        assert info["_is_playlist"] is True
+        assert info["title"] == "first"
+
+    def test_falls_back_to_entry_count_when_total_unknown(self):
+        info = dl._normalize_info_dict("u", {
+            "_type": "playlist", "title": "L",
+            "entries": [{"title": "a"}, {"title": "b"}],
+        })
+        assert info["_playlist_count"] == 2
+
+    def test_empty_playlist_still_raises(self):
+        with pytest.raises(RuntimeError):
+            dl._normalize_info_dict("u", {"_type": "playlist", "entries": []})
+
+
+class TestNotFoundMessages:
+    def test_404_reads_like_a_missing_link(self):
+        out = dl.DownloadManager._friendly_error(
+            "ERROR: [youtube:tab] @SomeChannel: Unable to download API page: "
+            "HTTP Error 404: Not Found (caused by <HTTPError 404: Not Found>)"
+        )
+        assert "unavailable" in out.lower()
+        for noise in ("404", "caused by", "HTTPError", "@SomeChannel", "API page"):
+            assert noise not in out, f"leaked {noise!r}"
+
+    def test_caused_by_tail_is_stripped(self):
+        out = dl._clean_extractor_message(
+            "Something broke (caused by <HTTPError 403: Forbidden>)"
+        )
+        assert out == "Something broke"
+
+    def test_at_handle_prefix_stripped(self):
+        out = dl._clean_extractor_message("[youtube:tab] @Handle: real message here")
+        assert out == "real message here"
+
+    def test_exception_prefixes_still_survive(self):
+        """Regression: the @ widening must not start eating KeyError: etc."""
+        assert "KeyError" in dl._clean_extractor_message("KeyError: 'formats'")

@@ -545,7 +545,16 @@ class TestStartUrlFlow:
         status = msg.children[0]
         err_edits = [e for e in status.edits if "could not read" in e[0].lower()]
         assert err_edits, f"friendly error expected, got: {[e[0] for e in status.edits]}"
-        assert err_edits[0][1].get("reply_markup") is not None  # main keyboard attached
+        # The edit must carry NO reply keyboard: editMessageText accepts an
+        # inline keyboard only, and attaching the persistent one made Telegram
+        # answer BadRequest("Inline keyboard expected"), which surfaced to the
+        # user as "Something went wrong" on every unreadable link. The old
+        # assertion here (`is not None`) encoded that bug.
+        from telegram import ReplyKeyboardMarkup
+
+        assert not isinstance(
+            err_edits[0][1].get("reply_markup"), ReplyKeyboardMarkup
+        )
 
     async def test_success_creates_session_and_shows_modes(self, fx, monkeypatch, no_rate_limit):
         from bot.services.downloader import MediaInfo

@@ -116,6 +116,8 @@ class FakeBot:
         self.sent: list[tuple[str, tuple, dict]] = []
         self.chat_actions: list[tuple[int, str]] = []
         self.edits: list = []
+        self.media_edits: list = []
+        self.deletes: list = []
 
     async def send_chat_action(self, chat_id, action, **kw):
         self.chat_actions.append((chat_id, action))
@@ -143,6 +145,16 @@ class FakeBot:
 
     async def edit_message_text(self, text, chat_id=None, message_id=None, **kw):
         self.edits.append((text, chat_id, message_id, kw))
+        return True
+
+    # Kept in step with telegram.Bot: a missing method here fails as an
+    # AttributeError deep inside a handler instead of exercising the code.
+    async def edit_message_media(self, chat_id=None, message_id=None, media=None, **kw):
+        self.media_edits.append((chat_id, message_id, media, kw))
+        return True
+
+    async def delete_message(self, chat_id=None, message_id=None, **kw):
+        self.deletes.append((chat_id, message_id))
         return True
 
 

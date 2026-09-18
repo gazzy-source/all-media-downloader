@@ -7,7 +7,14 @@ import logging
 import time
 from pathlib import Path
 
-from telegram import InputFile, Update
+from telegram import (
+    InputFile,
+    InputMediaAudio,
+    InputMediaDocument,
+    InputMediaPhoto,
+    InputMediaVideo,
+    Update,
+)
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import ContextTypes
@@ -17,6 +24,7 @@ from bot.config import (
     AUTO_DOWNLOAD_ALWAYS,
     AUTO_DOWNLOAD_GROUPS,
     AUTO_QUALITY,
+    CHANNEL_REPLACE_LINK,
     DM_FAST_AUTO,
     MAX_FILE_SIZE_BYTES,
     QUALITY_MAP,
@@ -305,7 +313,12 @@ async def auto_download_flow(
             )
             return
 
-        await _send_media(context, chat.id, path, result, caption, reply_markup=actions)
+        if is_channel and CHANNEL_REPLACE_LINK and getattr(msg, "message_id", None):
+            await _replace_channel_post(context, chat.id, msg.message_id, path, result)
+        else:
+            await _send_media(
+                context, chat.id, path, result, caption, reply_markup=actions
+            )
         record_download(
             actor, url, result.title or "", "?", "video", quality, True, file_size=size
         )
@@ -908,6 +921,68 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
     finally:
         download_manager.cleanup_result_files(result)
         sessions.remove(session.session_id)
+
+
+def _input_media_for(result, fh, filename: str):
+    """Wrap the downloaded file in the InputMedia type matching its kind."""
+    if result.is_audio:
+        return InputMediaAudio(media=fh, filename=filename)
+    if result.is_image:
+        return InputMediaPhoto(media=fh, filename=filename)
+    if result.is_video:
+        return InputMediaVideo(
+            media=fh, filename=filename, supports_streaming=True
+        )
+    return InputMediaDocument(media=fh, filename=filename)
+
+
+async def _replace_channel_post(
+    context, chat_id: int, source_message_id: int, path: Path, result
+) -> str:
+    """
+    Turn the channel's link post into the media itself, so nobody has to tidy up.
+
+    Three strategies, best first:
+
+    1. edit — Bot API 7.4+ lets editMessageMedia add media to a TEXT message, so
+       the link post becomes the video in place: same message id, same position
+       in the channel, nothing left to delete. Needs the bot to be an admin with
+       "Edit messages".
+    2. replace — post the media, then delete the link. Readers see the same end
+       state; needs "Delete messages" instead.
+    3. send — post the media and leave the link alone. Always works, and is what
+       the bot did before; the link just has to be removed by hand.
+
+    Returns which one succeeded, for logging.
+    """
+    try:
+        with path.open("rb") as fh:
+            await context.bot.edit_message_media(
+                chat_id=chat_id,
+                message_id=source_message_id,
+                media=_input_media_for(result, fh, path.name),
+                **_UPLOAD_KW,
+            )
+        return "edited"
+    except TelegramError as e:
+        logger.info(
+            "Channel edit-in-place unavailable (%s) — falling back to "
+            "post+delete. Grant the bot 'Edit messages' to keep the original "
+            "message id.",
+            e,
+        )
+
+    await _send_media(context, chat_id, path, result, caption="", reply_markup=None)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=source_message_id)
+        return "replaced"
+    except TelegramError as e:
+        logger.info(
+            "Could not remove the source link post (%s) — grant the bot "
+            "'Delete messages' so the link does not have to be removed by hand.",
+            e,
+        )
+        return "sent"
 
 
 # Per-request timeouts for large media (seconds) — long write for multi-MB uploads

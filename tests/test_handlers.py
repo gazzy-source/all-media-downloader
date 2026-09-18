@@ -199,11 +199,17 @@ class TestAutoDownloadFlow:
         msg = FakeMessage(text="https://youtu.be/abc", chat=fx.chat, from_user=None)
         upd = fx.update(msg)
         await hd.auto_download_flow(upd, fx.ctx, "https://youtu.be/abc")
-        vid_calls = [s for s in fx.ctx.bot.sent if s[0] == "send_video"]
-        assert vid_calls, "channel must still receive the media"
-        kw = vid_calls[0][2]
-        assert "caption" not in kw or not kw.get("caption")
-        assert "reply_markup" not in kw or not kw.get("reply_markup")
+        # The channel's link post is now turned into the media in place, so the
+        # media arrives as an edit of that message rather than a new post.
+        media_edits = fx.ctx.bot.media_edits
+        assert media_edits, "channel must still receive the media"
+        assert media_edits[0][1] == msg.message_id, "must replace the link post"
+        kw = media_edits[0][3]
+        assert not kw.get("caption")
+        assert not kw.get("reply_markup")
+        assert not [s for s in fx.ctx.bot.sent if s[0] == "send_video"], (
+            "editing in place must not also post a second message"
+        )
 
 
 def make_fake(result):

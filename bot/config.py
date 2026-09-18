@@ -61,6 +61,19 @@ AUTO_DOWNLOAD_ALWAYS: bool = os.getenv("AUTO_DOWNLOAD_ALWAYS", "0").strip() in (
     "True",
     "yes",
 )
+# Channels: replace the link post with the downloaded media instead of adding a
+# second message, so nobody has to delete the link by hand. Needs the bot to be
+# a channel admin with "Edit messages" (best: the post becomes the video in
+# place) or "Delete messages" (the link is removed after the media is posted).
+# Groups are excluded on purpose: Telegram does not let a bot edit another
+# user's message outside channels.
+CHANNEL_REPLACE_LINK: bool = os.getenv("CHANNEL_REPLACE_LINK", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "no",
+)
+
 # Private chat: 0 = mode/quality buttons (default). 1 = auto-download like groups.
 DM_FAST_AUTO: bool = os.getenv("DM_FAST_AUTO", "0").strip() in (
     "1",

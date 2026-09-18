@@ -160,6 +160,7 @@ Open your bot in Telegram → `/start` → paste a link.
 | `DOWNLOAD_DIR` / `TEMP_DIR` | `downloads` / `temp` | Storage paths |
 | `COOKIES_FILE` | — | Optional. Netscape cookies, only for private/age-walled posts |
 | `POT_PROVIDER_URL` | auto-detect | bgutil PO-token provider. Unlocks full-quality YouTube without cookies |
+| `CHANNEL_REPLACE_LINK` | `1` | In channels, turn the link post into the media instead of adding a second message |
 | `PROXY` | — | `http://` or `socks5://` proxy |
 | `PROXY_HOSTS` | all | Comma-separated hosts to route through `PROXY`. Empty = everything |
 | `FFMPEG_LOCATION` | auto | Folder containing `ffmpeg` binary |
@@ -222,6 +223,31 @@ An unset `POT_PROVIDER_URL` is probed once at startup against
 
 `cookies.txt` remains optional and is only needed for private, members-only, or
 age-restricted content.
+
+---
+
+## Channels: the link post becomes the media
+
+Post a link in a channel the bot administers and the bot replaces that post with
+the downloaded media, so there is no leftover link to delete by hand.
+
+It tries three things, in order, and the one that works depends on the rights
+the bot has in the channel:
+
+| | What happens | Needs |
+|---|---|---|
+| 1 | The link post itself becomes the video — same message, same position | **Edit messages** |
+| 2 | Media is posted, then the link post is deleted | **Delete messages** |
+| 3 | Media is posted, link is left in place (old behaviour) | Post messages |
+
+Give the bot **Edit messages** for the cleanest result. The chosen path is
+logged, so if you see `Channel edit-in-place unavailable …` in the journal, the
+bot is missing that right and fell back.
+
+Set `CHANNEL_REPLACE_LINK=0` to keep the old post-alongside behaviour.
+
+Groups are deliberately excluded: Telegram does not let a bot edit another
+user's message outside channels.
 
 ---
 

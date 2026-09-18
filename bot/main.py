@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import sys
 import time
-from pathlib import Path
 
 from telegram import Update
 from telegram.ext import (
@@ -23,7 +21,6 @@ from bot.config import (
     ADMIN_IDS,
     BASE_DIR,
     BOT_TOKEN,
-    COOKIES_FILE,
     TEMP_DIR,
     TEMP_CLEANUP_HOURS,
     TELEGRAM_API_URL,
@@ -102,10 +99,20 @@ async def post_init(app: Application) -> None:
     logger.info("Logged in as @%s (id=%s)", me.username, me.id)
     logger.info("Admins: %s", ADMIN_IDS or "(none)")
     logger.info("FFmpeg: %s", ff if ff else "NOT FOUND")
-    from bot.services.downloader import _resolved_cookie
+    from bot.services.downloader import _resolved_cookie, pot_provider_available
 
     ck = _resolved_cookie()
-    logger.info("Cookies: %s", ck if ck else "none")
+    pot = pot_provider_available()
+    logger.info("Cookies: %s (optional — public posts need none)", ck if ck else "none")
+    if pot:
+        logger.info("YouTube: PO-token provider reachable — full quality available")
+    else:
+        logger.info(
+            "YouTube: no PO-token provider — public videos still download "
+            "cookielessly, but the highest formats may 403 and fall back to the "
+            "`android` client (360p). Start bgutil-provider or set "
+            "POT_PROVIDER_URL to make every quality reachable."
+        )
     logger.info("Telegram API: %s", TELEGRAM_API_URL or "https://api.telegram.org (default)")
     logger.info("=" * 50)
 

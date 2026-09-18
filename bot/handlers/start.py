@@ -64,9 +64,10 @@ HELP_TEXT = f"""
 • Very large files are sent as documents when possible
 
 <b>Troubleshooting</b>
-• Private / login-walled posts need a cookies.txt on the server
+• Public posts work with no login or cookies at all
+• Only private / age-restricted posts need a cookies.txt on the server
 • Install FFmpeg for audio conversion &amp; merging
-• Age-restricted YouTube may need cookies
+• YouTube may cap at 360p unless the server runs a PO-token provider
 
 Built with ❤️ by <b>Gazzy Labs</b>
 """.strip()

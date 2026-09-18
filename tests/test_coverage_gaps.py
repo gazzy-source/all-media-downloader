@@ -338,12 +338,20 @@ class TestFetchHtmlCached:
 # ---------------------------------------------------------------------------
 
 
+def _clear_ffmpeg_cache() -> None:
+    """Some tests monkeypatch find_ffmpeg with a plain callable, and teardown
+    can run before monkeypatch undoes that — so never assume the lru_cache."""
+    clear = getattr(ff.find_ffmpeg, "cache_clear", None)
+    if clear is not None:
+        clear()
+
+
 @pytest.fixture(autouse=True)
 def _ffmpeg_cache_clean():
     """find_ffmpeg is lru_cached — isolate every test from real disk state."""
-    ff.find_ffmpeg.cache_clear()
+    _clear_ffmpeg_cache()
     yield
-    ff.find_ffmpeg.cache_clear()
+    _clear_ffmpeg_cache()
 
 
 class TestEnsurePath:

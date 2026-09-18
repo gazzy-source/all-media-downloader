@@ -22,8 +22,13 @@ BARE_URL_RE = re.compile(
 )
 
 
-def extract_urls(text: str) -> list[str]:
-    """Extract and normalize URLs from user message text."""
+def extract_urls(text: str, *, expand: bool = True) -> list[str]:
+    """
+    Extract and normalize URLs from user message text.
+
+    `expand=False` skips the short-link HEAD lookups, making the call pure and
+    non-blocking — use it from anywhere that must not touch the network.
+    """
     if not text:
         return []
     found: list[str] = []
@@ -41,7 +46,7 @@ def extract_urls(text: str) -> list[str]:
     for u in found:
         if u not in seen:
             seen.add(u)
-            out.append(_expand_short_url(u))
+            out.append(_expand_short_url(u) if expand else u)
     return out
 
 
@@ -82,7 +87,8 @@ def _expand_short_url(url: str) -> str:
 
 
 def is_likely_url(text: str) -> bool:
-    return bool(extract_urls(text.strip()))
+    """Cheap syntactic check — never expands short links."""
+    return bool(extract_urls(text.strip(), expand=False))
 
 
 def platform_from_url(url: str) -> str:

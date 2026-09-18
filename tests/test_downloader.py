@@ -76,12 +76,39 @@ class TestVideoFormatForHost:
 
     def test_max_quality(self):
         f = _video_format_for_host("example.org", "max")
-        assert f == dl.FORMAT_FALLBACK
+        assert f == "b/bv*+ba/best"
 
     def test_platform_specific_simple_selectors(self):
-        assert _video_format_for_host("tiktok.com", "1080") == "b/best"
-        assert _video_format_for_host("x.com", "480") == "b/best"
-        assert _video_format_for_host("reddit.com", "max") == "b/best"
+        # Single-rendition hosts stay progressive-first, with a merge tail.
+        assert _video_format_for_host("tiktok.com", "1080") == "b/bv*+ba/best"
+        assert _video_format_for_host("pinterest.com", "720") == "b/bv*+ba/best"
+
+    @pytest.mark.parametrize(
+        "host",
+        ["youtube.com", "instagram.com", "x.com", "twitter.com", "facebook.com",
+         "reddit.com", "v.redd.it", "tiktok.com", "pinterest.com", "example.org"],
+    )
+    @pytest.mark.parametrize("quality", ["480", "720", "1080", "max"])
+    def test_every_selector_can_reach_a_merge(self, host, quality):
+        """
+        Regression: "b"/"best" only match a format carrying BOTH tracks, so on a
+        DASH/HLS-only host they match nothing and the download dies with
+        "Requested format is not available" (hit live on every Reddit post).
+        Every selector must therefore contain an unrestricted bv*+ba merge.
+        """
+        f = _video_format_for_host(host, quality)
+        assert "bv*+ba" in f, f"{host}/{quality} has no merge fallback: {f}"
+
+    def test_reddit_leads_with_merge(self):
+        """Reddit serves no progressive format at all — merge must come first."""
+        for q in ("480", "720", "1080", "max"):
+            f = _video_format_for_host("reddit.com", q)
+            assert f.split("/")[0].startswith("bv*"), f
+
+    def test_x_respects_quality_cap(self):
+        """X serves a real 270/360/720 ladder, so the cap must be honoured."""
+        assert "height<=480" in _video_format_for_host("x.com", "480")
+        assert "height<=720" in _video_format_for_host("twitter.com", "720")
 
     def test_instagram_caps_height(self):
         f = _video_format_for_host("instagram.com", "720")
@@ -184,7 +211,7 @@ class TestFriendlyError:
     @pytest.mark.parametrize(
         ("msg", "expect"),
         [
-            ("Sign in to confirm you're not a bot", "YouTube blocked"),
+            ("Sign in to confirm you're not a bot", "bot-walled"),
             ("HTTP Error 403: Forbidden", "403"),
             ("This video is unavailable", "unavailable"),
             ("Unsupported URL", "not supported"),
@@ -230,12 +257,84 @@ class TestImageErrorHeuristics:
 class TestStickyWinnerOrdering:
     def test_remember_and_order_roundtrip(self):
         # ensure the remembered index round-trips through module globals
-        old = dl._YT_WINNER_SI
+        old_meta, old_dl = dl._YT_WINNER_META, dl._YT_WINNER_DL
         try:
-            dl._remember_yt_strategy(2)
-            assert dl._YT_WINNER_SI == 2
+            dl._remember_yt_strategy(2, download=True)
+            assert dl._YT_WINNER_DL == 2
+            assert dl._YT_WINNER_META == old_meta, "download win must not move meta"
+            dl._remember_yt_strategy(1, download=False)
+            assert dl._YT_WINNER_META == 1
+            assert dl._YT_WINNER_DL == 2, "meta win must not move download"
         finally:
-            dl._remember_yt_strategy(old)
+            dl._remember_yt_strategy(old_meta, download=False)
+            dl._remember_yt_strategy(old_dl, download=True)
+
+    def test_order_puts_winner_first_and_keeps_indices(self):
+        strats = [{"a": 0}, {"a": 1}, {"a": 2}, {"a": 3}]
+        old = dl._YT_WINNER_DL
+        try:
+            dl._remember_yt_strategy(2, download=True)
+            ordered, indices = dl._order_yt_strategies(strats, download=True)
+            assert ordered[0] == {"a": 2}
+            assert indices[0] == 2
+            # every base strategy still reachable, exactly once
+            assert sorted(indices) == [0, 1, 2, 3]
+            assert [strats[i] for i in indices] == ordered
+        finally:
+            dl._remember_yt_strategy(old, download=True)
+
+
+class TestYtStrategies:
+    def test_android_present_and_cookieless(self):
+        """The one client verified to deliver bytes without cookies or a PO token."""
+        for has_cookies in (False, True):
+            strats = dl._yt_strategies(has_cookies=has_cookies)
+            clients = [
+                (s.get("extractor_args", {}).get("youtube", {}).get("player_client") or [None])[0]
+                for s in strats
+            ]
+            assert "android" in clients
+            android = strats[clients.index("android")]
+            assert android["use_cookies"] is False
+
+    def test_default_rotation_leads(self):
+        """Quality-first: the full format ladder is attempted before the 360p floor."""
+        strats = dl._yt_strategies(has_cookies=False)
+        assert not strats[0].get("extractor_args"), "default rotation must lead"
+
+    def test_cookie_strategy_only_when_cookies_exist(self):
+        assert not any(
+            s.get("use_cookies") for s in dl._yt_strategies(has_cookies=False)
+        )
+        assert any(s.get("use_cookies") for s in dl._yt_strategies(has_cookies=True))
+
+
+class TestMergeExtractorArgs:
+    def test_client_pin_preserves_pot_block(self):
+        base = {"youtubepot-bgutilhttp": {"base_url": ["http://p:4416"]}}
+        merged = dl._merge_extractor_args(
+            base, {"youtube": {"player_client": ["android"]}}
+        )
+        assert merged["youtubepot-bgutilhttp"]["base_url"] == ["http://p:4416"]
+        assert merged["youtube"]["player_client"] == ["android"]
+
+    def test_same_key_merges_one_level_deep(self):
+        merged = dl._merge_extractor_args(
+            {"youtube": {"formats": ["dashy"]}},
+            {"youtube": {"player_client": ["android"]}},
+        )
+        assert merged["youtube"] == {
+            "formats": ["dashy"],
+            "player_client": ["android"],
+        }
+
+    def test_does_not_mutate_inputs(self):
+        base = {"youtube": {"formats": ["dashy"]}}
+        dl._merge_extractor_args(base, {"youtube": {"player_client": ["android"]}})
+        assert base == {"youtube": {"formats": ["dashy"]}}
+
+    def test_handles_none(self):
+        assert dl._merge_extractor_args(None, None) == {}
 
 
 class TestBaseOpts:
@@ -247,15 +346,57 @@ class TestBaseOpts:
         assert "player_client" not in yt, "forced clients break cookieless path"
 
     def test_yt_gets_pot_provider_arg(self, monkeypatch):
+        """base_url must be a LIST: the plugin reads _configuration_arg(...)[0],
+        so a bare string would resolve to its first character."""
         monkeypatch.setattr(dl, "POT_PROVIDER_URL", "http://pot:4416")
+        monkeypatch.setattr(dl, "_POT_RESOLVED", False)
+        monkeypatch.setattr(dl, "_POT_ARGS", None)
         opts = dl._base_opts(host="www.youtube.com")
-        assert opts["extractor_args"]["youtubepot-bgutilhttp"]["base_url"] == "http://pot:4416"
+        assert opts["extractor_args"]["youtubepot-bgutilhttp"]["base_url"] == [
+            "http://pot:4416"
+        ]
 
-    def test_pot_default_localhost(self, monkeypatch):
+    def test_configured_pot_url_is_trusted_without_probing(self, monkeypatch):
+        """A compose provider may still be booting — never probe a set URL."""
+        monkeypatch.setattr(dl, "POT_PROVIDER_URL", "http://bgutil-provider:4416")
+        monkeypatch.setattr(dl, "_POT_RESOLVED", False)
+        monkeypatch.setattr(dl, "_POT_ARGS", None)
+
+        def explode(*a, **k):  # pragma: no cover - must not be called
+            raise AssertionError("configured POT_PROVIDER_URL must not be probed")
+
+        monkeypatch.setattr("urllib.request.urlopen", explode)
+        assert dl.pot_provider_available() is True
+
+    def test_unreachable_pot_provider_omits_arg(self, monkeypatch):
+        """A dead endpoint must not cost a connect timeout on every extraction."""
         monkeypatch.setattr(dl, "POT_PROVIDER_URL", None)
+        monkeypatch.setattr(dl, "_POT_RESOLVED", False)
+        monkeypatch.setattr(dl, "_POT_ARGS", None)
+
+        def refuse(*a, **k):
+            raise OSError("connection refused")
+
+        monkeypatch.setattr("urllib.request.urlopen", refuse)
         opts = dl._base_opts(host="www.youtube.com")
-        assert opts["extractor_args"]["youtubepot-bgutilhttp"]["base_url"] == \
-            "http://127.0.0.1:4416"
+        assert "youtubepot-bgutilhttp" not in (opts.get("extractor_args") or {})
+        assert dl.pot_provider_available() is False
+
+    def test_pot_probe_runs_only_once(self, monkeypatch):
+        monkeypatch.setattr(dl, "POT_PROVIDER_URL", None)
+        monkeypatch.setattr(dl, "_POT_RESOLVED", False)
+        monkeypatch.setattr(dl, "_POT_ARGS", None)
+        calls = {"n": 0}
+
+        def refuse(*a, **k):
+            calls["n"] += 1
+            raise OSError("connection refused")
+
+        monkeypatch.setattr("urllib.request.urlopen", refuse)
+        dl._base_opts(host="www.youtube.com")
+        dl._base_opts(host="www.youtube.com")
+        dl.pot_provider_available()
+        assert calls["n"] == 1
 
     def test_non_yt_no_pot_arg(self):
         opts = dl._base_opts(host="vimeo.com")
@@ -321,3 +462,284 @@ class TestConfigSanity:
     def test_pot_provider_url_default(self):
         from bot.config import POT_PROVIDER_URL
         assert POT_PROVIDER_URL is None  # empty env -> None -> localhost default
+
+
+class TestStoryboardExclusion:
+    """
+    Regression: YouTube SABR responses include storyboard "formats"
+    (vcodec=mjpeg, ext=mhtml) with REAL heights. A height-capped selector
+    must never pick one as "video" — live testing showed a 0-second,
+    15.9 KB mjpeg frame delivered as "480p video".
+
+    These tests run the bot's actual format strings through yt-dlp's REAL
+    selector machinery (build_format_selector) with mock format lists —
+    no network. yt-dlp caveats covered here:
+    - filters referencing a missing field silently EXCLUDE the format
+      (so format_note!=storyboard is unsafe; vcodec/ext guards are used)
+    - a trailing b[height<=N] re-matches the storyboard when only
+      storyboards sit under the cap (hence the unrestricted bv*+ba tail)
+    """
+
+    @staticmethod
+    def _fmt(fid, vc, ac, h=None, ext="mp4", tbr=100):
+        f = {
+            "format_id": fid,
+            "vcodec": vc,
+            "acodec": ac,
+            "ext": ext,
+            "url": f"https://example/{fid}",
+            "protocol": "https",
+            "format_note": "standard",
+            "tbr": tbr,
+        }
+        if h:
+            f["height"] = h
+        return f
+
+    @staticmethod
+    def _storyboard(h=480):
+        return {
+            "format_id": "sb0",
+            "vcodec": "mjpeg",
+            "acodec": "none",
+            "height": h,
+            "ext": "mhtml",
+            "url": "https://example/sb0",
+            "protocol": "mhtml",
+            "format_note": "storyboard",
+            "tbr": 50,
+        }
+
+    @classmethod
+    def _pick(cls, fmt_spec, formats):
+        import yt_dlp
+
+        ctx = {
+            "formats": formats,
+            "has_merged_format": any(
+                "none" not in (f.get("acodec"), f.get("vcodec")) for f in formats
+            ),
+            "incomplete_formats": (
+                all(f.get("vcodec") == "none" for f in formats)
+                or all(f.get("acodec") == "none" for f in formats)
+            ),
+        }
+        selector = yt_dlp.YoutubeDL({"format": fmt_spec}).build_format_selector(fmt_spec)
+        return [f["format_id"] for f in selector(ctx)]
+
+    # The trap: only the storyboard sits under the 480 cap; real video is 720p
+    TRAP_LIST = None  # built lazily below (class attrs can't reference self)
+
+    @classmethod
+    def _trap_list(cls):
+        return [
+            cls._storyboard(480),
+            cls._fmt("137", "avc1.640028", "none", 720),
+            cls._fmt("140", "none", "mp4a.40.2", None, "m4a"),
+        ]
+
+    @classmethod
+    def _normal_list(cls):
+        # Realistic SABR list: storyboard + separated streams + itag 18
+        return [
+            *cls._trap_list(),
+            cls._fmt("18", "avc1.42001E", "mp4a.40.2", 360),
+        ]
+
+    def test_capped_quality_never_picks_storyboard(self):
+        from bot.config import QUALITY_MAP
+
+        picked = self._pick(QUALITY_MAP["480"]["format"], self._trap_list())
+        assert picked, "selector must always pick something"
+        for fid in picked:
+            assert not fid.startswith("sb"), f"storyboard selected: {picked}"
+
+    def test_capped_quality_same_result_as_before_on_normal_lists(self):
+        # Normal SABR list (itag 18 present): unchanged behavior vs old spec
+        from bot.config import QUALITY_MAP
+
+        picked = self._pick(QUALITY_MAP["480"]["format"], self._normal_list())
+        assert picked == ["18"]
+
+    @pytest.mark.parametrize("quality", ["480", "720", "1080"])
+    def test_all_quality_tiers_reject_storyboards(self, quality):
+        from bot.config import QUALITY_MAP
+
+        # Storyboard just under the tier cap, real video just above it
+        h_sb = QUALITY_MAP[quality]["height"]
+        formats = [
+            self._storyboard(h_sb),
+            self._fmt("999", "avc1.640028", "none", h_sb + 240),
+            self._fmt("998", "none", "mp4a.40.2", None, "m4a"),
+        ]
+        picked = self._pick(QUALITY_MAP[quality]["format"], formats)
+        assert picked
+        assert not any(f.startswith("sb") for f in picked), picked
+
+    def test_video_format_for_host_generic_has_guard(self):
+        f = _video_format_for_host("example.org", "480")
+        assert "mjpeg" in f and "mhtml" in f
+        assert "height<=480" in f
+
+    def test_480p_guard_applies_on_generic_host(self):
+        # A generic host serving a "storyboard-like" single format under cap
+        # plus higher real video: must resolve to real video, not the frame.
+        formats = [
+            self._storyboard(480),
+            self._fmt("vid", "avc1.640028", "none", 720),
+            self._fmt("aud", "none", "mp4a.40.2", None, "m4a"),
+        ]
+        picked = self._pick(_video_format_for_host("example.org", "480"), formats)
+        assert picked
+        assert not any(f.startswith("sb") for f in picked), picked
+
+
+class TestUnknownCodecHandling:
+    """
+    yt-dlp uses the STRING "none" for "track absent"; None/missing means UNKNOWN.
+    Collapsing the two (`f.get("vcodec") or "none"`) silently broke real posts.
+    """
+
+    def _info(self, formats=None, **kw):
+        info = {"formats": formats or [], "title": "t"}
+        info.update(kw)
+        return info
+
+    def test_twitch_clip_single_unknown_codec_format(self):
+        """Live shape: one format, vcodec/acodec None, height set → was image-only."""
+        hv, ha, hi, heights, _, _ = _parse_formats(self._info(
+            [{"format_id": "1080", "ext": "mp4", "vcodec": None,
+              "acodec": None, "height": 1080, "width": None}],
+            thumbnails=[{"width": 640, "height": 360}],
+        ))
+        assert hv and ha and not hi
+        assert heights == [1080]
+
+    def test_rumble_unknown_codecs_multiple_heights(self):
+        hv, ha, hi, heights, _, _ = _parse_formats(self._info(
+            [{"ext": "mp4", "vcodec": None, "acodec": None, "height": h, "width": w}
+             for h, w in ((360, 640), (480, 854), (720, 1280))],
+            thumbnails=[{"width": 640, "height": 360}],
+        ))
+        assert hv and ha and not hi
+        assert heights == [360, 480, 720]
+
+    def test_x_progressive_formats_expose_audio(self):
+        """X's http-* formats report acodec=None → Audio button never appeared."""
+        hv, ha, hi, _, _, _ = _parse_formats(self._info([
+            {"format_id": "hls-audio", "ext": "mp4", "vcodec": "none",
+             "acodec": None, "height": None},
+            {"format_id": "http-2176", "ext": "mp4", "vcodec": None,
+             "acodec": None, "height": 720, "width": 1280},
+            {"format_id": "hls-500", "ext": "mp4", "vcodec": "avc1",
+             "acodec": "none", "height": 360},
+        ]))
+        assert hv and ha and not hi
+
+    def test_linkedin_mp4_without_height_is_video(self):
+        """Three bare mp4 renditions, no dimensions → used to read audio-only."""
+        hv, ha, hi, _, _, _ = _parse_formats(self._info(
+            [{"format_id": str(i), "ext": "mp4", "vcodec": None,
+              "acodec": None, "height": None} for i in range(3)],
+            thumbnails=[{"width": 640, "height": 360}],
+        ))
+        assert hv and not hi
+
+    def test_snapchat_no_formats_list_is_video(self):
+        """Single-format extractor: no `formats` at all, just ext + duration."""
+        hv, ha, hi, _, _, _ = _parse_formats({
+            "title": "t", "ext": "mp4", "duration": 4.6,
+            "url": "https://cf-st.sc-cdn.net/d/abc.mp4",
+            "thumbnails": [{"width": 640, "height": 360}],
+        })
+        assert hv and not hi
+
+    def test_explicit_none_still_means_absent(self):
+        """The fix must not turn audio-only posts into video."""
+        hv, ha, hi, _, _, _ = _parse_formats(self._info([
+            {"ext": "m4a", "vcodec": "none", "acodec": "mp4a", "height": None},
+        ]))
+        assert ha and not hv
+
+    def test_dash_video_only_is_not_audio(self):
+        hv, ha, hi, _, _, _ = _parse_formats(self._info([
+            {"ext": "mp4", "vcodec": "avc1", "acodec": "none", "height": 720},
+        ]))
+        assert hv and not ha
+
+    def test_real_image_post_still_image(self):
+        hv, ha, hi, _, imgs, _ = _parse_formats(self._info(
+            [{"ext": "jpg", "vcodec": None, "acodec": None,
+              "width": 1080, "height": 1350}],
+        ))
+        assert hi and not hv
+        assert (1080, 1350) in imgs
+
+    def test_youtube_storyboards_never_count_as_media(self):
+        hv, ha, hi, heights, _, _ = _parse_formats(self._info([
+            {"format_id": "sb0", "ext": "mhtml", "vcodec": "images",
+             "acodec": "none", "width": 320, "height": 180},
+            {"format_id": "18", "ext": "mp4", "vcodec": "avc1",
+             "acodec": "mp4a", "height": 360},
+        ]))
+        assert hv and not hi
+        assert heights == [360], "storyboard height must not enter the ladder"
+
+
+class TestBaseOptsTransport:
+    def test_http_chunk_size_only_for_youtube(self):
+        """
+        Regression: a global 10MB http_chunk_size makes yt-dlp use Range
+        requests, which breaks fragmented HLS/DASH — it was the sole cause of
+        every Reddit and VK download dying with "The downloaded file is empty".
+        """
+        assert "http_chunk_size" in dl._base_opts(host="www.youtube.com")
+        for host in ("reddit.com", "v.redd.it", "vk.com", "x.com",
+                     "instagram.com", "example.org"):
+            assert "http_chunk_size" not in dl._base_opts(host=host), host
+
+    def test_impersonation_drops_forced_user_agent(self, monkeypatch):
+        """
+        curl_cffi forges a Chrome TLS fingerprint and sends the matching UA.
+        Forcing our own Chrome/131 header advertises a different browser than
+        the handshake shows; anti-bot systems fingerprint that mismatch
+        (Bilibili: 1/3 success with both, 3/3 with either alone).
+        """
+        monkeypatch.setattr(dl, "_IMPERSONATE", object())
+        monkeypatch.setattr(dl, "_IMPERSONATE_RESOLVED", True)
+        opts = dl._base_opts(host="www.bilibili.com")
+        assert "impersonate" in opts
+        assert "User-Agent" not in opts["http_headers"]
+        # Non-fingerprinting headers must survive
+        assert "Accept-Language" in opts["http_headers"]
+
+    def test_youtube_keeps_its_user_agent_and_no_impersonation(self, monkeypatch):
+        monkeypatch.setattr(dl, "_IMPERSONATE", object())
+        monkeypatch.setattr(dl, "_IMPERSONATE_RESOLVED", True)
+        opts = dl._base_opts(host="www.youtube.com")
+        assert "impersonate" not in opts
+        assert "User-Agent" in opts["http_headers"]
+
+
+class TestInternalErrorMasking:
+    def test_raw_python_error_is_masked(self):
+        """Live yt-dlp OK.ru crash — a TypeError string helps no Telegram user."""
+        out = dl.DownloadManager._friendly_error(
+            "the JSON object must be str, bytes or bytearray, not dict"
+        )
+        assert "JSON object" not in out
+        assert "extractor failed" in out.lower()
+
+    @pytest.mark.parametrize("msg", [
+        "'NoneType' object is not subscriptable",
+        "KeyError: 'formats'",
+        "AttributeError: 'dict' object has no attribute 'group'",
+    ])
+    def test_other_internal_crashes_masked(self, msg):
+        assert "extractor failed" in dl.DownloadManager._friendly_error(msg).lower()
+
+    def test_real_extractor_messages_still_shown(self):
+        """Must not swallow genuine, useful extractor text."""
+        out = dl.DownloadManager._friendly_error("Video unavailable")
+        assert "unavailable" in out.lower()
+        assert "extractor failed" not in out.lower()

@@ -94,7 +94,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     text = update.effective_message.text or update.effective_message.caption or ""
-    urls = extract_urls(text)
+    # extract_urls() resolves pin.it / t.co / bit.ly with blocking HEAD requests.
+    # PTB runs handlers as tasks on one loop, so doing that inline would stall
+    # every other user's update for up to a couple of seconds per short link.
+    if extract_urls(text, expand=False):
+        urls = await asyncio.get_running_loop().run_in_executor(
+            None, extract_urls, text
+        )
+    else:
+        urls = []
     if not urls:
         # Groups/channels: stay quiet on normal posts
         if _is_auto_chat(update):
@@ -144,7 +152,6 @@ async def auto_download_flow(
     Group / channel / instant mode: download immediately at AUTO_QUALITY.
     No mode/quality wizard.
     """
-    user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
     actor = _actor_id(update)
@@ -271,7 +278,7 @@ async def auto_download_flow(
         actions = None
     else:
         title = _esc((result.title or "Media")[:100])
-        kind = "🖼 Image" if result.is_image else f"📐 {q_label}"
+        kind = "🖼 Image" if result.is_image else f"📐 {_quality_label(result)}"
         caption = (
             f"🎬 <b>{title}</b>\n"
             f"{kind} · 💾 {format_size(size)}\n"
@@ -365,7 +372,8 @@ async def start_url_flow(
         friendly = DownloadManager._friendly_error(str(e))
         await status.edit_text(
             f"❌ <b>Could not read this link</b>\n\n{_esc(friendly)}\n\n"
-            "Tips: post must be public, try another URL, or refresh cookies on the VPS.",
+            "Tips: the post must be public, the link must not be a story/private "
+            "account, and some platforms block datacenter IPs.",
             parse_mode=ParseMode.HTML,
             reply_markup=main_reply_keyboard(),
         )
@@ -619,6 +627,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if action == "go":
         await execute_download(query, context, session)
         return
+
+
+def _quality_label(result) -> str:
+    """
+    Requested quality, corrected to what was actually delivered.
+
+    A cookieless YouTube fallback can only serve 360p, so a caption reading
+    "1080p" on a 360p file would be plainly wrong.
+    """
+    requested = QUALITY_MAP.get(result.quality or "", {}).get(
+        "label", result.quality or ""
+    )
+    height = getattr(result, "actual_height", None)
+    if not height:
+        return requested
+    actual = f"{height}p"
+    if actual == requested:
+        return requested
+    if result.quality == "max":
+        return actual
+    return f"{actual} (best available for {requested})"
 
 
 def _mode_label(mode: str) -> str:
@@ -888,8 +917,6 @@ async def _send_media(
     attempts: int = 3,
 ) -> None:
     """Upload media with long timeouts and retries on TimedOut."""
-    from telegram.error import TimedOut, NetworkError, RetryAfter
-
     filename = path.name
     if len(caption) > 1024:
         caption = caption[:1000] + "…"
@@ -1033,9 +1060,7 @@ def _build_caption(session: DownloadSession, result, size: int) -> str:
         f"📡 {session.platform} · {_mode_label(mode)}",
     ]
     if result.quality and mode in ("video", "video_subs"):
-        parts.append(
-            f"📐 {QUALITY_MAP.get(result.quality, {}).get('label', result.quality)}"
-        )
+        parts.append(f"📐 {_quality_label(result)}")
     parts.append(f"💾 {format_size(size)}")
     parts.append("⚡ via All-Media Downloader Bot · Gazzy Labs")
     return "\n".join(parts)

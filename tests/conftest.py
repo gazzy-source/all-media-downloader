@@ -177,6 +177,19 @@ class SimpleBundle:
 
 
 @pytest.fixture(autouse=True)
+def _no_pot_probe(monkeypatch):
+    """
+    Pin the PO-token probe to "no provider" so tests never hit the network or
+    change behaviour based on whether a bgutil server happens to run locally.
+    Tests that exercise the probe itself reset these two globals themselves.
+    """
+    import bot.services.downloader as dl
+
+    monkeypatch.setattr(dl, "_POT_RESOLVED", True)
+    monkeypatch.setattr(dl, "_POT_ARGS", {})
+
+
+@pytest.fixture(autouse=True)
 def _clean_global_state():
     """Keep global stores isolated between tests."""
     from bot.services.rate_limit import rate_limiter

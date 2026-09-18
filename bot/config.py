@@ -114,22 +114,32 @@ SUPPORTED_PLATFORMS = [
 ]
 
 # Progressive-first format strings: one file, no ffmpeg merge when possible
-# → faster + less RAM/CPU on small VPS
+# → faster + less RAM/CPU on small VPS.
+# Storyboard guard: YouTube's SABR responses include mjpeg/mhtml storyboard
+# "formats" with real heights — a capped selector can otherwise pick a
+# 0-second image frame as "video" (verified live: 15.9 KB "480p" file).
+# yt-dlp caveat: filters referencing a missing field silently exclude the
+# format (e.g. format_note!=storyboard drops formats WITHOUT that key), and
+# a trailing b[height<=N] re-matches the storyboard when only storyboards sit
+# under the cap. Chain: guarded segments first, then an UNRESTRICTED merge
+# bv*+ba (requires ffmpeg, which the bot ships/requires) — verified to prefer
+# real video over storyboards in every format-list shape.
+SB_GUARD = "[vcodec!^=mjpeg][ext!=mhtml]"
 QUALITY_MAP = {
     "480": {
         "label": "480p",
         "height": 480,
-        "format": "b[height<=480]/bv*[height<=480]+ba/b",
+        "format": f"b[height<=480]{SB_GUARD}/bv*[height<=480]{SB_GUARD}+ba/bv*+ba/b",
     },
     "720": {
         "label": "720p",
         "height": 720,
-        "format": "b[height<=720]/bv*[height<=720]+ba/b",
+        "format": f"b[height<=720]{SB_GUARD}/bv*[height<=720]{SB_GUARD}+ba/bv*+ba/b",
     },
     "1080": {
         "label": "1080p",
         "height": 1080,
-        "format": "b[height<=1080]/bv*[height<=1080]+ba/b",
+        "format": f"b[height<=1080]{SB_GUARD}/bv*[height<=1080]{SB_GUARD}+ba/bv*+ba/b",
     },
     "max": {
         "label": "Max Quality",

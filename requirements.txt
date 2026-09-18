@@ -1,5 +1,8 @@
 python-telegram-bot[job-queue]==21.10
-yt-dlp>=2025.1.15
+# Extractors break constantly as sites change — keep this floor recent.
+# 2026.8.19 restored cookieless YouTube above 360p and fixed Facebook watch
+# and Tumblr; older builds fail those outright. Update often: pip install -U yt-dlp
+yt-dlp>=2026.8.19
 # Chrome-impersonation for yt-dlp (needed for cookieless Instagram/Facebook).
 # Pin: yt-dlp requires curl-cffi >=0.5.10,<0.16 — 0.15.0 is its tested version.
 curl_cffi==0.15.0

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
-import os
 import re
 import shutil
 import threading
@@ -26,11 +25,13 @@ from bot.config import (
     POT_PROVIDER_URL,
     PROXY,
     QUALITY_MAP,
+    SB_GUARD,
     TEMP_DIR,
 )
-from bot.utils.ffmpeg import ffmpeg_location_dir, find_ffmpeg
+from bot.utils.ffmpeg import ffmpeg_location_dir
 from bot.utils.helpers import (
     IMAGE_EXTS,
+    VIDEO_EXTS,
     format_duration,
     format_size,
     platform_from_url,
@@ -118,6 +119,10 @@ class DownloadResult:
     is_audio: bool = False
     is_video: bool = False
     subtitle_file: Path | None = None
+    # Height yt-dlp actually delivered. May be below the requested quality when
+    # a fallback client was used (e.g. cookieless YouTube capped at 360p), so
+    # captions report this rather than the button the user pressed.
+    actual_height: int | None = None
 
 
 def _esc(text: str) -> str:
@@ -137,9 +142,17 @@ _FFMPEG_RESOLVED = False
 _IMPERSONATE = None
 _IMPERSONATE_RESOLVED = False
 
-# Sticky YouTube strategy winner — next jobs try the fast path first
-_YT_WINNER_SI: int = 0
+# Sticky YouTube strategy winners — next jobs try the proven path first.
+# Metadata and download are tracked separately on purpose: metadata extraction
+# succeeds on clients whose media URLs later 403 (no PO token), so a metadata
+# win must never pin the download path to a strategy that cannot fetch bytes.
+_YT_WINNER_META: int = 0
+_YT_WINNER_DL: int = 0
 _YT_WINNER_LOCK = threading.Lock()
+
+# PO-token provider reachability (resolved once per process)
+_POT_ARGS: dict[str, Any] | None = None
+_POT_RESOLVED = False
 
 # Short-lived metadata cache (speeds DM wizard re-analyzes / back buttons)
 _META_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -208,6 +221,73 @@ def _resolved_ffmpeg_dir() -> str | None:
     return _FFMPEG_DIR
 
 
+def _merge_extractor_args(
+    base: dict[str, Any] | None, extra: dict[str, Any] | None
+) -> dict[str, Any]:
+    """
+    Merge yt-dlp extractor_args one level deep.
+
+    A plain dict.update() would drop the PO-token provider block whenever a
+    strategy supplies its own `youtube` args, which silently removes the only
+    cookieless path to full-quality YouTube formats.
+    """
+    merged: dict[str, Any] = {k: dict(v) for k, v in (base or {}).items()}
+    for key, val in (extra or {}).items():
+        if isinstance(val, dict) and isinstance(merged.get(key), dict):
+            merged[key].update(val)
+        else:
+            merged[key] = dict(val) if isinstance(val, dict) else val
+    return merged
+
+
+def _pot_provider_args() -> dict[str, Any]:
+    """
+    extractor_args for the bgutil PO-token provider, or {} when none is usable.
+
+    YouTube serves full-quality formats to a cookieless client only when it can
+    present a PO token. Pointing the plugin at a dead endpoint on every request
+    just burns a connect timeout per extraction, so an unset POT_PROVIDER_URL is
+    probed once against the plugin's default local endpoint and cached.
+    An explicitly configured URL is always trusted — in compose the provider
+    container may still be booting when the bot resolves this.
+    """
+    global _POT_ARGS, _POT_RESOLVED
+    if _POT_RESOLVED:
+        return dict(_POT_ARGS or {})
+    _POT_RESOLVED = True
+
+    configured = bool(POT_PROVIDER_URL)
+    base = (POT_PROVIDER_URL or "http://127.0.0.1:4416").rstrip("/")
+    reachable = configured
+    if not configured:
+        import urllib.request
+
+        try:
+            with urllib.request.urlopen(f"{base}/ping", timeout=2) as resp:
+                reachable = 200 <= resp.status < 400
+        except Exception:
+            reachable = False
+
+    if reachable:
+        _POT_ARGS = {"youtubepot-bgutilhttp": {"base_url": [base]}}
+        logger.info("PO-token provider: %s (%s)", base, "configured" if configured else "detected")
+    else:
+        _POT_ARGS = {}
+        logger.info(
+            "PO-token provider: none reachable at %s — cookieless YouTube still "
+            "works; the top formats may 403 and fall back to the `android` "
+            "client (360p). Run bgutil-provider (see docker-compose.yml) to "
+            "make every quality reachable.",
+            base,
+        )
+    return dict(_POT_ARGS)
+
+
+def pot_provider_available() -> bool:
+    """True when a PO-token provider is usable (startup logging / diagnostics)."""
+    return bool(_pot_provider_args())
+
+
 def _resolved_impersonate():
     global _IMPERSONATE, _IMPERSONATE_RESOLVED
     if _IMPERSONATE_RESOLVED:
@@ -261,7 +341,12 @@ def _base_opts(
         "file_access_retries": 2,
         "concurrent_fragment_downloads": 4,
         "buffersize": 1024 * 256,
-        "http_chunk_size": 1024 * 1024 * 10,
+        # NOTE: http_chunk_size is NOT set globally. It makes yt-dlp fetch via
+        # 10 MB Range requests, which breaks fragmented HLS/DASH downloads — the
+        # fragment comes back unusable and yt-dlp aborts with "The downloaded
+        # file is empty". Verified live: it was the sole cause of every Reddit
+        # and VK download failing. It is applied for YouTube only below, where
+        # chunking is the documented mitigation for throttled streams.
         "nocheckcertificate": True,
         "geo_bypass": True,
         "noplaylist": True,
@@ -328,16 +413,29 @@ def _base_opts(
         # Chrome impersonation defeats IG/FB bot walls WITHOUT cookies.
         # YouTube extraction is most reliable with vanilla yt-dlp behavior.
         opts["impersonate"] = imp
+        # Drop our hardcoded User-Agent: curl_cffi forges a Chrome TLS/JA3
+        # fingerprint and sends the UA that matches the version it emulates.
+        # Overriding it advertises a different Chrome than the handshake shows,
+        # and anti-bot systems fingerprint exactly that mismatch. Measured on
+        # Bilibili: impersonate + forced UA succeeded 1/3, either alone 3/3.
+        opts["http_headers"].pop("User-Agent", None)
 
     if is_yt:
+        # Chunked ranges keep YouTube from throttling a long single stream, and
+        # cap peak RAM on a small VPS. YouTube serves plain HTTP ranges here
+        # (progressive + DASH), so the fragment problem above does not apply.
+        opts["http_chunk_size"] = 1024 * 1024 * 10
+
         # YouTube heavily throttles datacenter IPs without PO tokens (403s,
         # "Sign in to confirm you're not a bot") — no cookies needed when a
-        # bgutil provider is reachable. The plugin defaults to 127.0.0.1:4416;
-        # docker-compose points us at the provider container by name.
-        base = (POT_PROVIDER_URL or "http://127.0.0.1:4416").rstrip("/")
-        opts["extractor_args"] = {
-            "youtubepot-bgutilhttp": {"base_url": f"{base}"},
-        }
+        # bgutil provider is reachable. Values must be LISTS: the plugin reads
+        # them via _configuration_arg(...)[0], so a bare string would resolve to
+        # its first character. Empty when no provider is usable.
+        pot = _pot_provider_args()
+        if pot:
+            opts["extractor_args"] = _merge_extractor_args(
+                opts.get("extractor_args"), pot
+            )
 
     if PROXY:
         opts["proxy"] = PROXY
@@ -355,29 +453,45 @@ def _video_format_for_host(host: str, quality: str) -> str:
     h = int(q.get("height") or 1080)
     flags = _platform_flags(host)
 
+    # Every selector below ends in an unrestricted `bv*+ba` merge before the
+    # bare fallbacks. "b"/"best" only ever match a format that already carries
+    # BOTH tracks, so on a DASH/HLS-only host they match nothing and the whole
+    # download fails — see the Reddit branch.
     if flags["yt"]:
         return q["format"]
     if flags["ig"]:
         # Reels are usually single progressive streams
         if h >= 9999:
-            return "b/best"
-        return f"b[height<={h}]/best[height<={h}]/b/best"
-    if flags["tt"]:
-        return "b/best"
+            return "b/bv*+ba/best"
+        return f"b[height<={h}]/best[height<={h}]/bv*+ba/b/best"
+    if flags["rd"]:
+        # Reddit is DASH/HLS only: every video format is video-only and every
+        # audio format is audio-only, so a progressive-first selector matches
+        # nothing at all. The merge has to lead here (verified live: "b/best"
+        # returned "Requested format is not available" on every v.redd.it post).
+        if h >= 9999:
+            return "bv*+ba/b/best"
+        return f"bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b/best"
     if flags["x"]:
-        return "b/best"
+        # X serves a real ladder (270/360/720) as progressive http-* formats,
+        # so the requested cap is worth honouring instead of always taking best.
+        if h >= 9999:
+            return "b/bv*+ba/best"
+        return f"b[height<={h}]/bv*[height<={h}]+ba/bv*+ba/b/best"
     if flags["fb"]:
         if h >= 9999:
-            return "b/best"
-        return f"b[height<={h}]/best"
-    if flags["rd"]:
-        return "b/best"
-    if flags["pin"]:
-        return "b/best"
-    # Generic: progressive under cap, then merge, then anything
+            return "b/bv*+ba/best"
+        return f"b[height<={h}]/bv*[height<={h}]+ba/bv*+ba/best"
+    if flags["tt"] or flags["pin"]:
+        # Usually a single progressive rendition; merge tail is pure insurance.
+        return "b/bv*+ba/best"
+    # Generic: progressive under cap, then merge, then anything.
+    # SB_GUARD keeps SABR-era storyboard "formats" (mjpeg/mhtml) from winning
+    # height-capped selectors; the unrestricted bv*+ba merge tail prefers real
+    # video when only storyboards sit under the cap (requires ffmpeg).
     if h >= 9999:
-        return FORMAT_FALLBACK
-    return f"b[height<={h}]/bv*[height<={h}]+ba/b/best"
+        return "b/bv*+ba/best"
+    return f"b[height<={h}]{SB_GUARD}/bv*[height<={h}]{SB_GUARD}+ba/bv*+ba/best"
 
 
 def _parse_formats(info: dict[str, Any]) -> tuple[bool, bool, bool, list[int], list[tuple[int, int]], dict[str, int]]:
@@ -395,30 +509,66 @@ def _parse_formats(info: dict[str, Any]) -> tuple[bool, bool, bool, list[int], l
         has_image = True
 
     for f in formats:
-        vcodec = f.get("vcodec") or "none"
-        acodec = f.get("acodec") or "none"
+        # yt-dlp uses the STRING "none" to mean "this track is definitely
+        # absent". A missing key or None means UNKNOWN, which is a completely
+        # different claim. Collapsing unknown into "none" (`f.get(...) or
+        # "none"`) made real media look empty: Twitch clips and Rumble videos
+        # report vcodec=None on the only format they have and were classified
+        # image-only, and X/Twitter's progressive http-* formats report
+        # acodec=None, so Twitter videos never offered the Audio button.
+        vcodec = f.get("vcodec")
+        acodec = f.get("acodec")
         height = f.get("height")
         width = f.get("width")
         fext = (f.get("ext") or "").lower()
         filesize = f.get("filesize") or f.get("filesize_approx") or 0
 
-        is_image_fmt = fext in IMAGE_EXTS or f.get("format_note") == "storyboard"
-        if is_image_fmt and width and height and not (vcodec not in ("none", None) and height and height > 0 and fext in {"mp4", "webm", "mkv"}):
+        # Storyboards are contact sheets, never a download target.
+        is_image_fmt = (
+            fext in IMAGE_EXTS
+            or fext == "mhtml"
+            or vcodec == "images"
+            or f.get("format_note") == "storyboard"
+        )
+        if is_image_fmt:
             if fext in IMAGE_EXTS:
                 has_image = True
-                image_sizes.append((int(width), int(height)))
+                if width and height:
+                    image_sizes.append((int(width), int(height)))
             continue
 
-        if vcodec != "none" and height:
+        # A video container with a codec that is not explicitly "none" is video
+        # even when the extractor reports no height — LinkedIn returns three
+        # bare mp4 renditions with no dimensions at all, which used to read as
+        # an audio-only post. Audio-only formats (m4a/mp3/opus) are excluded by
+        # the container check, and true video-less mp4 tracks by vcodec=="none".
+        if vcodec != "none" and (height or fext in VIDEO_EXTS):
             has_video = True
-            heights.add(int(height))
-            for qkey, qmeta in QUALITY_MAP.items():
-                if int(height) <= qmeta["height"]:
-                    prev = size_by_quality.get(qkey, 0)
-                    if filesize and filesize > prev:
-                        size_by_quality[qkey] = int(filesize)
+            if height:
+                heights.add(int(height))
+                for qkey, qmeta in QUALITY_MAP.items():
+                    if int(height) <= qmeta["height"]:
+                        prev = size_by_quality.get(qkey, 0)
+                        if filesize and filesize > prev:
+                            size_by_quality[qkey] = int(filesize)
         if acodec != "none":
             has_audio = True
+
+    # Single-format extractors return no `formats` list at all — just a
+    # top-level url/ext/duration (Snapchat Spotlight, plain direct links).
+    # Without this the thumbnail fallback below claimed they were photo posts,
+    # so the wizard offered 🖼 Image for a video.
+    if not formats and not has_video and not has_audio:
+        top_url = str(info.get("url") or "")
+        top_ext = ext or top_url.lower().split("?")[0].rsplit(".", 1)[-1]
+        if info.get("vcodec") != "none" and (
+            top_ext in VIDEO_EXTS
+            or (info.get("duration") and top_ext not in IMAGE_EXTS)
+        ):
+            has_video = True
+            has_audio = True
+            if info.get("height"):
+                heights.add(int(info["height"]))
 
     # Thumbnails as image fallback for photo posts
     thumbs = info.get("thumbnails") or []
@@ -441,21 +591,15 @@ def _parse_formats(info: dict[str, Any]) -> tuple[bool, bool, bool, list[int], l
         if info.get("width") and info.get("height"):
             image_sizes.append((int(info["width"]), int(info["height"])))
 
-    # Media with only video track still "has video"
-    if info.get("duration") and (info.get("vcodec") or formats):
-        if any((f.get("vcodec") or "none") != "none" for f in formats):
+    # Media with only a video track still "has video". Same rule as the loop:
+    # only the literal "none" proves a track is absent.
+    if info.get("duration") and formats:
+        if any(f.get("vcodec") != "none" and f.get("height") for f in formats):
             has_video = True
 
     # Audio-only posts (SoundCloud, music)
-    if not has_video and any((f.get("acodec") or "none") != "none" for f in formats):
+    if not has_video and any(f.get("acodec") != "none" for f in formats):
         has_audio = True
-
-    # Some extractors emit codec == "unknown" for direct links — that is still
-    # real media and must not be misclassified as having no video/audio.
-    if not has_video and any(
-        (f.get("vcodec") or "none") not in ("none", None) for f in formats
-    ):
-        has_video = True
 
     # Fallback: if we have a duration and formats, treat as video/audio
     if formats and not has_video and not has_audio and not has_image:
@@ -505,54 +649,65 @@ def _normalize_info_dict(url: str, info: dict[str, Any]) -> dict[str, Any]:
 
 def _yt_strategies(*, has_cookies: bool) -> list[dict[str, Any]]:
     """
-    Cookieless-first YouTube strategies.
+    YouTube strategy ladder — every step works without cookies.
 
-    yt-dlp's own default client rotation (tv, web, mweb, android, ios) is the
-    most reliable cookieless path — hardcoding clients (e.g. "tv_embedded",
-    removed in yt-dlp >= 2026.x) breaks extraction. Strategy 0 is vanilla
-    yt-dlp with no cookies; narrow fallbacks sit behind it.
+    yt-dlp's own default client rotation carries the full format ladder, but in
+    the SABR era its media URLs 403 unless a PO token is attached. Verified live
+    against yt-dlp 2026.7.4 with no cookies and no provider: `tv` errors ("page
+    needs to be reloaded"); `ios`, `mweb`, `tv_simply`, `web_safari` and
+    `web_embedded` return storyboards only; `android_vr` lists format 18 but
+    403s on the stream. `android` is the one client that actually delivers
+    bytes — capped at progressive 360p, which beats failing outright.
+
+    Order is deliberately quality-first rather than success-first: the default
+    rotation leads so a trusted IP or a reachable PO-token provider still gets
+    the full ladder, and `android` sits directly behind it as the guaranteed
+    floor. The sticky winner promotes whichever one actually worked, so a
+    server that always 403s pays the failed first attempt once per process.
     """
+    # Bare progressive client: no PO token, no cookies, always returns bytes.
+    android = {
+        "use_cookies": False,
+        "extractor_args": {"youtube": {"player_client": ["android"]}},
+        "drop_impersonate": True,
+    }
+    android_vr = {
+        "use_cookies": False,
+        "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
+        "drop_impersonate": True,
+    }
+    # Default rotation, cookieless — public videos, full format ladder
+    ladder: list[dict[str, Any]] = [{"use_cookies": False}]
     if has_cookies:
-        return [
-            # 0) Default rotation, cookieless — public videos work here
-            {"use_cookies": False},
-            # 1) Default rotation + cookies (age-restricted content)
-            {"use_cookies": True},
-            # 2) android_vr: rarely throttled, no PO token required
-            {
-                "use_cookies": False,
-                "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
-                "drop_impersonate": True,
-            },
-            # 3) mweb: last resort when the default rotation is bot-walled
-            {
-                "use_cookies": False,
-                "extractor_args": {"youtube": {"player_client": ["mweb"]}},
-                "drop_impersonate": True,
-            },
-        ]
-    return [
-        # 0) Default rotation, cookieless — public videos work here
-        {"use_cookies": False},
-        # 1) android_vr: rarely throttled, no PO token required
-        {
-            "use_cookies": False,
-            "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
-            "drop_impersonate": True,
-        },
-        # 2) mweb: last resort when the default rotation is bot-walled
-        {
-            "use_cookies": False,
-            "extractor_args": {"youtube": {"player_client": ["mweb"]}},
-            "drop_impersonate": True,
-        },
-    ]
+        # Default rotation + cookies (age-restricted / members-only)
+        ladder.append({"use_cookies": True})
+    return [*ladder, android, android_vr]
 
 
-def _remember_yt_strategy(original_index: int) -> None:
-    global _YT_WINNER_SI
+def _remember_yt_strategy(original_index: int, *, download: bool) -> None:
+    global _YT_WINNER_META, _YT_WINNER_DL
     with _YT_WINNER_LOCK:
-        _YT_WINNER_SI = original_index
+        if download:
+            _YT_WINNER_DL = original_index
+        else:
+            _YT_WINNER_META = original_index
+
+
+def _yt_winner(*, download: bool) -> int:
+    with _YT_WINNER_LOCK:
+        return _YT_WINNER_DL if download else _YT_WINNER_META
+
+
+def _order_yt_strategies(
+    base_strats: list[dict[str, Any]], *, download: bool
+) -> tuple[list[dict[str, Any]], list[int]]:
+    """Put the last known winner first, keeping original indices for recall."""
+    wi = _yt_winner(download=download)
+    if 0 < wi < len(base_strats):
+        ordered = [base_strats[wi], *base_strats[:wi], *base_strats[wi + 1 :]]
+        indices = [wi, *range(0, wi), *range(wi + 1, len(base_strats))]
+        return ordered, indices
+    return list(base_strats), list(range(len(base_strats)))
 
 
 def _meta_cache_get(url: str) -> dict[str, Any] | None:
@@ -617,20 +772,31 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
             return _normalize_info_dict(url, info)
 
         if not is_yt:
-            # Fast single pass; one cookieless retry on login walls
+            # Fast single pass; one plain retry on login walls or a TLS failure
             try:
                 info = _run(base)
                 _meta_cache_put(url, info)
                 return info
             except yt_dlp.utils.DownloadError as e:
                 err = str(e).lower()
-                if cookie and (
+                wall = cookie and (
                     "login" in err
                     or "private" in err
                     or "cookies" in err
                     or "403" in err
                     or "rate" in err
-                ):
+                )
+                # curl_cffi cannot always negotiate TLS with a given host or
+                # network; the stdlib client usually can, so it is worth one
+                # retry without impersonation even when no cookies are involved.
+                transport = base.get("impersonate") is not None and (
+                    "sslerror" in err
+                    or "connection was reset" in err
+                    or "connection reset" in err
+                    or "recv failure" in err
+                    or "failed to perform" in err
+                )
+                if wall or transport:
                     opts = dict(base)
                     opts.pop("cookiefile", None)
                     opts.pop("impersonate", None)
@@ -640,23 +806,17 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 raise
 
         base_strats = _yt_strategies(has_cookies=bool(cookie))
-        with _YT_WINNER_LOCK:
-            wi = _YT_WINNER_SI
-        if 0 < wi < len(base_strats):
-            strats = [base_strats[wi], *base_strats[:wi], *base_strats[wi + 1 :]]
-            # Track original indices so a win on the reordered first slot
-            # still remembers the correct base strategy (mirrors
-            # _extract_with_format_fallback below).
-            orig_indices = [wi, *range(0, wi), *range(wi + 1, len(base_strats))]
-        else:
-            strats = list(base_strats)
-            orig_indices = list(range(len(base_strats)))
+        strats, orig_indices = _order_yt_strategies(base_strats, download=False)
         last_err: Exception | None = None
         for si, strat in enumerate(strats):
             opts = dict(base)
             opts["http_headers"] = dict(base.get("http_headers") or {})
             if strat.get("extractor_args"):
-                opts["extractor_args"] = strat["extractor_args"]
+                # Merge, don't replace — the PO-token provider block lives in
+                # base and is what makes the full format ladder reachable.
+                opts["extractor_args"] = _merge_extractor_args(
+                    base.get("extractor_args"), strat["extractor_args"]
+                )
             if strat.get("use_cookies") is False:
                 opts.pop("cookiefile", None)
             elif strat.get("refresh_cookies"):
@@ -668,7 +828,7 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 opts.pop("impersonate", None)
             try:
                 info = _run(opts)
-                _remember_yt_strategy(orig_indices[si])
+                _remember_yt_strategy(orig_indices[si], download=False)
                 _meta_cache_put(url, info)
                 return info
             except yt_dlp.utils.DownloadError as e:
@@ -745,6 +905,48 @@ def build_media_info(url: str, info: dict[str, Any]) -> MediaInfo:
         webpage_url=info.get("webpage_url") or url,
         raw=info,
     )
+
+
+_INTERNAL_ERROR_MARKERS = (
+    "must be str, bytes or bytearray",
+    "object is not subscriptable",
+    "object has no attribute",
+    "traceback (most recent call last)",
+    "unhashable type",
+    "takes no arguments",
+    "nonetype",
+    "keyerror",
+    "indexerror",
+    "typeerror",
+    "attributeerror",
+)
+
+
+def _looks_like_internal_error(msg: str) -> bool:
+    """A Python-level crash inside an extractor, not a message meant for users."""
+    low = (msg or "").lower()
+    return any(m in low for m in _INTERNAL_ERROR_MARKERS)
+
+
+def _delivered_height(info: dict[str, Any] | None) -> int | None:
+    """Height of what was actually written, not what the user asked for."""
+    if not info:
+        return None
+    candidates: list[Any] = [info.get("height")]
+    for req in info.get("requested_downloads") or []:
+        candidates.append(req.get("height"))
+    # A merge writes separate video/audio entries; the video one carries height.
+    for fmt in info.get("requested_formats") or []:
+        candidates.append(fmt.get("height"))
+    heights = []
+    for c in candidates:
+        try:
+            h = int(c)
+        except (TypeError, ValueError):
+            continue
+        if h > 0:
+            heights.append(h)
+    return max(heights) if heights else None
 
 
 async def _emit_progress(progress_cb: ProgressCallback | None, pct: float, msg: str) -> None:
@@ -917,8 +1119,6 @@ class DownloadManager:
                 _emit(100, "⚙️ Finishing…")
 
         host = urlparse(url).netloc.lower()
-        flags = _platform_flags(host)
-        is_yt = flags["yt"]
         # Disposable jar for every download so concurrent jobs never corrupt cookies
         cookie_path = _cookie_jar_for_job()
         if cookie_path:
@@ -1024,21 +1224,8 @@ class DownloadManager:
                     sub_file = f
                     break
 
-            # Special case: image mode may need thumbnail extraction
-            if mode == "image":
-                img_candidates = [
-                    f for f in files if f.suffix.lower().lstrip(".") in IMAGE_EXTS
-                ]
-                if img_candidates:
-                    primary = img_candidates[0]
-                elif info and info.get("thumbnail"):
-                    # Download thumbnail as image
-                    thumb_path = self._fetch_url_file(
-                        info["thumbnail"], work_dir / f"{safe_filename(title_hint)}.jpg"
-                    )
-                    if thumb_path:
-                        primary = thumb_path
-                        files = [thumb_path]
+            # NOTE: mode == "image" never reaches here — it returns early via
+            # _download_image_page() above.
 
             size = primary.stat().st_size if primary.exists() else 0
             ext = primary.suffix.lower().lstrip(".")
@@ -1054,6 +1241,7 @@ class DownloadManager:
                 is_audio=ext in {"mp3", "m4a", "opus", "ogg", "flac", "wav", "aac"},
                 is_video=ext in {"mp4", "mkv", "webm", "mov", "avi", "m4v", "3gp"},
                 subtitle_file=sub_file,
+                actual_height=_delivered_height(info),
             )
         except yt_dlp.utils.DownloadError as e:
             msg = str(e).split("\n")[-1][:300]
@@ -1102,26 +1290,25 @@ class DownloadManager:
 
         if is_yt:
             base_strats = _yt_strategies(has_cookies=bool(initial_cookie))
-            with _YT_WINNER_LOCK:
-                wi = _YT_WINNER_SI
-            if 0 < wi < len(base_strats):
-                strategies = [base_strats[wi], *base_strats[:wi], *base_strats[wi + 1 :]]
-                orig_indices = [wi, *range(0, wi), *range(wi + 1, len(base_strats))]
-            else:
-                strategies = list(base_strats)
-                orig_indices = list(range(len(base_strats)))
+            strategies, orig_indices = _order_yt_strategies(base_strats, download=True)
         elif flags["ig"] or flags["fb"] or flags["x"]:
             # Cookieless-first: impersonated pass (public posts work without
             # cookies), then without cookies, then without impersonation.
+            # With no cookies the first two passes are byte-identical, so the
+            # cookie pass is only worth scheduling when a jar actually exists.
             strategies = [
-                {"use_cookies": True},
+                *([{"use_cookies": True}] if initial_cookie else []),
                 {"use_cookies": False},
                 {"use_cookies": False, "drop_impersonate": True},
             ]
-            orig_indices = [0, 1, 2]
+            orig_indices = list(range(len(strategies)))
         else:
-            strategies = [{}]
-            orig_indices = [0]
+            # Everything else: one plain pass, then one without Chrome
+            # impersonation. curl_cffi can fail the TLS handshake outright
+            # ("Recv failure: Connection was reset") on networks or hosts it
+            # cannot negotiate with, and the stdlib client usually can.
+            strategies = [{}, {"drop_impersonate": True}]
+            orig_indices = [0, 1]
 
         last_err: Exception | None = None
         for si, strat in enumerate(strategies):
@@ -1133,7 +1320,10 @@ class DownloadManager:
             attempt_base["http_headers"] = dict(opts.get("http_headers") or {})
 
             if strat.get("extractor_args"):
-                attempt_base["extractor_args"] = strat["extractor_args"]
+                # Merge so the PO-token provider block survives a client pin.
+                attempt_base["extractor_args"] = _merge_extractor_args(
+                    opts.get("extractor_args"), strat["extractor_args"]
+                )
             if strat.get("use_cookies") is False:
                 attempt_base.pop("cookiefile", None)
             elif strat.get("refresh_cookies"):
@@ -1159,7 +1349,7 @@ class DownloadManager:
                         prepared = ydl.prepare_filename(info)
                         title = str(info.get("title") or title_hint)[:200]
                         if is_yt:
-                            _remember_yt_strategy(orig_indices[si])
+                            _remember_yt_strategy(orig_indices[si], download=True)
                             if si or fi:
                                 logger.info(
                                     "YT strategy ok si=%s fmt=%s cookies=%s",
@@ -1188,6 +1378,18 @@ class DownloadManager:
                         "http error 403" in err
                         or "unable to download video data" in err
                     )
+                    # Transport-level failures say nothing about the format, so
+                    # a plain retry on the next strategy (which may drop Chrome
+                    # impersonation) is the only thing worth trying.
+                    transport_fail = (
+                        "sslerror" in err
+                        or "connection was reset" in err
+                        or "connection reset" in err
+                        or "recv failure" in err
+                        or "failed to perform" in err
+                        or "connection aborted" in err
+                        or "remote end closed" in err
+                    )
                     # One format fallback for quality/403 before next strategy
                     if (format_issue or stream_fail) and fi == 0 and primary not in (
                         "b/best",
@@ -1201,7 +1403,7 @@ class DownloadManager:
                         )
                         fi += 1
                         continue
-                    if bot_check or format_issue or stream_fail:
+                    if bot_check or format_issue or stream_fail or transport_fail:
                         logger.warning(
                             "Attempt failed (si=%s fi=%s): %s",
                             si,
@@ -1374,19 +1576,20 @@ class DownloadManager:
             or "cookies are no longer valid" in low
         ):
             return (
-                "YouTube blocked this server / cookies expired.\n\n"
-                "Fix (takes ~1 min):\n"
-                "1. Chrome → open youtube.com (logged in)\n"
-                "2. Export cookies with “Get cookies.txt LOCALLY”\n"
-                "3. Save as cookies.txt (do NOT open YouTube again after export)\n"
-                "4. Upload to VPS and restart the bot\n\n"
-                "Note: Google often invalidates cookies when a VPS IP uses them. "
-                "Re-export if it breaks again."
+                "YouTube bot-walled this server on every client it tried.\n\n"
+                "The bot needs no cookies for public videos — it falls back to a "
+                "client that works without them. If even that fails, the server's "
+                "IP is blocked outright.\n\n"
+                "Fixes, easiest first:\n"
+                "1. Run a PO-token provider (bgutil) — see docker-compose.yml\n"
+                "2. Set PROXY to a residential/clean IP\n"
+                "3. Only for private or age-restricted videos: add a cookies.txt"
             )
         if "private" in low or "login required" in low or "sign in" in low:
             return (
-                "This content is private or requires login. "
-                "Add a cookies.txt file for authenticated downloads."
+                "This content is private, age-restricted, or requires login. "
+                "Public posts need no setup; this one needs a cookies.txt on the "
+                "server."
             )
         # Must be before generic "not available" (format errors were mislabeled as region)
         if "format is not available" in low or "requested format" in low:
@@ -1416,9 +1619,20 @@ class DownloadManager:
             return "The platform rate-limited the bot. Wait a minute and try again."
         if "403" in low or "forbidden" in low:
             return (
-                "YouTube blocked the media stream (HTTP 403). "
-                "Refresh cookies.txt (export while logged into YouTube) "
-                "and try again. The bot now retries safer formats automatically."
+                "The platform blocked the media stream (HTTP 403) on every client "
+                "the bot tried. For YouTube this usually means the server needs a "
+                "PO-token provider (bgutil) or a cleaner IP — cookies are not "
+                "required for public videos."
+            )
+        # Anything left is either an extractor message worth showing verbatim or
+        # a raw Python exception from a broken extractor. Leaking the latter
+        # ("the JSON object must be str, bytes or bytearray, not dict" — a real
+        # yt-dlp OK.ru crash) tells a Telegram user nothing and looks broken.
+        if _looks_like_internal_error(msg):
+            return (
+                "This platform's extractor failed on this link — usually the site "
+                "changed and yt-dlp needs an update. Try another link, or update "
+                "yt-dlp on the server."
             )
         return msg or "Download failed for an unknown reason."
 

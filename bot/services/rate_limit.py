@@ -24,14 +24,27 @@ class RateLimiter:
             retry = int(window - (now - q[0])) + 1
             return False, max(retry, 1)
         q.append(now)
+        self._evict_idle(now)
         return True, 0
 
     def remaining(self, user_id: int) -> int:
         now = time.time()
-        q = self._hits[user_id]
+        # Plain .get(): a read must not create an entry for an unknown user,
+        # which would let /settings-style lookups grow the map without bound.
+        q = self._hits.get(user_id)
+        if q is None:
+            return self.max_per_hour
         while q and now - q[0] > 3600:
             q.popleft()
         return max(0, self.max_per_hour - len(q))
+
+    def _evict_idle(self, now: float) -> None:
+        """Drop users whose whole window has aged out (long-running bot)."""
+        if len(self._hits) < 512:
+            return
+        stale = [uid for uid, q in self._hits.items() if not q or now - q[-1] > 3600]
+        for uid in stale:
+            del self._hits[uid]
 
 
 rate_limiter = RateLimiter()

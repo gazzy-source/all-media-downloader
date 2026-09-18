@@ -63,7 +63,8 @@ YouTube · Instagram · TikTok · X/Twitter · Facebook · Pinterest · Reddit �
 
 ### Ops
 - Docker + docker-compose  
-- Optional cookies / proxy  
+- **No cookies required** — public posts download out of the box  
+- Optional PO-token provider / cookies / proxy  
 - Configurable concurrency & rate limits  
 - Periodic temp + session cleanup  
 
@@ -157,7 +158,8 @@ Open your bot in Telegram → `/start` → paste a link.
 | `MAX_FILE_SIZE_MB` | `49` | Soft cap before refusing Telegram upload (~50 MB Bot API) |
 | `RATE_LIMIT_PER_HOUR` | `30` | Per-user downloads / hour |
 | `DOWNLOAD_DIR` / `TEMP_DIR` | `downloads` / `temp` | Storage paths |
-| `COOKIES_FILE` | — | Netscape cookies for login/age walls |
+| `COOKIES_FILE` | — | Optional. Netscape cookies, only for private/age-walled posts |
+| `POT_PROVIDER_URL` | auto-detect | bgutil PO-token provider. Unlocks full-quality YouTube without cookies |
 | `PROXY` | — | `http://` or `socks5://` proxy |
 | `FFMPEG_LOCATION` | auto | Folder containing `ffmpeg` binary |
 | `BOT_NAME` | — | Optional API override (leave empty to keep BotFather) |
@@ -178,6 +180,47 @@ docker compose up --build -d
 ```
 
 FFmpeg is included in the image.
+
+Compose also starts a **bgutil PO-token provider** and points the bot at it via
+`POT_PROVIDER_URL` — that is what gives cookieless YouTube its full quality.
+
+---
+
+## YouTube without cookies
+
+The bot needs **no cookies for public videos**. YouTube is tried in this order,
+and whichever step works is remembered for the rest of the process:
+
+| Step | Client | Needs | Quality |
+|------|--------|-------|---------|
+| 1 | yt-dlp default rotation | a PO token for the top formats | up to 4K |
+| 2 | `android` | nothing | 360p |
+| 3 | `android_vr` | nothing | 360p |
+
+Since YouTube moved to SABR, the highest media URLs from step 1 return **HTTP
+403** unless a PO token is attached. Measured with no cookies and no provider
+(yt-dlp 2026.8.19): 480p and 720p come straight from step 1, while a 1080p
+request 403s and falls back to step 2 at 360p. Step 2 always returns bytes, so a
+download degrades instead of failing — and captions report the resolution
+actually delivered, not the button that was pressed.
+
+The order is quality-first on purpose: leading with `android` would cap every
+download at 360p even where 720p is available. The winning step is remembered,
+so a server that always 403s pays the failed attempt only once per process.
+
+To get 720p/1080p without cookies, run a PO-token provider:
+
+```bash
+docker compose up -d bgutil-provider     # compose wires POT_PROVIDER_URL for you
+# or, outside compose, publish port 4416 and set:
+# POT_PROVIDER_URL=http://127.0.0.1:4416
+```
+
+An unset `POT_PROVIDER_URL` is probed once at startup against
+`http://127.0.0.1:4416`; the startup log states which mode is active.
+
+`cookies.txt` remains optional and is only needed for private, members-only, or
+age-restricted content.
 
 ---
 

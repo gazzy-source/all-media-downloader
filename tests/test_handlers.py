@@ -304,37 +304,50 @@ class TestHandleCallback:
         await hd.handle_callback(fx.update(callback_query=q), fx.ctx)
         assert q.edits and "audio format" in q.edits[0][0].lower()
 
-    async def test_aformat_then_confirm(self, fx):
+    async def test_aformat_starts_download_immediately(self, fx, monkeypatch):
+        """Picking the format is the last decision — no extra confirm tap."""
+        started = []
+        async def spy(query, context, session):
+            started.append(session.audio_format)
+        monkeypatch.setattr(hd, "execute_download", spy)
         s = DownloadSession(session_id="sM", user_id=42, chat_id=1,
                             url="https://x.com/1", title="t", platform="p")
         sessions.put(s)
         q = FakeCallbackQuery(data="aformat:sM:opus")
         await hd.handle_callback(fx.update(callback_query=q), fx.ctx)
         assert s.audio_format == "opus" and s.mode == "audio"
-        assert q.edits and "ready" in q.edits[0][0].lower()
+        assert started == ["opus"], "download must start on the format tap"
 
-    async def test_imgsize_sets_index(self, fx):
+    async def test_imgsize_sets_index(self, fx, monkeypatch):
         s = DownloadSession(session_id="sI", user_id=42, chat_id=1,
                             url="https://x.com/1", title="t", platform="p",
                             available_image_sizes=[(1080, 1920), (720, 1280)])
         sessions.put(s)
+        started = []
+        async def spy(query, context, session):
+            started.append(session.image_index)
+        monkeypatch.setattr(hd, "execute_download", spy)
         q = FakeCallbackQuery(data="imgsize:sI:1")
         await hd.handle_callback(fx.update(callback_query=q), fx.ctx)
         assert s.image_index == 1 and s.mode == "image"
-        assert "720×1280" in q.edits[0][0]
+        assert started == [1], "download must start on the size tap"
 
-    async def test_video_subs_without_subs_skips_lang_picker(self, fx):
+    async def test_video_subs_without_subs_skips_lang_picker(self, fx, monkeypatch):
         s = DownloadSession(session_id="sN", user_id=42, chat_id=1,
                             url="https://x.com/1", title="t", platform="p")
         sessions.put(s)
         q = FakeCallbackQuery(data="mode:sN:video_subs")
         await hd.handle_callback(fx.update(callback_query=q), fx.ctx)
         assert q.edits and "quality" in q.edits[0][0].lower()
+        started = []
+        async def spy(query, context, session):
+            started.append(session.quality)
+        monkeypatch.setattr(hd, "execute_download", spy)
         q2 = FakeCallbackQuery(data="quality:sN:720")
         q2.message = q.message
         await hd.handle_callback(fx.update(callback_query=q2), fx.ctx)
         assert s.subtitle_lang == "en.*", "must auto-set subtitle lang"
-        assert q2.edits and "ready" in q2.edits[0][0].lower()
+        assert started == ["720"], "download must start without a confirm tap"
 
 
 # ---------------------------------------------------------------------------

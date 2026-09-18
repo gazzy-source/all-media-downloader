@@ -236,9 +236,17 @@ the bot has in the channel:
 
 | | What happens | Needs |
 |---|---|---|
-| 1 | The link post itself becomes the video — same message, same position | **Edit messages** |
-| 2 | Media is posted, then the link post is deleted | **Delete messages** |
-| 3 | Media is posted, link is left in place (old behaviour) | Post messages |
+| 1 | The link post itself becomes the media — same message, same position | **Edit messages** |
+| 2 | The bot's own "Downloading…" message becomes the media and the link is deleted | **Delete messages** |
+| 3 | Media is posted as a new message; link left in place (old behaviour) | Post messages |
+
+Either way the channel ends up holding one message — the media — and never a
+leftover link plus a stray status message.
+
+Music and podcast links (`music.youtube.com`, SoundCloud, Bandcamp, Mixcloud,
+Apple Podcasts) are delivered as an **audio** message rather than a video.
+Spotify is not supported: yt-dlp has no Spotify extractor because its tracks are
+DRM-protected, so those links get the normal "no downloadable media" reply.
 
 Give the bot **Edit messages** for the cleanest result. The chosen path is
 logged, so if you see `Channel edit-in-place unavailable …` in the journal, the

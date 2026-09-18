@@ -74,6 +74,21 @@ CHANNEL_REPLACE_LINK: bool = os.getenv("CHANNEL_REPLACE_LINK", "1").strip() not 
     "no",
 )
 
+# Links that are music/podcast by nature: auto-download delivers them as an
+# audio message rather than a video file. music.youtube.com in particular serves
+# the full video stream, so without this a song arrives as an mp4.
+# NOTE: Spotify is absent on purpose — yt-dlp has no Spotify extractor because
+# its tracks are DRM-protected. Those links fall through to the normal
+# "no downloadable media" reply.
+AUDIO_HOST_HINTS: tuple[str, ...] = (
+    "music.youtube.com",
+    "soundcloud.com",
+    "bandcamp.com",
+    "mixcloud.com",
+    "audiomack.com",
+    "podcasts.apple.com",
+)
+
 # Private chat: 0 = mode/quality buttons (default). 1 = auto-download like groups.
 DM_FAST_AUTO: bool = os.getenv("DM_FAST_AUTO", "0").strip() in (
     "1",

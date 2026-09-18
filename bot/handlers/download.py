@@ -21,6 +21,7 @@ from telegram.ext import ContextTypes
 
 from bot.config import (
     ADMIN_IDS,
+    AUDIO_HOST_HINTS,
     AUTO_DOWNLOAD_ALWAYS,
     AUTO_DOWNLOAD_GROUPS,
     AUTO_QUALITY,
@@ -32,7 +33,6 @@ from bot.config import (
 from bot.keyboards.menus import (
     after_download_keyboard,
     audio_format_keyboard,
-    confirm_keyboard,
     image_size_keyboard,
     main_reply_keyboard,
     mode_keyboard,
@@ -200,7 +200,19 @@ async def auto_download_flow(
     else:
         mode = "video"
 
-    kind = "🖼 Image" if mode == "image" else f"🎥 {q_label}"
+    # Channels only: music/podcast links become an audio message. Checked after
+    # the fast path above because music.youtube.com also matches "youtu" and
+    # would otherwise be pulled down as a video stream. Groups and DMs keep
+    # their existing behaviour.
+    if chat.type == "channel" and any(h in low_u for h in AUDIO_HOST_HINTS):
+        mode = "audio"
+
+    if mode == "image":
+        kind = "🖼 Image"
+    elif mode == "audio":
+        kind = "🎵 Audio"
+    else:
+        kind = f"🎥 {q_label}"
     status = await msg.reply_text(
         f"⚡ <b>Downloading</b> · {kind}",
         parse_mode=ParseMode.HTML,
@@ -313,8 +325,12 @@ async def auto_download_flow(
             )
             return
 
+        outcome = ""
         if is_channel and CHANNEL_REPLACE_LINK and getattr(msg, "message_id", None):
-            await _replace_channel_post(context, chat.id, msg.message_id, path, result)
+            outcome = await _replace_channel_post(
+                context, chat.id, msg.message_id, status, path, result
+            )
+            logger.info("Channel post handling: %s", outcome)
         else:
             await _send_media(
                 context, chat.id, path, result, caption, reply_markup=actions
@@ -322,6 +338,9 @@ async def auto_download_flow(
         record_download(
             actor, url, result.title or "", "?", "video", quality, True, file_size=size
         )
+        if outcome == "edited-status":
+            return  # the status message IS the media now — deleting it would
+            # throw the download away
         try:
             await status.delete()
         except TelegramError:
@@ -576,30 +595,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         fmt = parts[2] if len(parts) > 2 else "mp3"
         session.audio_format = fmt
         session.mode = "audio"
-        await query.edit_message_text(
-            _session_header(session)
-            + f"\n\n🎵 Audio · <b>{fmt.upper()}</b>\n\n"
-            f"Ready when you are:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=confirm_keyboard(session),
-        )
+        # Start straight away. The format choice is the last thing the user had
+        # to decide, so a separate confirm screen only cost another tap and
+        # another round-trip before anything began downloading.
+        await execute_download(query, context, session)
         return
 
     if action == "imgsize":
         idx = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
         session.image_index = idx
         session.mode = "image"
-        size_label = "Best available"
-        if session.available_image_sizes and idx < len(session.available_image_sizes):
-            w, h = session.available_image_sizes[idx]
-            size_label = f"{w}×{h}"
-        await query.edit_message_text(
-            _session_header(session)
-            + f"\n\n🖼 Image · <b>{size_label}</b>\n\n"
-            f"Ready when you are:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=confirm_keyboard(session),
-        )
+        await execute_download(query, context, session)
         return
 
     if action == "quality":
@@ -615,38 +621,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     reply_markup=subtitle_lang_keyboard(session),
                 )
             else:
+                # No subtitle list to pick from — nothing left to ask.
                 session.subtitle_lang = "en.*"
-                await query.edit_message_text(
-                    _session_header(session)
-                    + f"\n\n🎞 Quality: <b>{QUALITY_MAP.get(q, {}).get('label', q)}</b>\n"
-                    f"💬 Subtitles: <i>auto (if available)</i>\n\n"
-                    f"Ready when you are:",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=confirm_keyboard(session),
-                )
+                await execute_download(query, context, session)
             return
-        # plain video
-        await query.edit_message_text(
-            _session_header(session)
-            + f"\n\n🎥 Quality: <b>{QUALITY_MAP.get(q, {}).get('label', q)}</b>\n\n"
-            f"Ready when you are:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=confirm_keyboard(session),
-        )
+        # plain video — quality was the last decision, so start downloading
+        await execute_download(query, context, session)
         return
 
     if action == "sublang":
         lang = parts[2] if len(parts) > 2 else "en"
         session.subtitle_lang = lang
-        qlabel = QUALITY_MAP.get(session.quality or "720", {}).get("label", session.quality)
-        await query.edit_message_text(
-            _session_header(session)
-            + f"\n\n🎞 Quality: <b>{qlabel}</b>\n"
-            f"💬 Subtitles: <b>{_esc(lang)}</b>\n\n"
-            f"Ready when you are:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=confirm_keyboard(session),
-        )
+        await execute_download(query, context, session)
         return
 
     if action == "go":
@@ -936,53 +922,83 @@ def _input_media_for(result, fh, filename: str):
     return InputMediaDocument(media=fh, filename=filename)
 
 
+async def _edit_into_media(context, chat_id: int, message_id: int, path: Path, result):
+    """editMessageMedia with one flood-control wait — never a retry storm."""
+    for attempt in (1, 2):
+        try:
+            with path.open("rb") as fh:
+                await context.bot.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    media=_input_media_for(result, fh, path.name),
+                    **_UPLOAD_KW,
+                )
+            return True
+        except RetryAfter as e:
+            # Telegram asked us to slow down. Obey it exactly once, then give
+            # up and let the caller fall back — hammering flood control is the
+            # fastest way to get a bot limited.
+            wait = int(getattr(e, "retry_after", 5)) + 1
+            if attempt == 2 or wait > 60:
+                logger.warning("Flood control on edit (%ss) — falling back", wait)
+                return False
+            logger.info("Flood control on edit, waiting %ss", wait)
+            await _sleep(wait)
+        except TelegramError:
+            return False
+    return False
+
+
 async def _replace_channel_post(
-    context, chat_id: int, source_message_id: int, path: Path, result
+    context, chat_id: int, source_message_id: int, status_message, path: Path, result
 ) -> str:
     """
-    Turn the channel's link post into the media itself, so nobody has to tidy up.
+    Leave the channel holding the media and nothing else.
 
-    Three strategies, best first:
+    Bot API 7.4+ lets editMessageMedia add media to a TEXT message, so a text
+    link post can literally become the video. Which strategy works depends on
+    the rights the bot has, so they are tried best-first:
 
-    1. edit — Bot API 7.4+ lets editMessageMedia add media to a TEXT message, so
-       the link post becomes the video in place: same message id, same position
-       in the channel, nothing left to delete. Needs the bot to be an admin with
-       "Edit messages".
-    2. replace — post the media, then delete the link. Readers see the same end
-       state; needs "Delete messages" instead.
-    3. send — post the media and leave the link alone. Always works, and is what
-       the bot did before; the link just has to be removed by hand.
+    1. ``edited-source``  — the link post itself becomes the media: same message
+       id, same position, nothing left over. Needs "Edit messages".
+    2. ``edited-status``  — the bot's own "Downloading…" message becomes the
+       media (always allowed, it is the bot's own message) and the link post is
+       deleted. Needs "Delete messages".
+    3. ``sent``           — media posted as a new message; the link is removed if
+       possible, otherwise left. Always delivers the file.
 
-    Returns which one succeeded, for logging.
+    Returns the strategy used. ``edited-status`` means the caller must NOT
+    delete the status message — it *is* the media now.
     """
-    try:
-        with path.open("rb") as fh:
-            await context.bot.edit_message_media(
-                chat_id=chat_id,
-                message_id=source_message_id,
-                media=_input_media_for(result, fh, path.name),
-                **_UPLOAD_KW,
-            )
-        return "edited"
-    except TelegramError as e:
-        logger.info(
-            "Channel edit-in-place unavailable (%s) — falling back to "
-            "post+delete. Grant the bot 'Edit messages' to keep the original "
-            "message id.",
-            e,
-        )
+    if await _edit_into_media(context, chat_id, source_message_id, path, result):
+        return "edited-source"
+
+    logger.info(
+        "Channel edit-in-place unavailable — grant the bot 'Edit messages' to "
+        "convert the link post itself. Falling back."
+    )
+
+    status_id = getattr(status_message, "message_id", None)
+    if status_id and await _edit_into_media(context, chat_id, status_id, path, result):
+        await _try_delete(context, chat_id, source_message_id)
+        return "edited-status"
 
     await _send_media(context, chat_id, path, result, caption="", reply_markup=None)
+    await _try_delete(context, chat_id, source_message_id)
+    return "sent"
+
+
+async def _try_delete(context, chat_id: int, message_id: int) -> bool:
     try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=source_message_id)
-        return "replaced"
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
     except TelegramError as e:
         logger.info(
-            "Could not remove the source link post (%s) — grant the bot "
-            "'Delete messages' so the link does not have to be removed by hand.",
+            "Could not remove the link post (%s) — grant the bot 'Delete "
+            "messages' so it does not have to be removed by hand.",
             e,
         )
-        return "sent"
+        return False
 
 
 # Per-request timeouts for large media (seconds) — long write for multi-MB uploads

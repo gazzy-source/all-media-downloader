@@ -884,8 +884,14 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                     opts["cookiefile"] = str(jar)
             if strat.get("drop_impersonate"):
                 opts.pop("impersonate", None)
+            attempt_started = time.monotonic()
             try:
                 info = _run(opts)
+                logger.info(
+                    "  meta strategy %s ok in %.1fs",
+                    orig_indices[si],
+                    time.monotonic() - attempt_started,
+                )
                 _remember_yt_strategy(orig_indices[si], download=False)
                 _meta_cache_put(url, info)
                 return info

@@ -1139,7 +1139,8 @@ class DownloadManager:
         outtmpl = str(work_dir / f"{safe_filename(title_hint)}.%(ext)s")
         job_cookies: list[Path] = []
 
-        last_pct = {"v": -1}
+        last_pct = {"v": -1.0}
+        last_tick = {"t": 0.0}
 
         def _emit(pct: float, msg: str) -> None:
             if not progress_cb:
@@ -1156,13 +1157,26 @@ class DownloadManager:
             if status == "downloading":
                 total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
                 done = d.get("downloaded_bytes") or 0
-                pct = (done / total * 100) if total else 0
-                # Throttle Telegram edits (still update often enough to feel live)
-                if abs(pct - last_pct["v"]) < 8 and pct < 95:
-                    return
-                last_pct["v"] = pct
                 speed = d.get("speed")
                 speed_s = format_size(speed) + "/s" if speed else "—"
+                if not total:
+                    # yt-dlp cannot always report a total (some fragmented
+                    # streams). A percentage would be invented, so report the
+                    # bytes actually fetched, on a timer.
+                    now = time.time()
+                    if now - last_tick["t"] < 3:
+                        return
+                    last_tick["t"] = now
+                    _emit(0, f"⬇ {format_size(done)} · {speed_s}")
+                    return
+                pct = done / total * 100
+                # Throttle Telegram edits (still update often enough to feel
+                # live) — but never swallow the FIRST update. last_pct starts
+                # negative, so a download that begins under 8% used to have
+                # every early tick dropped and the bar stayed on "Resolving…".
+                if last_pct["v"] >= 0 and abs(pct - last_pct["v"]) < 8 and pct < 95:
+                    return
+                last_pct["v"] = pct
                 _emit(pct, f"⬇ {pct:.0f}% · {speed_s}")
             elif status == "finished":
                 _emit(100, "⚙️ Finishing…")
@@ -1232,7 +1246,8 @@ class DownloadManager:
                 )
 
             info, prepared, title = self._extract_with_format_fallback(
-                opts, url, title_hint, job_cookies=job_cookies
+                opts, url, title_hint, job_cookies=job_cookies,
+                on_stage=_emit,
             )
 
             files = sorted(
@@ -1325,6 +1340,7 @@ class DownloadManager:
         url: str,
         title_hint: str,
         job_cookies: list[Path] | None = None,
+        on_stage: Callable[[float, str], None] | None = None,
     ) -> tuple[dict[str, Any], str, str]:
         """
         Fast path first; fallbacks only on bot-check / format / 403 errors.
@@ -1384,6 +1400,19 @@ class DownloadManager:
                 attempt_base["cookiefile"] = initial_cookie
             if strat.get("drop_impersonate"):
                 attempt_base.pop("impersonate", None)
+
+            if on_stage is not None:
+                # yt-dlp only drives progress_hooks once bytes are moving, so
+                # extraction — 5s on a good day, far longer when strategies
+                # retry — showed a frozen "Resolving… 2%". Give each attempt a
+                # visible tick so the job never looks hung.
+                if si == 0:
+                    on_stage(3, "🔎 Resolving media…")
+                else:
+                    on_stage(
+                        min(3 + si, 6),
+                        f"🔎 Trying another source… ({si + 1}/{len(strategies)})",
+                    )
 
             fi = 0
             while fi < len(formats_to_try):

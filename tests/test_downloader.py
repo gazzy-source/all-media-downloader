@@ -929,3 +929,130 @@ class TestCleanExtractorMessage:
     def test_does_not_eat_a_colon_inside_a_real_message(self):
         out = dl._clean_extractor_message("unable to download video data: HTTP Error 403")
         assert "HTTP Error 403" in out
+
+
+class TestProgressNeverLooksFrozen:
+    """
+    Reported from production: a YouTube download sat on "Resolving… 2%".
+    Two causes, both covered here.
+    """
+
+    def _hook(self, emitted, first_pct=-1.0):
+        """Rebuild the progress hook exactly as _download_sync wires it."""
+        import time as _t
+        last_pct = {"v": first_pct}
+        last_tick = {"t": 0.0}
+
+        def _emit(pct, msg):
+            emitted.append((pct, msg))
+
+        def hook(d):
+            status = d.get("status")
+            if status == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                done = d.get("downloaded_bytes") or 0
+                speed = d.get("speed")
+                speed_s = dl.format_size(speed) + "/s" if speed else "—"
+                if not total:
+                    now = _t.time()
+                    if now - last_tick["t"] < 3:
+                        return
+                    last_tick["t"] = now
+                    _emit(0, f"⬇ {dl.format_size(done)} · {speed_s}")
+                    return
+                pct = done / total * 100
+                if last_pct["v"] >= 0 and abs(pct - last_pct["v"]) < 8 and pct < 95:
+                    return
+                last_pct["v"] = pct
+                _emit(pct, f"⬇ {pct:.0f}% · {speed_s}")
+            elif status == "finished":
+                _emit(100, "⚙️ Finishing…")
+
+        return hook
+
+    def test_first_tick_is_never_swallowed(self):
+        """
+        Real values observed from yt-dlp: 1024 bytes of 25998574 = 0.004%.
+        The old gate (abs(0.004 - -1) < 8) dropped it, and every tick under 8%
+        after it, so the bar stayed on "Resolving…".
+        """
+        got = []
+        hook = self._hook(got)
+        hook({"status": "downloading", "total_bytes": 25998574,
+              "downloaded_bytes": 1024, "speed": 10560})
+        assert got, "the first progress tick must reach the user"
+        assert got[0][0] < 1, "and it should report the real (tiny) percentage"
+
+    def test_still_throttles_after_the_first_tick(self):
+        """The fix must not turn into a Telegram edit storm."""
+        got = []
+        hook = self._hook(got)
+        for done in range(1024, 2_000_000, 50_000):
+            hook({"status": "downloading", "total_bytes": 25998574,
+                  "downloaded_bytes": done, "speed": 1e6})
+        assert len(got) <= 2, f"expected heavy throttling, got {len(got)} edits"
+
+    def test_unknown_total_still_reports_bytes(self):
+        """
+        Some fragmented streams report no total. Computing 0% and then
+        throttling on it meant nothing was ever emitted.
+        """
+        got = []
+        hook = self._hook(got)
+        hook({"status": "downloading", "total_bytes": None,
+              "total_bytes_estimate": None, "downloaded_bytes": 5_000_000,
+              "speed": 2e6})
+        assert got, "an unknown total must still produce feedback"
+        assert "MB" in got[0][1], got[0][1]
+        assert "%" not in got[0][1], "must not invent a percentage"
+
+    def test_finished_reports_complete(self):
+        got = []
+        self._hook(got)({"status": "finished"})
+        assert got == [(100, "⚙️ Finishing…")]
+
+
+class TestExtractionEmitsStages:
+    """Extraction runs before any byte moves, so it needs its own feedback."""
+
+    def test_each_strategy_attempt_reports(self, monkeypatch, tmp_path):
+        stages = []
+
+        class FakeYDL:
+            calls = {"n": 0}
+
+            def __init__(self, opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def extract_info(self, url, download=False):
+                FakeYDL.calls["n"] += 1
+                if FakeYDL.calls["n"] < 3:
+                    raise dl.yt_dlp.utils.DownloadError(
+                        "unable to download video data: HTTP Error 403: Forbidden"
+                    )
+                return {"title": "ok", "formats": []}
+
+            def prepare_filename(self, info):
+                return str(tmp_path / "x.mp4")
+
+        monkeypatch.setattr(dl.yt_dlp, "YoutubeDL", FakeYDL)
+        monkeypatch.setattr(dl, "_YT_WINNER_DL", 0)
+        mgr = dl.DownloadManager.__new__(dl.DownloadManager)
+        mgr._extract_with_format_fallback(
+            {"format": "b", "http_headers": {}},
+            "https://www.youtube.com/watch?v=x",
+            "t",
+            on_stage=lambda pct, msg: stages.append((pct, msg)),
+        )
+        assert stages, "extraction must emit at least one stage update"
+        assert any("Resolving" in m for _, m in stages)
+        assert any("another source" in m for _, m in stages), (
+            f"retries must be visible, got {stages}"
+        )
+        assert all(0 < p < 8 for p, _ in stages), "stages stay in the early band"

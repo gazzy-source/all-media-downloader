@@ -34,6 +34,7 @@ from bot.keyboards.menus import (
 )
 from bot.services.downloader import download_manager
 from bot.services.history import record_download
+from bot.services.inflight import add as inflight_add, remove as inflight_remove
 from bot.services.media_detect import detect_mode
 from bot.services.rate_limit import rate_limiter
 from bot.services.session import DownloadSession, sessions
@@ -233,6 +234,7 @@ async def auto_download_flow(
         except TelegramError:
             pass
 
+    inflight_add(chat.id, status.message_id)
     try:
         await context.bot.send_chat_action(chat.id, ChatAction.UPLOAD_DOCUMENT)
         result = await download_manager.download(
@@ -352,6 +354,7 @@ async def auto_download_flow(
         except TelegramError:
             pass
     finally:
+        inflight_remove(chat.id, status.message_id)
         download_manager.cleanup_result_files(result)
 
 
@@ -748,6 +751,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         except TelegramError:
             pass
 
+    inflight_add(chat_id, query.message.message_id)
     try:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
         result = await download_manager.download(
@@ -925,6 +929,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
                 reply_markup=main_reply_keyboard(),
             )
     finally:
+        inflight_remove(chat_id, query.message.message_id)
         download_manager.cleanup_result_files(result)
         sessions.remove(session.session_id)
 

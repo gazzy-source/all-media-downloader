@@ -93,6 +93,35 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Cleanup: %s sessions, %s temp files", removed_sessions, removed_files)
 
 
+async def _rescue_interrupted_jobs(app: Application) -> None:
+    """
+    Tell anyone whose download died with the previous process.
+
+    Jobs are in-memory, so a deploy, crash or reboot kills them mid-flight and
+    nothing ever updates the "Downloading…" message again — it sits frozen on
+    whatever it last showed, which reads as the bot hanging. The registry is on
+    disk, so this also covers a SIGKILL that no shutdown hook would catch.
+    """
+    from bot.services.inflight import drain
+
+    rows = drain()
+    if not rows:
+        return
+    logger.info("Found %s download(s) interrupted by the last restart", len(rows))
+    for row in rows:
+        try:
+            await app.bot.edit_message_text(
+                "⚠️ <b>Interrupted</b>\n\n"
+                "The bot restarted while this was downloading, so the job was "
+                "lost.\n\nSend the link again to retry.",
+                chat_id=row["chat_id"],
+                message_id=row["message_id"],
+                parse_mode="HTML",
+            )
+        except Exception as e:  # message deleted, too old, no rights — never fatal
+            logger.debug("Could not flag interrupted job: %s", e)
+
+
 async def post_init(app: Application) -> None:
     from bot.utils.ffmpeg import find_ffmpeg
 
@@ -126,6 +155,8 @@ async def post_init(app: Application) -> None:
         )
     logger.info("Telegram API: %s", TELEGRAM_API_URL or "https://api.telegram.org (default)")
     logger.info("=" * 50)
+
+    await _rescue_interrupted_jobs(app)
 
     # Command menu only — do NOT overwrite name/description/about from BotFather
     # unless explicitly set in .env (BOT_NAME / BOT_DESCRIPTION / BOT_SHORT_DESCRIPTION).

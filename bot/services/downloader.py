@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import importlib.util
 import logging
 import re
 import shutil
@@ -295,7 +296,11 @@ def _resolved_impersonate():
         return _IMPERSONATE
     _IMPERSONATE_RESOLVED = True
     try:
-        import curl_cffi  # noqa: F401
+        # Presence check only — importing curl_cffi here just to discard it
+        # reads as dead code and trips linters. yt-dlp needs it installed for
+        # impersonation to work at all.
+        if importlib.util.find_spec("curl_cffi") is None:
+            raise ImportError("curl_cffi is not installed")
         from yt_dlp.networking.impersonate import ImpersonateTarget
 
         _IMPERSONATE = ImpersonateTarget.from_str("chrome")

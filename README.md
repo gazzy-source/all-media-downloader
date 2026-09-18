@@ -19,6 +19,8 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22C55E?style=flat-square" alt="MIT" /></a>
   <a href="#-quick-start"><img src="https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square" alt="Python" /></a>
   <a href="https://github.com/yt-dlp/yt-dlp"><img src="https://img.shields.io/badge/engine-yt--dlp-F59E0B?style=flat-square" alt="yt-dlp" /></a>
+  <a href="#testing--quality"><img src="https://img.shields.io/badge/tests-399%20passing-16A34A?style=flat-square" alt="399 tests" /></a>
+  <a href="#testing--quality"><img src="https://img.shields.io/badge/coverage-73%25-16A34A?style=flat-square" alt="73% coverage" /></a>
 </p>
 
 ---
@@ -31,8 +33,8 @@ Most Telegram download bots are thin shells: paste link → dump one format → 
 
 | Differentiator | What it means for users |
 |----------------|-------------------------|
-| **Guided format matrix** | Mode → quality → audio codec / subtitle language → confirm. Only options that make sense for *that* link. |
-| **Honest quality picker** | 480p / 720p / 1080p / Max are derived from real format metadata — not fake buttons. |
+| **Guided format matrix** | Mode → quality → audio codec / subtitle language. Only options that make sense for *that* link, and the last choice starts the download — no dead-end confirm tap. |
+| **Honest quality picker** | 480p / 720p / 1080p / Max are derived from real format metadata — not fake buttons. Captions report the height actually delivered, so a 360p fallback never claims to be 1080p. |
 | **Upload resilience** | 5‑minute media timeouts, automatic retries, document fallback after timeout. |
 | **Windows-first ops** | Auto-discovers FFmpeg from WinGet (`Gyan.FFmpeg`) when it’s not on `PATH`. |
 | **Single-instance lock** | Prevents the classic “bot answers twice” disaster from multiple pollers. |
@@ -79,6 +81,159 @@ You  →  🎥 Video  |  🎞 +Subs  |  🎵 Audio  |  🖼 Image
 You  →  720p / 1080p / Max …
 Bot →  progress ▓▓▓▓▓░░░░  then one clean media message
 ```
+
+---
+
+## Tech stack
+
+| Layer | Choice | Why this one |
+|-------|--------|--------------|
+| Language | **Python 3.11+** | Structural pattern matching, `X \| None` unions, `asyncio.TaskGroup`-era stdlib. CI runs 3.11 / 3.12 / 3.13. |
+| Bot framework | **python-telegram-bot 21.x** (`[job-queue]`) | Mature async API, built-in `JobQueue` for the cleanup loop, per-request timeout control for multi-MB uploads. |
+| Extraction engine | **yt-dlp** | 1000+ extractors, actively maintained. Pinned to a recent floor because site extractors break weekly. |
+| TLS impersonation | **curl_cffi** | Forges a real Chrome JA3/TLS fingerprint, which is what gets past Instagram/Facebook bot walls without cookies. |
+| Anti-bot tokens | **bgutil PO-token provider** | Supplies YouTube PO tokens so cookieless extraction reaches the full format ladder. |
+| Media processing | **FFmpeg** | DASH/HLS muxing, audio extraction, subtitle embedding. Auto-discovered on Windows from WinGet. |
+| Concurrency | `asyncio` + a dedicated `ThreadPoolExecutor` | yt-dlp is blocking; downloads run in their own pool so one job can't starve the event loop. A semaphore caps parallelism. |
+| Persistence | Flat JSON | History/stats are small, local and operator-owned. No database to run or back up on a 1 GB VPS. |
+| Packaging | `pyproject.toml`, Docker, docker-compose | Reproducible local, container and systemd deploys. |
+| CI | **GitHub Actions** | Import smoke test, `compileall`, full suite across a 3-version Python matrix on every push and PR. |
+
+**Tooling:** `pytest` + `pytest-asyncio` + `pytest-cov` · `pyflakes` · `coverage` (branch mode) · `systemd` · `journalctl` · `docker`
+
+---
+
+## Engineering notes
+
+The interesting work in this project was not wiring up a bot API — it was keeping
+extraction working against platforms that actively fight it. A few problems worth
+writing down, each found by measurement rather than assumption:
+
+<details>
+<summary><b>Cookieless YouTube after SABR</b></summary>
+
+YouTube's move to SABR means the default client's media URLs return **HTTP 403**
+unless a PO token is attached, so "it extracts fine" and "it downloads" stopped
+being the same thing. Tested every player client directly: `tv` errors,
+`ios`/`mweb`/`tv_simply`/`web_safari`/`web_embedded` return storyboards only, and
+`android_vr` lists a format but 403s on the stream. `android` was the one client
+that reliably returned bytes.
+
+The ladder is deliberately **quality-first, not success-first**: the full format
+rotation leads so a trusted IP or a reachable token provider still gets 1080p+,
+with `android` directly behind it as a guaranteed 360p floor. A sticky winner
+promotes whichever actually worked, so a server that always 403s pays the failed
+attempt once per process rather than once per download.
+
+Two latent bugs fell out of this: the PO-token `base_url` was passed as a bare
+string where the plugin reads `_configuration_arg(...)[0]`, so it silently
+resolved to `"h"`; and fallback strategies replaced `extractor_args` wholesale,
+dropping the token config exactly when it was needed.
+</details>
+
+<details>
+<summary><b>"Unknown codec" is not "no codec"</b></summary>
+
+yt-dlp uses the *string* `"none"` for "this track is absent" and `None` for
+"unknown". Collapsing them with `f.get("vcodec") or "none"` is an easy mistake
+and it quietly broke four platforms: Twitch clips and Rumble videos were
+classified image-only, LinkedIn posts read as audio-only, and every X/Twitter
+video hid its Audio option — because X's progressive formats report
+`acodec: None`.
+</details>
+
+<details>
+<summary><b>Format selectors that can never match</b></summary>
+
+`b` and `best` only match a format carrying **both** tracks. Reddit serves no
+progressive format at all — every video entry is video-only, every audio entry
+audio-only — so a progressive-first selector matched nothing and *every* Reddit
+download failed. Every selector now ends in an unrestricted `bv*+ba` merge, and
+Reddit leads with it. A parametrised test asserts the property across all
+hosts × qualities rather than spot-checking one string.
+</details>
+
+<details>
+<summary><b>A 10 MB range request that broke fragmented downloads</b></summary>
+
+A global `http_chunk_size` makes yt-dlp fetch via HTTP Range, which fragmented
+HLS/DASH cannot serve — the fragment returns unusable and the job dies with
+"The downloaded file is empty". Bisecting the option set proved it was the sole
+cause of every Reddit and VK failure. It is now scoped to YouTube, where
+chunking is the documented throttling mitigation.
+</details>
+
+<details>
+<summary><b>A self-defeating bot-detection fingerprint</b></summary>
+
+The bot enabled curl_cffi Chrome impersonation *and* forced its own
+`Chrome/131` User-Agent header — so the TLS handshake advertised one browser and
+the header another. Anti-bot systems fingerprint exactly that mismatch.
+Measured over repeated runs against Bilibili: **both = 1/3 success, either alone
+= 3/3**. The forced UA is now dropped whenever impersonation is active.
+</details>
+
+<details>
+<summary><b>Datacenter IP reputation, and what actually fixes it</b></summary>
+
+Several platforms rate the server's IP, not the request. On an Oracle Cloud VPS,
+YouTube refused every client, Reddit demanded account auth and SoundCloud
+reported DRM — while identical code passed all three from a residential IP.
+
+A PO-token provider does **not** fix this: it mints tokens successfully from the
+blocked host and YouTube still refuses, because the block lands on the initial
+player request. Routing egress through **Cloudflare WARP in proxy mode** (free,
+no credentials, and it leaves the host default route untouched) recovered all
+three. `PROXY_HOSTS` limits the proxy to the hosts that need it, so metered
+bandwidth isn't spent on the platforms that already work.
+</details>
+
+<details>
+<summary><b>The error path that crashed</b></summary>
+
+Every unreadable link answered "Something went wrong" instead of the reason.
+`editMessageText` accepts an *inline* keyboard only, and the error branch passed
+the persistent reply keyboard — Telegram returned
+`BadRequest: Inline keyboard expected`, which escaped to the global handler. The
+failure reason was unreachable by construction.
+
+Worse, an existing test *asserted* the bug (`reply_markup is not None`). The fix
+is guarded structurally: an AST scan fails if any `edit_*` call anywhere in
+`bot/` is handed a reply-keyboard factory.
+</details>
+
+---
+
+## Testing & quality
+
+```bash
+pytest                        # 399 passing, branch coverage on bot/
+pytest -m live                # 14 opt-in tests that hit the real network
+RUN_LIVE_TESTS=1 pytest       # enable them
+python -m pyflakes bot/       # lint
+```
+
+| | |
+|---|---|
+| Automated tests | **399** passing, plus **14** opt-in live-network tests |
+| Coverage | **73%** of `bot/`, branch mode |
+| CI | GitHub Actions on Python **3.11 / 3.12 / 3.13**, every push and PR |
+| Source | ~5.0k lines in `bot/`, ~4.0k lines of tests |
+
+Beyond ordinary unit tests, the suite includes a few **structural** ones that
+catch whole classes of mistake rather than single instances:
+
+- **Keyboard contract** — AST-scans `bot/` and fails if any `edit_*` call is
+  passed a reply keyboard, which Telegram rejects at runtime.
+- **Selector invariants** — asserts every format selector, across all hosts and
+  qualities, can reach a merge fallback.
+- **Suite hygiene** — fails on duplicate test class/method names, which silently
+  shadow earlier tests (this caught four assertions that had stopped running).
+- **Environment independence** — proxy and token settings are pinned per-test, so
+  the suite cannot pass locally and fail on a server that configures them.
+
+Fixes are verified against the broken revision before being committed: a test
+that cannot fail on the bug it describes is not worth having.
 
 ---
 
@@ -332,8 +487,10 @@ all-media-downloader-bot/
 │   │   ├── history.py       # Local JSON history & stats
 │   │   └── rate_limit.py    # Anti-spam
 │   └── utils/               # URL helpers, FFmpeg discovery, instance lock
+├── tests/                   # 399 tests incl. structural + opt-in live-network
 ├── docs/                    # Architecture & deployment guides
-├── scripts/                 # Windows setup / run helpers
+├── scripts/                 # Setup / health-endpoint helpers
+├── .github/workflows/       # CI: 3.11/3.12/3.13 matrix
 ├── .env.example
 ├── Dockerfile
 ├── docker-compose.yml

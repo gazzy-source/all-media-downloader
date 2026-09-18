@@ -44,6 +44,9 @@ jobs:
       - name: Syntax compile
         run: python -m compileall -q bot run.py
 
+      - name: Lint (pyflakes)
+        run: python -m pyflakes bot/
+
       - name: Run test suite
         env:
           BOT_TOKEN: ""

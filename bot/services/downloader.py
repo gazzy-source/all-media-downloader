@@ -356,6 +356,13 @@ def _base_opts(
         "nocheckcertificate": True,
         "geo_bypass": True,
         "noplaylist": True,
+        # `noplaylist` only covers a video that happens to sit IN a playlist.
+        # A bare playlist/channel URL still expands, and with extract_flat off
+        # yt-dlp fully extracts EVERY entry — minutes of work for a list of a
+        # few hundred. _normalize_info_dict then throws all but entries[0]
+        # away. Measured: a plain video 5s, a playlist URL >100s. Stopping at
+        # the first entry gets the identical result for the cost of one.
+        "playlistend": 1,
         "ignoreerrors": False,
         "extract_flat": False,
         # Skip extras that only slow extraction/download
@@ -660,7 +667,13 @@ def _normalize_info_dict(url: str, info: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("Playlist is empty or unavailable.")
         first = entries[0]
         first["_playlist_title"] = info.get("title")
-        first["_playlist_count"] = len(entries)
+        # Prefer the count yt-dlp reports for the whole playlist: we only ever
+        # fetch the first entry, so len(entries) is 1 and would under-report.
+        first["_playlist_count"] = (
+            info.get("playlist_count")
+            or info.get("n_entries")
+            or len(entries)
+        )
         first["_is_playlist"] = True
         first["_playlist_url"] = info.get("webpage_url") or url
         return first

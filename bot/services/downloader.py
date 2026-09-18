@@ -937,6 +937,35 @@ _INTERNAL_ERROR_MARKERS = (
 )
 
 
+# yt-dlp appends maintainer-facing boilerplate to many extractor errors. It is
+# addressed to whoever runs yt-dlp, not to a Telegram user, and it dominates the
+# message when shown verbatim — production showed users the full "please report
+# this issue on github ... Confirm you are on the latest version using yt-dlp -U"
+# tail on every Substack, TikTok and Facebook failure.
+_YTDLP_NOISE = re.compile(
+    r"""(?:
+          ;?\s*please\ report\ this\ issue\ on\s+https?://\S+.*
+        | ,?\s*filling\ out\ the\ appropriate\ issue\ template\.?
+        | \s*Confirm\ you\ are\ on\ the\ latest\ version\ using\s+yt-dlp\ -U\.?
+        | \s*See\s+https?://github\.com/yt-dlp/\S+[^.]*\.
+        | \s*Use\ --cookies(?:-from-browser)?[^.]*\.
+    )""",
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
+
+
+def _clean_extractor_message(msg: str) -> str:
+    """Reduce a yt-dlp error to the part a user can actually act on."""
+    text = re.sub(r"^\s*ERROR:\s*", "", msg or "", flags=re.IGNORECASE)
+    text = re.sub(r"^\[[^\]]+\]\s*", "", text)      # leading "[Substack] "
+    # Leading "<video-id>: " — but never an exception class name, or
+    # "KeyError: 'formats'" would become "'formats'" and stop being
+    # recognisable as an internal crash to mask.
+    text = re.sub(r"^(?!\w*(?:Error|Exception)\b)[\w.-]{1,80}:\s+", "", text)
+    text = _YTDLP_NOISE.sub("", text)
+    return " ".join(text.split()).strip(" ;,")
+
+
 def _looks_like_internal_error(msg: str) -> bool:
     """A Python-level crash inside an extractor, not a message meant for users."""
     low = (msg or "").lower()
@@ -1582,6 +1611,7 @@ class DownloadManager:
 
     @staticmethod
     def _friendly_error(msg: str) -> str:
+        msg = _clean_extractor_message(msg)
         low = msg.lower()
         if (
             "sign in to confirm" in low
@@ -1637,8 +1667,29 @@ class DownloadManager:
             return "This media is unavailable or has been removed."
         if "copyright" in low or "blocked" in low:
             return "This media is blocked due to copyright or platform restrictions."
-        if "unsupported url" in low or "no suitable extractor" in low:
-            return "This URL is not supported yet. Try another link from a major platform."
+        # Extractor broken against the live site — nothing the user can change.
+        if (
+            "unexpected response" in low
+            or "cannot parse data" in low
+            or "unable to extract" in low
+        ):
+            return (
+                "This platform's extractor is currently failing — the site "
+                "changed and yt-dlp needs an update on the server. Nothing you "
+                "did wrong; try a different link or try again later."
+            )
+        if (
+            "is not supported" in low  # e.g. Substack: page type "newsletter"
+            or "unsupported url" in low
+            or "no suitable extractor" in low
+            or "no media found" in low
+        ):
+            return (
+                "No downloadable media on this link.\n\n"
+                "It looks like an article, newsletter or plain web page rather "
+                "than a video, audio or image post. Send the direct link to the "
+                "media itself."
+            )
         if "ffmpeg" in low or "ffprobe" in low:
             return "FFmpeg is required for this format. Install FFmpeg and try again."
         if "timed out" in low or "timeout" in low:

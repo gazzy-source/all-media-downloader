@@ -215,7 +215,7 @@ class TestFriendlyError:
             ("Sign in to confirm you're not a bot", "bot-walled"),
             ("HTTP Error 403: Forbidden", "403"),
             ("This video is unavailable", "unavailable"),
-            ("Unsupported URL", "not supported"),
+            ("Unsupported URL", "No downloadable media"),
             ("ffprobe failed", "FFmpeg"),
             ("The download timed out", "timed out"),
             ("requested format is not available", "quality/format"),
@@ -840,3 +840,89 @@ class TestBotWallAdviceMatchesSetup:
             monkeypatch.setattr(dl, "pot_provider_available", lambda: available)
             out = dl.DownloadManager._friendly_error(self.MSG)
             assert "public videos need none" in out.lower() or "no cookies" in out.lower()
+
+
+class TestNoMediaLinks:
+    """
+    Newsletters/articles must be refused cleanly. Production showed users the
+    raw yt-dlp error including "please report this issue on github ... Confirm
+    you are on the latest version using yt-dlp -U".
+    """
+
+    SUBSTACK = (
+        'ERROR: [Substack] why-highly-self-aware-people-cant: Page type '
+        '"newsletter" is not supported; please report this issue on  '
+        'https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the '
+        'appropriate issue template. Confirm you are on the latest version '
+        'using  yt-dlp -U'
+    )
+
+    def test_substack_newsletter_gets_a_plain_answer(self):
+        out = dl.DownloadManager._friendly_error(self.SUBSTACK)
+        assert "No downloadable media" in out
+        assert "newsletter" in out.lower()
+
+    @pytest.mark.parametrize("noise", [
+        "please report this issue",
+        "yt-dlp -U",
+        "issue template",
+        "github.com/yt-dlp",
+        "ERROR:",
+        "[Substack]",
+    ])
+    def test_maintainer_boilerplate_never_reaches_the_user(self, noise):
+        assert noise not in dl.DownloadManager._friendly_error(self.SUBSTACK)
+
+    @pytest.mark.parametrize("raw", [
+        "ERROR: Unsupported URL: https://example.com/a-blog-post",
+        "ERROR: [generic] page: No media found",
+        'Page type "newsletter" is not supported',
+    ])
+    def test_all_no_media_shapes_map_to_the_same_answer(self, raw):
+        assert "No downloadable media" in dl.DownloadManager._friendly_error(raw)
+
+    def test_no_media_page_does_not_trigger_the_image_salvage_retry(self):
+        """
+        A video request that fails is retried as an image for photo posts. An
+        article must NOT go down that path, or the bot would hand back the
+        page's header image instead of refusing.
+        """
+        msg = dl.DownloadManager._friendly_error(self.SUBSTACK)
+        assert not dl.DownloadManager._looks_like_image_only_error(msg)
+
+    def test_broken_extractor_is_explained_not_dumped(self):
+        raw = (
+            "ERROR: [TikTok] 7106594312292453675: Unexpected response from "
+            "webpage request; please report this issue on "
+            "https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the "
+            "appropriate issue template."
+        )
+        out = dl.DownloadManager._friendly_error(raw)
+        assert "extractor is currently failing" in out
+        assert "please report this issue" not in out
+
+    def test_genuine_media_errors_are_not_swallowed(self):
+        for raw, expect in [
+            ("ERROR: [youtube] abc: This video is unavailable", "unavailable"),
+            ("ERROR: [ig] x: This content is private", "private"),
+            ("ERROR: The download timed out", "timed out"),
+        ]:
+            assert expect in dl.DownloadManager._friendly_error(raw).lower()
+
+
+class TestCleanExtractorMessage:
+    def test_strips_prefix_and_noise_but_keeps_substance(self):
+        out = dl._clean_extractor_message(
+            "ERROR: [Foo] vid123: Something real happened; please report this "
+            "issue on https://github.com/yt-dlp/yt-dlp/issues?q= , filling out "
+            "the appropriate issue template."
+        )
+        assert out == "Something real happened"
+
+    def test_handles_empty_and_plain_text(self):
+        assert dl._clean_extractor_message("") == ""
+        assert dl._clean_extractor_message("plain message") == "plain message"
+
+    def test_does_not_eat_a_colon_inside_a_real_message(self):
+        out = dl._clean_extractor_message("unable to download video data: HTTP Error 403")
+        assert "HTTP Error 403" in out

@@ -48,3 +48,6 @@ Desktop.ini
 
 # Optional local overrides
 docker-compose.override.yml
+
+# Claude Code personal settings (not shared)
+.claude/settings.local.json

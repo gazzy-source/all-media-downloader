@@ -105,7 +105,13 @@ async def post_init(app: Application) -> None:
     pot = pot_provider_available()
     logger.info("Cookies: %s (optional — public posts need none)", ck if ck else "none")
     if pot:
-        logger.info("YouTube: PO-token provider reachable — full quality available")
+        # Reachable != YouTube will serve us: the provider can mint tokens while
+        # YouTube still bot-walls the host's IP (seen on a datacenter VPS, where
+        # every player client is refused even with a valid token).
+        logger.info(
+            "YouTube: PO-token provider reachable — top formats unlocked unless "
+            "this server's IP is itself bot-walled"
+        )
     else:
         logger.info(
             "YouTube: no PO-token provider — public videos still download "

@@ -7,14 +7,7 @@ import logging
 import time
 from pathlib import Path
 
-from telegram import (
-    InputFile,
-    InputMediaAudio,
-    InputMediaDocument,
-    InputMediaPhoto,
-    InputMediaVideo,
-    Update,
-)
+from telegram import InputFile, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import ContextTypes
@@ -325,10 +318,9 @@ async def auto_download_flow(
             )
             return
 
-        outcome = ""
         if is_channel and CHANNEL_REPLACE_LINK and getattr(msg, "message_id", None):
             outcome = await _replace_channel_post(
-                context, chat.id, msg.message_id, status, path, result
+                context, chat.id, msg.message_id, path, result
             )
             logger.info("Channel post handling: %s", outcome)
         else:
@@ -338,9 +330,6 @@ async def auto_download_flow(
         record_download(
             actor, url, result.title or "", "?", "video", quality, True, file_size=size
         )
-        if outcome == "edited-status":
-            return  # the status message IS the media now — deleting it would
-            # throw the download away
         try:
             await status.delete()
         except TelegramError:
@@ -909,82 +898,24 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         sessions.remove(session.session_id)
 
 
-def _input_media_for(result, fh, filename: str):
-    """Wrap the downloaded file in the InputMedia type matching its kind."""
-    if result.is_audio:
-        return InputMediaAudio(media=fh, filename=filename)
-    if result.is_image:
-        return InputMediaPhoto(media=fh, filename=filename)
-    if result.is_video:
-        return InputMediaVideo(
-            media=fh, filename=filename, supports_streaming=True
-        )
-    return InputMediaDocument(media=fh, filename=filename)
-
-
-async def _edit_into_media(context, chat_id: int, message_id: int, path: Path, result):
-    """editMessageMedia with one flood-control wait — never a retry storm."""
-    for attempt in (1, 2):
-        try:
-            with path.open("rb") as fh:
-                await context.bot.edit_message_media(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    media=_input_media_for(result, fh, path.name),
-                    **_UPLOAD_KW,
-                )
-            return True
-        except RetryAfter as e:
-            # Telegram asked us to slow down. Obey it exactly once, then give
-            # up and let the caller fall back — hammering flood control is the
-            # fastest way to get a bot limited.
-            wait = int(getattr(e, "retry_after", 5)) + 1
-            if attempt == 2 or wait > 60:
-                logger.warning("Flood control on edit (%ss) — falling back", wait)
-                return False
-            logger.info("Flood control on edit, waiting %ss", wait)
-            await _sleep(wait)
-        except TelegramError:
-            return False
-    return False
-
-
 async def _replace_channel_post(
-    context, chat_id: int, source_message_id: int, status_message, path: Path, result
+    context, chat_id: int, source_message_id: int, path: Path, result
 ) -> str:
     """
-    Leave the channel holding the media and nothing else.
+    Post the media as a new message, then remove the link post.
 
-    Bot API 7.4+ lets editMessageMedia add media to a TEXT message, so a text
-    link post can literally become the video. Which strategy works depends on
-    the rights the bot has, so they are tried best-first:
+    Send first, delete second, deliberately: if the upload fails the link is
+    still sitting in the channel, so a failed download never silently destroys
+    what somebody posted. Deleting first would look marginally tidier for a
+    second and risk losing the link for nothing.
 
-    1. ``edited-source``  — the link post itself becomes the media: same message
-       id, same position, nothing left over. Needs "Edit messages".
-    2. ``edited-status``  — the bot's own "Downloading…" message becomes the
-       media (always allowed, it is the bot's own message) and the link post is
-       deleted. Needs "Delete messages".
-    3. ``sent``           — media posted as a new message; the link is removed if
-       possible, otherwise left. Always delivers the file.
-
-    Returns the strategy used. ``edited-status`` means the caller must NOT
-    delete the status message — it *is* the media now.
+    Returns "replaced" when the link was removed, "sent" when it could not be
+    (the bot needs the "Delete messages" right); the media is delivered either
+    way.
     """
-    if await _edit_into_media(context, chat_id, source_message_id, path, result):
-        return "edited-source"
-
-    logger.info(
-        "Channel edit-in-place unavailable — grant the bot 'Edit messages' to "
-        "convert the link post itself. Falling back."
-    )
-
-    status_id = getattr(status_message, "message_id", None)
-    if status_id and await _edit_into_media(context, chat_id, status_id, path, result):
-        await _try_delete(context, chat_id, source_message_id)
-        return "edited-status"
-
     await _send_media(context, chat_id, path, result, caption="", reply_markup=None)
-    await _try_delete(context, chat_id, source_message_id)
+    if await _try_delete(context, chat_id, source_message_id):
+        return "replaced"
     return "sent"
 
 

@@ -10,7 +10,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from telegram import InputMediaAudio, InputMediaPhoto, InputMediaVideo
 from telegram.error import BadRequest, Forbidden
 
 import bot.handlers.download as hd
@@ -31,17 +30,13 @@ def _result(tmp_path: Path, **kw) -> DownloadResult:
 class Recorder:
     """Bot double that records edit/send/delete and can fail chosen calls."""
 
-    def __init__(self, fail_edit=False, fail_delete=False,
-                 fail_edit_source_only=False):
-        self.fail_edit = fail_edit
+    def __init__(self, fail_delete=False, fail_send=False):
         self.fail_delete = fail_delete
-        self.fail_edit_source_only = fail_edit_source_only
+        self.fail_send = fail_send
         self.edited, self.sent, self.deleted = [], [], []
 
     async def edit_message_media(self, chat_id=None, message_id=None, media=None, **kw):
-        # 77 = the channel's link post, 99 = the bot's own status message
-        if self.fail_edit or (self.fail_edit_source_only and message_id == 77):
-            raise BadRequest("not enough rights to edit a message")
+        # Recorded so a test can assert the link post is never edited.
         self.edited.append((chat_id, message_id, media))
         return True
 
@@ -55,81 +50,82 @@ class Recorder:
         return True
 
     async def send_video(self, chat_id, video=None, **kw):
+        if self.fail_send:
+            raise BadRequest("upload failed")
         self.sent.append(("video", chat_id))
         return True
 
     async def send_document(self, chat_id, document=None, **kw):
+        if self.fail_send:
+            raise BadRequest("upload failed")
         self.sent.append(("document", chat_id))
         return True
 
     async def send_photo(self, chat_id, photo=None, **kw):
+        if self.fail_send:
+            raise BadRequest("upload failed")
         self.sent.append(("photo", chat_id))
         return True
 
     async def send_audio(self, chat_id, audio=None, **kw):
+        if self.fail_send:
+            raise BadRequest("upload failed")
         self.sent.append(("audio", chat_id))
         return True
 
 
-class Status:
-    """Stand-in for the bot's own "Downloading..." message."""
-    message_id = 99
-
-
 class TestReplaceChannelPost:
+    """Contract: post the media as a new message, then delete the link post."""
+
     async def _run(self, tmp_path, bot, result=None):
         class Ctx:
             pass
         ctx = Ctx()
         ctx.bot = bot
         res = result or _result(tmp_path)
-        return await hd._replace_channel_post(
-            ctx, -100123, 77, Status(), res.primary, res
-        )
+        return await hd._replace_channel_post(ctx, -100123, 77, res.primary, res)
 
-    async def test_edits_the_link_post_in_place(self, tmp_path):
-        """Best case: same message id becomes the video, nothing to clean up."""
+    async def test_sends_media_then_deletes_the_link(self, tmp_path):
         bot = Recorder()
         outcome = await self._run(tmp_path, bot)
-        assert outcome == "edited-source"
-        assert bot.edited and bot.edited[0][1] == 77, "must edit the SOURCE message"
-        assert isinstance(bot.edited[0][2], InputMediaVideo)
-        assert not bot.sent, "no second message may be posted"
-        assert not bot.deleted
-
-    async def test_without_edit_rights_reuses_the_downloading_message(self, tmp_path):
-        """
-        The bot can always edit its OWN message, so the "Downloading..." status
-        becomes the media and the link post is deleted — the channel is left
-        holding exactly one message, with no extra post.
-        """
-        bot = Recorder(fail_edit_source_only=True)
-        outcome = await self._run(tmp_path, bot)
-        assert outcome == "edited-status"
-        assert [m for _, m, _ in bot.edited] == [99], "status message becomes the media"
+        assert outcome == "replaced"
+        assert bot.sent, "media must be posted as a new message"
         assert bot.deleted == [(-100123, 77)], "the link post must be removed"
-        assert not bot.sent, "no extra message may be posted"
 
-    async def test_without_any_rights_media_is_still_delivered(self, tmp_path):
-        """Worst case must never lose the download."""
-        bot = Recorder(fail_edit=True, fail_delete=True)
+    async def test_never_edits_the_link_post(self, tmp_path):
+        """Editing the original post is explicitly not wanted."""
+        bot = Recorder()
+        await self._run(tmp_path, bot)
+        assert not bot.edited, "the link post must not be edited"
+
+    async def test_media_is_sent_before_the_link_is_deleted(self, tmp_path):
+        """
+        Order matters: if the upload fails the link must survive, so a failed
+        download never destroys what somebody posted.
+        """
+        bot = Recorder(fail_send=True)
+        with pytest.raises(BadRequest):
+            await self._run(tmp_path, bot)
+        assert not bot.deleted, "link must survive a failed upload"
+
+    async def test_without_delete_rights_media_still_arrives(self, tmp_path):
+        bot = Recorder(fail_delete=True)
         outcome = await self._run(tmp_path, bot)
         assert outcome == "sent"
         assert bot.sent, "media must still be delivered"
 
     @pytest.mark.parametrize(
-        ("kw", "expected"),
+        ("kw", "expected_call"),
         [
-            (dict(is_video=True), InputMediaVideo),
-            (dict(is_video=False, is_audio=True), InputMediaAudio),
-            (dict(is_video=False, is_image=True), InputMediaPhoto),
+            (dict(is_video=True), "video"),
+            (dict(is_video=False, is_audio=True), "audio"),
+            (dict(is_video=False, is_image=True), "photo"),
         ],
     )
-    async def test_media_type_matches_the_download(self, tmp_path, kw, expected):
+    async def test_send_type_matches_the_download(self, tmp_path, kw, expected_call):
         bot = Recorder()
-        res = _result(tmp_path, **kw)
-        await self._run(tmp_path, bot, res)
-        assert isinstance(bot.edited[0][2], expected)
+        await self._run(tmp_path, bot, _result(tmp_path, **kw))
+        assert bot.sent[0][0] == expected_call
 
 
 class TestChannelFlowUsesReplacement:
@@ -150,9 +146,9 @@ class TestChannelFlowUsesReplacement:
 
         calls = []
 
-        async def spy(context, chat_id, mid, status, path, result):
+        async def spy(context, chat_id, mid, path, result):
             calls.append(mid)
-            return "edited-source"
+            return "replaced"
 
         monkeypatch.setattr(hd, "_replace_channel_post", spy)
 
@@ -179,7 +175,7 @@ class TestChannelFlowUsesReplacement:
 
         async def spy(*a, **k):
             calls.append(1)
-            return "edited-source"
+            return "replaced"
 
         monkeypatch.setattr(hd, "_replace_channel_post", spy)
         fx.chat.type = "channel"

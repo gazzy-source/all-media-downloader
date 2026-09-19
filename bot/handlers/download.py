@@ -389,6 +389,10 @@ async def start_url_flow(
         "🔍 <b>Analyzing…</b>\n<code>Getting title, formats &amp; options</code>",
         parse_mode=ParseMode.HTML,
     )
+    # Analysis can take tens of seconds on a slow platform. A restart in
+    # that window used to leave this message frozen on Analyzing forever,
+    # since only the download phase was registered for rescue.
+    inflight_add(chat.id, status.message_id)
 
     # extract_info blocks with no callbacks of its own, so without a heartbeat
     # the message sits unchanged for the whole wait and reads as frozen. It is
@@ -463,6 +467,9 @@ async def start_url_flow(
         # Must stop on every path, or the ticker keeps overwriting whatever
         # the wizard (or the error branch) just wrote.
         heartbeat.cancel()
+        # Analysis is over on every path out of this block - success,
+        # timeout or error. The download phase registers itself separately.
+        inflight_remove(chat.id, status.message_id)
 
     if info.is_live:
         await status.edit_text(

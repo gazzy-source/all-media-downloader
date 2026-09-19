@@ -725,6 +725,14 @@ def _session_header(session: DownloadSession) -> str:
 
 
 async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: DownloadSession) -> None:
+    # Guard against a double-tapped button. Handlers run as tasks on one loop,
+    # so this check-and-set is atomic between awaits — the second callback sees
+    # the flag and returns instead of starting a duplicate download.
+    if session.started:
+        logger.info("Ignoring duplicate start for session %s", session.session_id)
+        return
+    session.started = True
+
     mode = session.mode or "video"
     quality = session.quality or "720"
     chat_id = session.chat_id

@@ -231,3 +231,72 @@ class TestNonYtMetaTransportRetry:
         info = dl._extract_info_sync("https://vimeo.com/999")
         assert info["title"] == "ok"
         assert seen == [True, False]
+
+
+class TestDownloadAttemptBudget:
+    """
+    The resolve ladder must stop starting attempts once the budget is spent.
+
+    Unbounded, the ladder multiplies out: socket_timeout 18 x 4 tries = 72s of
+    download plus the same again in extraction, so ~144s per (strategy, format)
+    attempt, x2 formats x4 strategies = ~19 minutes, and the image-only retry
+    doubles that. All of it while holding a concurrency slot and a pool thread.
+    """
+
+    @staticmethod
+    def _run_with_clock(monkeypatch, *, step, url="https://vimeo.com/123"):
+        """Drive the ladder with a clock that jumps `step` seconds per attempt."""
+        seen = []
+        now = [0.0]
+
+        def fake_monotonic():
+            return now[0]
+
+        def boom(self, url, download=False):
+            seen.append(FakeYDL.last_opts.get("format"))
+            now[0] += step
+            # A transport failure: the ladder is designed to walk on past it,
+            # so any truncation the test sees comes from the budget alone.
+            raise dl.yt_dlp.utils.DownloadError(
+                "Unable to download webpage: Failed to perform, curl: (35) "
+                "Recv failure: Connection was reset"
+            )
+
+        monkeypatch.setattr(dl.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(FakeYDL, "extract_info", boom)
+        mgr = dl.DownloadManager.__new__(dl.DownloadManager)
+        base = {
+            "format": "b[height<=1080]/bv*+ba/b",
+            "http_headers": {},
+            "impersonate": object(),
+        }
+        with pytest.raises(Exception):
+            mgr._extract_with_format_fallback(base, url, "t")
+        return seen
+
+    def test_budget_stops_the_ladder(self, fake_ydl, monkeypatch):
+        """One attempt that overruns the budget must not start a second strategy."""
+        from bot.config import DOWNLOAD_ATTEMPT_BUDGET
+
+        slow = self._run_with_clock(monkeypatch, step=DOWNLOAD_ATTEMPT_BUDGET + 1)
+        fast = self._run_with_clock(monkeypatch, step=0.0)
+
+        assert len(slow) < len(fast), (
+            "budget had no effect: the slow run made %s attempts, the same as an "
+            "instant one (%s)" % (len(slow), len(fast))
+        )
+        assert len(slow) == 1, "expected the ladder to stop after the first attempt"
+
+    def test_budget_does_not_truncate_a_healthy_ladder(self, fake_ydl, monkeypatch):
+        """A ladder that runs fast must still try every strategy."""
+        fast = self._run_with_clock(monkeypatch, step=0.0)
+        assert len(fast) >= 2, "the fallback ladder must still exhaust its strategies"
+
+    def test_first_attempt_always_runs(self, fake_ydl, monkeypatch):
+        """Even a clock already past the budget must not skip attempt one."""
+        from bot.config import DOWNLOAD_ATTEMPT_BUDGET
+
+        seen = self._run_with_clock(
+            monkeypatch, step=DOWNLOAD_ATTEMPT_BUDGET * 10
+        )
+        assert len(seen) == 1, "the budget must never prevent the first attempt"

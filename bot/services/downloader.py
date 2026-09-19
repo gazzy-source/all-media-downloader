@@ -20,6 +20,7 @@ import yt_dlp
 from bot.config import (
     BASE_DIR,
     COOKIES_FILE,
+    DOWNLOAD_ATTEMPT_BUDGET,
     EXTRACT_TIMEOUT,
     FORMAT_FALLBACK,
     MAX_CONCURRENT_DOWNLOADS,
@@ -154,6 +155,14 @@ _IMPERSONATE_RESOLVED = False
 # win must never pin the download path to a strategy that cannot fetch bytes.
 _YT_WINNER_META: int = 0
 _YT_WINNER_DL: int = 0
+# When each pin was set. The pin is an optimisation, not a conclusion: once the
+# `android` fallback wins (it always returns bytes, capped at 360p) nothing
+# ever re-probes the full ladder, so one transient 403 could hold the whole
+# process at 360p until the next restart. Let the pin expire so quality
+# recovers on its own.
+_YT_WINNER_META_AT: float = 0.0
+_YT_WINNER_DL_AT: float = 0.0
+_YT_WINNER_TTL = 600.0
 _YT_WINNER_LOCK = threading.Lock()
 
 # PO-token provider reachability (resolved once per process)
@@ -347,6 +356,10 @@ def _base_opts(
         "noprogress": True,
         "socket_timeout": 18,
         "retries": 3,
+        # yt-dlp retries the extraction itself 3 times by default, which
+        # multiplies on top of the strategy ladder that already provides
+        # retry diversity. One pass is enough.
+        "extractor_retries": 1,
         "fragment_retries": 6,
         "file_access_retries": 2,
         "concurrent_fragment_downloads": 4,
@@ -723,16 +736,29 @@ def _yt_strategies(*, has_cookies: bool) -> list[dict[str, Any]]:
 
 def _remember_yt_strategy(original_index: int, *, download: bool) -> None:
     global _YT_WINNER_META, _YT_WINNER_DL
+    global _YT_WINNER_META_AT, _YT_WINNER_DL_AT
+    now = time.monotonic()
     with _YT_WINNER_LOCK:
         if download:
             _YT_WINNER_DL = original_index
+            _YT_WINNER_DL_AT = now
         else:
             _YT_WINNER_META = original_index
+            _YT_WINNER_META_AT = now
 
 
 def _yt_winner(*, download: bool) -> int:
+    """The remembered strategy, or 0 once the pin has gone stale."""
     with _YT_WINNER_LOCK:
-        return _YT_WINNER_DL if download else _YT_WINNER_META
+        idx = _YT_WINNER_DL if download else _YT_WINNER_META
+        at = _YT_WINNER_DL_AT if download else _YT_WINNER_META_AT
+    if not idx:
+        return 0
+    if time.monotonic() - at > _YT_WINNER_TTL:
+        # Expired: fall back to the quality-first order so the full ladder gets
+        # another chance. Costs one failed attempt at most, and only every TTL.
+        return 0
+    return idx
 
 
 def _order_yt_strategies(
@@ -1148,6 +1174,7 @@ class DownloadManager:
                 f"Starting… ({self.active}/{self.max_concurrent} parallel)",
             )
             loop = asyncio.get_running_loop()
+            started = time.monotonic()
             result = await loop.run_in_executor(
                 self._executor,
                 lambda: self._download_sync(
@@ -1162,9 +1189,14 @@ class DownloadManager:
                 ),
             )
             # Auto: video request on image-only posts (Pinterest pins, etc.)
+            # The retry is a second full pass with its own attempt budget, so
+            # gate it on the first pass having been quick. An image-only post
+            # fails fast ("no video formats"); a pass that burned the whole
+            # budget was some other failure and retrying only doubles the wait.
             if (
                 not result.success
                 and mode == "video"
+                and time.monotonic() - started < DOWNLOAD_ATTEMPT_BUDGET
                 and self._looks_like_image_only_error(result.error or "")
             ):
                 logger.info("Retrying as image download for %s", url)
@@ -1478,7 +1510,15 @@ class DownloadManager:
             orig_indices = [0, 1]
 
         last_err: Exception | None = None
+        # No NEW attempt starts past this; an in-flight transfer still finishes.
+        attempt_deadline = time.monotonic() + DOWNLOAD_ATTEMPT_BUDGET
         for si, strat in enumerate(strategies):
+            if si and time.monotonic() > attempt_deadline:
+                logger.warning(
+                    "Download attempt budget (%ss) spent after %s strategies: %s",
+                    DOWNLOAD_ATTEMPT_BUDGET, si, url[:80],
+                )
+                break
             # Prefer requested quality; only try b/best if that format fails
             formats_to_try = [primary]
             if primary != FORMAT_FALLBACK and primary != "b/best":
@@ -1518,6 +1558,12 @@ class DownloadManager:
 
             fi = 0
             while fi < len(formats_to_try):
+                if fi and time.monotonic() > attempt_deadline:
+                    logger.warning(
+                        "Download attempt budget (%ss) spent mid-ladder: %s",
+                        DOWNLOAD_ATTEMPT_BUDGET, url[:80],
+                    )
+                    break
                 fmt = formats_to_try[fi]
                 attempt_opts = dict(attempt_base)
                 attempt_opts["format"] = fmt

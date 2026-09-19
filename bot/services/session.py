@@ -49,6 +49,11 @@ class DownloadSession:
     subtitle_lang: str | None = None
     audio_format: str = "mp3"  # mp3 | m4a | opus
     image_index: int = 0  # for carousels
+    # Set the moment a download starts. Telegram happily delivers two
+    # callbacks for an impatient double-tap, and each used to start its
+    # own download of the same media — doubling the work and racing over
+    # the same status message.
+    started: bool = False
 
     # UI message tracking
     prompt_message_id: int | None = None

@@ -105,6 +105,12 @@ EXTRACT_TIMEOUT: int = int(os.getenv("EXTRACT_TIMEOUT", "45"))
 # large transfer.
 METADATA_SOCKET_TIMEOUT: int = int(os.getenv("METADATA_SOCKET_TIMEOUT", "8"))
 METADATA_RETRIES: int = int(os.getenv("METADATA_RETRIES", "1"))
+# Ceiling on the download RESOLVE loop: no NEW (strategy, format) attempt
+# starts past this. A transfer already in flight is allowed to finish, so
+# this bounds thrashing rather than cutting off a legitimately large file.
+# Without it the ladder multiplies out to ~19 minutes (38 with the
+# image-only retry) while holding a concurrency slot and a pool thread.
+DOWNLOAD_ATTEMPT_BUDGET: int = int(os.getenv("DOWNLOAD_ATTEMPT_BUDGET", "420"))
 
 # Metadata extract cache TTL (seconds) — speeds repeated DM analyzes
 META_CACHE_TTL: int = int(os.getenv("META_CACHE_TTL", "180"))

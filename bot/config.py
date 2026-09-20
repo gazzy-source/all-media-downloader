@@ -112,6 +112,29 @@ METADATA_RETRIES: int = int(os.getenv("METADATA_RETRIES", "1"))
 # image-only retry) while holding a concurrency slot and a pool thread.
 DOWNLOAD_ATTEMPT_BUDGET: int = int(os.getenv("DOWNLOAD_ATTEMPT_BUDGET", "420"))
 
+# Warm the YouTube pipeline in the background right after startup.
+#
+# The first YouTube analysis in a fresh process pays costs no later one does:
+# spawning deno, solving and caching YouTube's signature function
+# (~/.cache/yt-dlp/youtube-sigfuncs), the first PO-token mint and the first
+# proxy TLS handshake. Measured in production: 24.3s for the first request
+# after a restart against ~3s once warm. That bill landed on whichever user
+# happened to send the first link. Paying it ourselves at boot, off the
+# request path, keeps it away from every user.
+#
+# It also re-warms after YouTube rotates its player, because that invalidates
+# the cached signature function — the same 24s, otherwise charged to a user.
+WARMUP_ON_START: bool = (os.getenv("WARMUP_ON_START", "1") or "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+# "Me at the zoo": the oldest, most stable public video on YouTube — 19s long
+# and metadata-only here, so warming costs a few small JSON requests.
+WARMUP_URL: str = (
+    os.getenv("WARMUP_URL") or "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+).strip()
+
 # Metadata extract cache TTL (seconds) — speeds repeated DM analyzes
 META_CACHE_TTL: int = int(os.getenv("META_CACHE_TTL", "180"))
 AUTO_QUALITY: str = (os.getenv("AUTO_QUALITY", "1080") or "1080").strip().lower()

@@ -40,6 +40,7 @@ from bot.services.media_detect import detect_mode
 from bot.services.rate_limit import rate_limiter
 from bot.services.session import DownloadSession, sessions
 from bot.utils.helpers import (
+    analysing_percent,
     extract_urls,
     format_size,
     progress_bar,
@@ -406,7 +407,7 @@ async def start_url_flow(
                 try:
                     await status.edit_text(
                         f"🔍 <b>Analyzing…</b>\n"
-                        f"{progress_bar(min(90, elapsed * 8))}\n"
+                        f"{progress_bar(analysing_percent(elapsed))}\n"
                         f"<code>Reading formats · {elapsed}s</code>",
                         parse_mode=ParseMode.HTML,
                     )

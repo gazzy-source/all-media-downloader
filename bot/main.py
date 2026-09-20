@@ -25,6 +25,8 @@ from bot.config import (
     TEMP_DIR,
     TEMP_CLEANUP_HOURS,
     TELEGRAM_API_URL,
+    WARMUP_ON_START,
+    WARMUP_URL,
 )
 from bot.handlers.download import handle_callback, handle_message
 from bot.handlers.start import (
@@ -123,6 +125,40 @@ async def _rescue_interrupted_jobs(app: Application) -> None:
             logger.debug("Could not flag interrupted job: %s", e)
 
 
+async def _warm_youtube_pipeline() -> None:
+    """
+    Pay the first-request costs at boot instead of charging them to a user.
+
+    A fresh process must spawn deno, solve and cache YouTube's signature
+    function, mint its first PO token and open the first proxy connection
+    before it can answer anything. Production measured 24.3s for the first
+    link after a restart versus ~3s once warm, and the user watching that
+    reasonably read it as the bot hanging.
+
+    Strictly best effort: metadata only, never fatal, and it holds nothing the
+    request path needs. A failure here says nothing about the bot's health —
+    the link may simply be gone — so it logs at debug and moves on.
+    """
+    if not WARMUP_ON_START:
+        return
+    from bot.services.downloader import download_manager
+
+    started = time.time()
+    try:
+        await asyncio.wait_for(
+            download_manager.extract_info(WARMUP_URL), timeout=120
+        )
+        logger.info("Warmed the YouTube pipeline in %.1fs", time.time() - started)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.debug(
+            "Warmup did not complete after %.1fs (harmless): %s",
+            time.time() - started,
+            e,
+        )
+
+
 async def post_init(app: Application) -> None:
     from bot.utils.ffmpeg import find_ffmpeg
 
@@ -180,6 +216,11 @@ async def post_init(app: Application) -> None:
     logger.info("=" * 50)
 
     await _rescue_interrupted_jobs(app)
+
+    # Background, so polling starts immediately: the whole point is that no
+    # user waits on this. Held on the Application so it is not garbage
+    # collected mid-flight, which asyncio permits for bare tasks.
+    app.bot_data["_warmup_task"] = asyncio.create_task(_warm_youtube_pipeline())
 
     # Command menu only — do NOT overwrite name/description/about from BotFather
     # unless explicitly set in .env (BOT_NAME / BOT_DESCRIPTION / BOT_SHORT_DESCRIPTION).

@@ -213,6 +213,23 @@ def progress_bar(percent: float, width: int = 12) -> str:
     return f"[{bar}] {pct:.0f}%"
 
 
+def analysing_percent(elapsed: float, half_life: float = 8.0) -> float:
+    """
+    A progress figure for a wait whose true length is unknown.
+
+    The old curve was `min(90, elapsed * 8)`: it hit 90% at 11 seconds and then
+    sat there. A 24s analysis therefore showed "90%" for 13 straight seconds,
+    which reads as a frozen bot one tick away from finishing — the single most
+    reported complaint about the analysing phase.
+
+    An asymptotic curve never stalls and never over-promises: each half_life
+    closes half the remaining gap to 95%, so the bar keeps visibly moving for
+    as long as the wait lasts and never claims to be nearly done.
+    """
+    e = max(0.0, float(elapsed))
+    return 95.0 * (1.0 - 0.5 ** (e / half_life))
+
+
 def now_ts() -> float:
     return time.time()
 

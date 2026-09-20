@@ -303,6 +303,53 @@ def pot_provider_available() -> bool:
     return bool(_pot_provider_args())
 
 
+def pot_provider_mint_check(timeout: float = 25.0) -> tuple[bool, str]:
+    """
+    Ask the provider to actually mint a token, through the proxy YouTube uses.
+
+    `/ping` only proves the HTTP server is up. The bgutil plugin forwards
+    yt-dlp's proxy to the provider, so a provider that answers /ping can still
+    fail every real mint — which is exactly what a containerised provider does
+    when PROXY points at a host-local SOCKS port it cannot reach from inside
+    its own network namespace. That failure is silent: YouTube just starts
+    answering "Sign in to confirm you're not a bot" and the startup banner
+    still claims the provider is fine.
+
+    Returns (ok, detail). Never raises.
+    """
+    args = _pot_provider_args()
+    if not args:
+        return False, "no provider configured"
+    base = args["youtubepot-bgutilhttp"]["base_url"][0]
+
+    import json
+    import urllib.error
+    import urllib.request
+
+    payload: dict[str, Any] = {"content_binding": "startup-selfcheck"}
+    # Mirror what a real YouTube extraction sends, proxy included.
+    if PROXY and _should_proxy("www.youtube.com"):
+        payload["proxy"] = PROXY
+    req = urllib.request.Request(
+        f"{base}/get_pot",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:200] if e.fp else str(e)
+        return False, f"HTTP {e.code}: {detail}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+    if body.get("poToken"):
+        return True, "minted a token"
+    return False, str(body.get("error") or body)[:300]
+
+
 def _resolved_impersonate():
     global _IMPERSONATE, _IMPERSONATE_RESOLVED
     if _IMPERSONATE_RESOLVED:
@@ -1793,6 +1840,10 @@ class DownloadManager:
 
     @staticmethod
     def _friendly_error(msg: str) -> str:
+        # Keep the pre-clean text: _clean_extractor_message strips the
+        # "[youtube] <id>:" prefix, which is often the only thing naming the
+        # platform. Branches that tailor advice per platform need it.
+        raw_low = (msg or "").lower()
         msg = _clean_extractor_message(msg)
         low = msg.lower()
         if (
@@ -1897,11 +1948,47 @@ class DownloadManager:
         if "rate-limit" in low or "rate limit" in low or "too many requests" in low:
             return "The platform rate-limited the bot. Wait a minute and try again."
         if "403" in low or "forbidden" in low:
+            # The PO-token advice is YouTube-specific. Printing it for a Rumble
+            # or Bilibili 403 sends the reader after a provider that has nothing
+            # to do with the platform that just refused them.
+            if "youtu" in low or "youtu" in raw_low:
+                return (
+                    "The platform blocked the media stream (HTTP 403) on every "
+                    "client the bot tried. For YouTube this usually means the "
+                    "server needs a PO-token provider (bgutil) or a cleaner IP — "
+                    "cookies are not required for public videos."
+                )
             return (
-                "The platform blocked the media stream (HTTP 403) on every client "
-                "the bot tried. For YouTube this usually means the server needs a "
-                "PO-token provider (bgutil) or a cleaner IP — cookies are not "
-                "required for public videos."
+                "The platform blocked this request (HTTP 403). It usually means "
+                "the site refuses this server's IP, or the post is not "
+                "public.\n\n"
+                "Try again later, or send a different link."
+            )
+        # 412 is what Bilibili (and a few others) answer when they refuse the
+        # request outright. Left unmapped it reached the user verbatim as
+        # "Unable to download webpage: HTTP Error 412: Precondition Failed".
+        if "412" in low or "precondition failed" in low:
+            return (
+                "The platform refused this request (HTTP 412) — it is blocking "
+                "this server, or the link needs a region/account the bot does "
+                "not have.\n\nTry a different link."
+            )
+        # Transport-level failures surfaced as raw Python repr, e.g. Tumblr's
+        # "('Connection aborted.', RemoteDisconnected('Remote end closed
+        # connection without response'))". That reads as a crash, not a hiccup.
+        if (
+            "connection aborted" in low
+            or "remotedisconnected" in low
+            or "remote end closed" in low
+            or "connection reset" in low
+            or "connection refused" in low
+            or "recv failure" in low
+            or "sslerror" in low
+        ):
+            return (
+                "The connection to the platform dropped before the bot could "
+                "read the page.\n\nThat is usually a temporary network or "
+                "anti-bot hiccup — please try again."
             )
         # Anything left is either an extractor message worth showing verbatim or
         # a raw Python exception from a broken extractor. Leaking the latter

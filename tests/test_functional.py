@@ -41,6 +41,33 @@ from bot.services.downloader import DownloadResult, download_manager  # noqa: E4
 from bot.utils.ffmpeg import find_ffmpeg  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _real_network_config(monkeypatch, _neutral_network_config, _no_pot_probe):
+    """
+    Undo the hermetic network stubs for this module only.
+
+    conftest pins PROXY/PROXY_HOSTS to None and the PO-token provider to "none"
+    for every test, which is right for unit tests — they must not change
+    behaviour because a proxy or a bgutil server happens to be running.
+
+    It is wrong here. These tests exist to prove the *deployment* works
+    end to end, and the deployment reaches YouTube through a proxy with a
+    PO-token provider attached. Stripped of both, every YouTube test hits
+    YouTube directly from a datacenter IP and fails with "Sign in to confirm
+    you're not a bot" — which says nothing about the bot and masks whether the
+    real path works. Declaring the two conftest fixtures as arguments forces
+    this one to run after them, so it restores rather than races.
+    """
+    import bot.config as cfg
+    import bot.services.downloader as dl
+
+    monkeypatch.setattr(dl, "PROXY", cfg.PROXY)
+    monkeypatch.setattr(dl, "PROXY_HOSTS", cfg.PROXY_HOSTS)
+    # Let the provider probe run for real instead of being pinned to "none".
+    monkeypatch.setattr(dl, "_POT_RESOLVED", False)
+    monkeypatch.setattr(dl, "_POT_ARGS", None)
+
+
 def _ffprobe(path: Path) -> dict:
     """Real ffprobe of a downloaded file — proves it's valid media."""
     ff = find_ffmpeg()

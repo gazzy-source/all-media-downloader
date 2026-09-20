@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 import time
@@ -133,19 +134,41 @@ async def post_init(app: Application) -> None:
     logger.info("Logged in as @%s (id=%s)", me.username, me.id)
     logger.info("Admins: %s", ADMIN_IDS or "(none)")
     logger.info("FFmpeg: %s", ff if ff else "NOT FOUND")
-    from bot.services.downloader import _resolved_cookie, pot_provider_available
+    from bot.services.downloader import (
+        _resolved_cookie,
+        pot_provider_available,
+        pot_provider_mint_check,
+    )
 
     ck = _resolved_cookie()
     pot = pot_provider_available()
     logger.info("Cookies: %s (optional — public posts need none)", ck if ck else "none")
     if pot:
-        # Reachable != YouTube will serve us: the provider can mint tokens while
-        # YouTube still bot-walls the host's IP (seen on a datacenter VPS, where
-        # every player client is refused even with a valid token).
-        logger.info(
-            "YouTube: PO-token provider reachable — top formats unlocked unless "
-            "this server's IP is itself bot-walled"
+        # Reachable != able to mint. A containerised provider answers /ping
+        # from its own namespace but cannot reach a host-local SOCKS proxy, so
+        # every real mint fails while the banner claims all is well. Ask it for
+        # a token the same way an extraction would, proxy included. Off the
+        # event loop: the call is blocking and can sit on a proxy timeout.
+        ok, detail = await asyncio.get_running_loop().run_in_executor(
+            None, pot_provider_mint_check
         )
+        if ok:
+            # Still not a promise of service: YouTube can bot-wall the host's
+            # IP even with a valid token (seen on a datacenter VPS).
+            logger.info(
+                "YouTube: PO-token provider working (%s) — top formats unlocked "
+                "unless this server's IP is itself bot-walled",
+                detail,
+            )
+        else:
+            logger.warning(
+                "YouTube: PO-token provider answers but CANNOT MINT (%s). "
+                "Expect 'Sign in to confirm you're not a bot' on YouTube. If "
+                "PROXY is set, the provider must be able to reach it too — a "
+                "container on a bridge network cannot reach a host-local "
+                "127.0.0.1 proxy; run it with host networking.",
+                detail,
+            )
     else:
         logger.info(
             "YouTube: no PO-token provider — public videos still download "

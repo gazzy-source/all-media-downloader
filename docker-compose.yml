@@ -21,6 +21,16 @@ services:
     image: brainicism/bgutil-ytdlp-pot-provider:latest
     container_name: bgutil-provider
     restart: unless-stopped
+    # NOTE: if you set PROXY in .env to a HOST-LOCAL address (127.0.0.1:...,
+    # e.g. Cloudflare WARP in proxy mode) AND proxy YouTube, this container
+    # cannot reach it — the yt-dlp plugin forwards PROXY here, and 127.0.0.1
+    # inside a bridge network is this container, not the host. /ping keeps
+    # answering 200 while every real mint fails, so YouTube starts answering
+    # "Sign in to confirm you're not a bot" for no visible reason.
+    # In that setup run this service with host networking instead:
+    #   network_mode: host
+    #   command: ["--host", "127.0.0.1"]
+    # A proxy on a real routable address needs none of this.
     # No ports published — only the bot container talks to it (isolated network)
     # To use with host-installed yt-dlp outside compose, uncomment:
     # ports:

@@ -32,6 +32,8 @@ from bot.config import (
     PROXY,
     PROXY_HOSTS,
     QUALITY_MAP,
+    PROXY_BLIP_BACKOFF,
+    PROXY_BLIP_RETRIES,
     SB_GUARD,
     TEMP_DIR,
     YT_LEAN_METADATA,
@@ -1597,6 +1599,9 @@ class DownloadManager:
             orig_indices = [0, 1]
 
         last_err: Exception | None = None
+        # Budget for transient proxy refusals, shared across the whole ladder so
+        # a persistently down relay still fails fast instead of sleeping per step.
+        proxy_retries = 0
         # No NEW attempt starts past this; an in-flight transfer still finishes.
         attempt_deadline = time.monotonic() + DOWNLOAD_ATTEMPT_BUDGET
         for si, strat in enumerate(strategies):
@@ -1714,6 +1719,28 @@ class DownloadManager:
                         or "proxy error" in err
                         or "connection refused" in err
                     )
+                    # A proxy blip is not a reason to move DOWN the ladder.
+                    # Every strategy shares the same proxy, so advancing just
+                    # burns them all in milliseconds against a relay that is
+                    # briefly refusing; WARP recovers in well under a second
+                    # (measured healthy again moments later, 60/60 probes OK).
+                    # Wait once and retry the SAME attempt instead.
+                    proxy_blip = (
+                        "socks5error" in err
+                        or "proxyerror" in err
+                        or "proxy error" in err
+                        or "connection refused" in err
+                    )
+                    if proxy_blip and proxy_retries < PROXY_BLIP_RETRIES:
+                        proxy_retries += 1
+                        logger.warning(
+                            "Proxy refused (si=%s fi=%s), retry %s/%s after %ss",
+                            si, fi, proxy_retries, PROXY_BLIP_RETRIES,
+                            PROXY_BLIP_BACKOFF,
+                        )
+                        time.sleep(PROXY_BLIP_BACKOFF)
+                        continue  # same strategy, same format
+
                     # One format fallback for quality/403 before next strategy
                     if (format_issue or stream_fail) and fi == 0 and primary not in (
                         "b/best",

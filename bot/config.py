@@ -135,6 +135,14 @@ WARMUP_URL: str = (
     os.getenv("WARMUP_URL") or "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 ).strip()
 
+# Transient SOCKS refusals from the egress proxy (Cloudflare WARP). Seen three
+# times in one day in production, each time with WARP healthy again moments
+# later — 60/60 sequential and 30/30 concurrent probes pass, so this is a brief
+# blip rather than load or an outage. Every strategy in the ladder shares the
+# proxy, so advancing through them cannot absorb one; a short wait can.
+PROXY_BLIP_RETRIES: int = int(os.getenv("PROXY_BLIP_RETRIES", "2"))
+PROXY_BLIP_BACKOFF: float = float(os.getenv("PROXY_BLIP_BACKOFF", "1.5"))
+
 # Skip YouTube's HLS manifest and translated-subtitle enumeration during the
 # ANALYSIS pass only (1 = skip, the default; 0 = restore the old behaviour).
 #

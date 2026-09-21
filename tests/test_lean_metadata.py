@@ -120,3 +120,43 @@ class TestLeanMetadataArgs:
         opts = {"extractor_args": merged}
         assert _yt_skips(opts) == {"hls", "translated_subs"}
         assert "dash" not in _yt_skips(opts)
+
+
+class TestProxyBlipBackoff:
+    """
+    A proxy refusal retries the SAME attempt after a short wait.
+
+    Advancing down the ladder cannot help: every strategy shares the one
+    proxy, so they all fail within milliseconds against a relay that is
+    briefly refusing. WARP measured healthy moments later (60/60 sequential,
+    30/30 concurrent), so a short backoff is what absorbs it.
+    """
+
+    def test_budget_is_bounded_so_a_dead_relay_still_fails_fast(self):
+        from bot.config import PROXY_BLIP_BACKOFF, PROXY_BLIP_RETRIES
+
+        assert 0 < PROXY_BLIP_RETRIES <= 3
+        assert 0 < PROXY_BLIP_BACKOFF <= 3
+        # Worst case added latency when the relay is genuinely down.
+        assert PROXY_BLIP_RETRIES * PROXY_BLIP_BACKOFF <= 6
+
+    def test_retry_is_shared_across_the_whole_ladder(self):
+        """
+        The counter must be initialised once per call, not per strategy —
+        otherwise a down relay sleeps the budget again at every rung.
+        """
+        import inspect
+
+        src = inspect.getsource(dl.DownloadManager._extract_with_format_fallback)
+        init_at = src.index("proxy_retries = 0")
+        loop_at = src.index("for si, strat in enumerate(strategies)")
+        assert init_at < loop_at, "proxy_retries must be initialised before the loop"
+
+    def test_proxy_blip_does_not_advance_the_strategy(self):
+        import inspect
+
+        src = inspect.getsource(dl.DownloadManager._extract_with_format_fallback)
+        blk = src[src.index("if proxy_blip and proxy_retries"):]
+        body = blk[: blk.index("# One format fallback")]
+        assert "continue" in body, "must retry the same attempt"
+        assert "break" not in body, "must not fall through to the next strategy"

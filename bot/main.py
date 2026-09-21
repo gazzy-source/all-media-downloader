@@ -25,6 +25,7 @@ from bot.config import (
     TEMP_DIR,
     TEMP_CLEANUP_HOURS,
     TELEGRAM_API_URL,
+    WARMUP_INTERVAL_MIN,
     WARMUP_ON_START,
     WARMUP_URL,
 )
@@ -94,6 +95,11 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("temp cleanup failed")
     if removed_sessions or removed_files:
         logger.info("Cleanup: %s sessions, %s temp files", removed_sessions, removed_files)
+
+
+async def warmup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Keep the YouTube pipeline warm so no user request pays to rebuild it."""
+    await _warm_youtube_pipeline()
 
 
 async def _rescue_interrupted_jobs(app: Application) -> None:
@@ -331,6 +337,14 @@ def build_app() -> Application:
     if app.job_queue:
         # More frequent temp cleanup on small VPS
         app.job_queue.run_repeating(cleanup_job, interval=600, first=30)
+        # Re-warm well inside the PO token's ~6h life. Without this the token
+        # lapses mid-day and the next user waits out a 12s re-mint.
+        if WARMUP_ON_START and WARMUP_INTERVAL_MIN > 0:
+            app.job_queue.run_repeating(
+                warmup_job,
+                interval=WARMUP_INTERVAL_MIN * 60,
+                first=WARMUP_INTERVAL_MIN * 60,
+            )
 
     return app
 

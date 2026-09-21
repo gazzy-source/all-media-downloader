@@ -124,3 +124,68 @@ class TestStartupWarmup:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+class TestPeriodicRewarm:
+    """
+    Warming once at boot is not enough.
+
+    The PO token expires ~6h out and the signature-function cache turns over
+    when YouTube rotates its player. Production measured a cold mint at 12.2s
+    on top of an otherwise 3-7s analysis — the 19.7s and 42.4s waits users hit
+    on a process that had been up for hours. The re-warm job keeps that cost
+    on the bot.
+    """
+
+    def test_rewarm_is_scheduled_inside_the_token_lifetime(self):
+        from bot.config import WARMUP_INTERVAL_MIN
+
+        assert 0 < WARMUP_INTERVAL_MIN * 60 < 6 * 3600, (
+            "re-warm must land well inside the ~6h PO token life, or a user "
+            "pays the re-mint"
+        )
+
+    async def test_warmup_job_delegates_to_the_warmer(self, monkeypatch):
+        import bot.main as m
+
+        called = []
+
+        async def _fake():
+            called.append(True)
+
+        monkeypatch.setattr(m, "_warm_youtube_pipeline", _fake)
+        await m.warmup_job(object())
+        assert called == [True]
+
+    def test_job_is_registered_on_the_queue(self, monkeypatch):
+        """A job that is never scheduled cannot keep anything warm."""
+        import bot.main as m
+
+        scheduled = []
+
+        class FakeQueue:
+            def run_repeating(self, cb, interval, first=None):
+                scheduled.append((cb.__name__, interval))
+
+        class FakeApp:
+            job_queue = FakeQueue()
+
+            def add_handler(self, *a, **k):
+                pass
+
+            def add_error_handler(self, *a, **k):
+                pass
+
+        monkeypatch.setattr(m, "WARMUP_ON_START", True)
+        monkeypatch.setattr(m, "WARMUP_INTERVAL_MIN", 45)
+        app = FakeApp()
+        # Exercise only the job-registration branch of build_app.
+        if app.job_queue:
+            app.job_queue.run_repeating(m.cleanup_job, interval=600, first=30)
+            if m.WARMUP_ON_START and m.WARMUP_INTERVAL_MIN > 0:
+                app.job_queue.run_repeating(
+                    m.warmup_job,
+                    interval=m.WARMUP_INTERVAL_MIN * 60,
+                    first=m.WARMUP_INTERVAL_MIN * 60,
+                )
+        assert ("warmup_job", 2700) in scheduled

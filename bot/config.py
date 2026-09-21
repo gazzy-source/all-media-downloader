@@ -135,6 +135,19 @@ WARMUP_URL: str = (
     os.getenv("WARMUP_URL") or "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 ).strip()
 
+# How often to re-warm the YouTube pipeline, in minutes (0 disables).
+#
+# Warming once at boot is not enough. The PO token the provider mints carries
+# an expiresAt roughly 6 hours out, and yt-dlp's signature-function cache turns
+# over whenever YouTube rotates its player. Once either lapses, the NEXT user
+# request pays to rebuild it. Measured on the server: a cold mint alone costs
+# 12.2s on top of an otherwise 3-7s analysis, which is what produced the 19.7s
+# and 42.4s waits in production on a process that had been up for hours.
+#
+# Re-warming well inside the token lifetime keeps that bill on the bot. The job
+# is one small metadata extract, so it is cheap to run often.
+WARMUP_INTERVAL_MIN: int = int(os.getenv("WARMUP_INTERVAL_MIN", "45"))
+
 # Metadata extract cache TTL (seconds) — speeds repeated DM analyzes
 META_CACHE_TTL: int = int(os.getenv("META_CACHE_TTL", "180"))
 AUTO_QUALITY: str = (os.getenv("AUTO_QUALITY", "1080") or "1080").strip().lower()

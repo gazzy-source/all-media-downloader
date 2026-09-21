@@ -1975,6 +1975,18 @@ class DownloadManager:
                 "2. Set PROXY to a residential/clean IP\n"
                 "3. Only for private or age-restricted videos: add a cookies.txt"
             )
+        # Instagram's own wording leaked to users verbatim, truncated mid
+        # sentence and telling them to pass --cookies-from-browser — a yt-dlp
+        # CLI flag that means nothing in a Telegram chat. Verified against
+        # yt-dlp master and through the proxy: neither helps, because the post
+        # is served only to signed-in viewers.
+        if "empty media response" in low or "empty response" in low:
+            return (
+                "Instagram only serves this post to signed-in viewers, so the "
+                "bot cannot read it.\n\nPublic posts and reels still work. "
+                "For the rest, the server needs Instagram cookies added to its "
+                "cookies.txt."
+            )
         if "private" in low or "login required" in low or "sign in" in low:
             return (
                 "This content is private, age-restricted, or requires login. "
@@ -2024,9 +2036,10 @@ class DownloadManager:
             or "unable to extract" in low
         ):
             return (
-                "This platform's extractor is currently failing — the site "
-                "changed and yt-dlp needs an update on the server. Nothing you "
-                "did wrong; try a different link or try again later."
+                "The bot could not read this link — the platform changed its "
+                "page format and there is no working extractor for it yet.\n\nNothing you did wrong, and updating would not help: this was checked "
+                "against the newest yt-dlp. If the post also has a normal "
+                "video/watch link, try that one."
             )
         if (
             "is not supported" in low  # e.g. Substack: page type "newsletter"

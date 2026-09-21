@@ -899,8 +899,13 @@ class TestNoMediaLinks:
             "appropriate issue template."
         )
         out = dl.DownloadManager._friendly_error(raw)
-        assert "extractor is currently failing" in out
+        # Assert the intent, not the exact phrasing: the user is told the bot
+        # could not read the link and is not shown yt-dlp's maintainer-facing
+        # boilerplate. The wording changed when the old copy was found to
+        # promise falsely that updating yt-dlp would fix it.
+        assert "could not read this link" in out
         assert "please report this issue" not in out
+        assert "github.com" not in out
 
     def test_genuine_media_errors_are_not_swallowed(self):
         for raw, expect in [

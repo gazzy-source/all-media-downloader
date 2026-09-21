@@ -160,3 +160,43 @@ class TestFriendlyErrorGaps:
         """
         out = self._f("[youtube] x: Sign in to confirm you’re not a bot")
         assert "bot-walled" in out
+
+
+class TestMetaPlatformMessages:
+    """
+    Meta platforms are authentication-blocked, not broken.
+
+    Verified on the server: Instagram reels fail identically direct, through
+    the WARP proxy, and on yt-dlp master. So the old advice ("yt-dlp needs an
+    update on the server") was actively wrong, and Instagram's own wording was
+    reaching users verbatim — truncated, and telling them to pass
+    --cookies-from-browser, a CLI flag with no meaning in a Telegram chat.
+    """
+
+    def _f(self, msg):
+        return dl.DownloadManager._friendly_error(msg)
+
+    def test_instagram_login_wall_is_explained_without_cli_flags(self):
+        out = self._f(
+            "ERROR: [Instagram] C0kfPZ0Ry1S: Instagram sent an empty media "
+            "response. Check if this post is accessible in your browser without "
+            "being logged-in. If it is not, then use --cookies-from-browser or "
+            "--cookies for the authentication."
+        )
+        assert "--cookies" not in out, "CLI flags must not reach a chat user"
+        assert "cookies.txt" in out
+        assert "signed-in" in out.lower()
+
+    def test_unparseable_page_does_not_promise_an_update_will_fix_it(self):
+        out = self._f("ERROR: [facebook] 1122176382566360: Cannot parse data")
+        assert "needs an update" not in out.lower()
+        assert "newest" in out.lower() or "updating would not help" in out.lower()
+
+    def test_image_only_instagram_post_still_routes_to_image_mode(self):
+        """A post with no video is a different case and must keep its own advice."""
+        out = self._f("ERROR: [Instagram] CUbHfeGsrRj: No video formats found!")
+        assert "image" in out.lower()
+
+    def test_genuine_bot_wall_is_untouched_by_the_new_branch(self):
+        out = self._f("[youtube] x: Sign in to confirm you're not a bot")
+        assert "bot-walled" in out

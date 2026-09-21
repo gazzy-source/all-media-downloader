@@ -34,6 +34,7 @@ from bot.config import (
     QUALITY_MAP,
     SB_GUARD,
     TEMP_DIR,
+    YT_LEAN_METADATA,
 )
 from bot.utils.ffmpeg import ffmpeg_location_dir
 from bot.utils.helpers import (
@@ -899,6 +900,17 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 "retries": METADATA_RETRIES,
             }
         )
+        if is_yt and YT_LEAN_METADATA:
+            # Analysis only: drop the HLS manifest round trip and the
+            # translated-subtitle enumeration. Both are pure duplication for
+            # the wizard — see YT_LEAN_METADATA in config for the measurements
+            # and the evidence that the offered qualities do not change.
+            # Merged, never assigned: the PO-token provider block lives in the
+            # same dict and is what unlocks the full format ladder.
+            base["extractor_args"] = _merge_extractor_args(
+                base.get("extractor_args"),
+                {"youtube": {"skip": ["hls", "translated_subs"]}},
+            )
 
         def _run(opts: dict[str, Any]) -> dict[str, Any]:
             with yt_dlp.YoutubeDL(opts) as ydl:

@@ -135,6 +135,29 @@ WARMUP_URL: str = (
     os.getenv("WARMUP_URL") or "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 ).strip()
 
+# Skip YouTube's HLS manifest and translated-subtitle enumeration during the
+# ANALYSIS pass only (1 = skip, the default; 0 = restore the old behaviour).
+#
+# The HLS variant manifest is a separate round trip to manifest.googlevideo.com
+# that returns m3u8 duplicates of resolutions already present as https/DASH,
+# and translated_subs enumerates hundreds of caption tracks the wizard never
+# shows. Benchmarked on the server over 4 videos x 4 rounds:
+#
+#   baseline            p50 3.82s   p90 14.22s   max 21.32s
+#   hls+translated_subs p50 2.76s   p90  3.46s   max 14.32s
+#
+# The offered qualities are unchanged — identical height lists on every video
+# tested, audio still present — only the duplicate format entries go (44 -> 27).
+# The p90 is what users feel, and it is the tail this removes.
+#
+# Deliberately NOT applied to the download pass, which may still want an HLS
+# rendition as a fallback when a progressive/DASH URL fails.
+YT_LEAN_METADATA: bool = (os.getenv("YT_LEAN_METADATA", "1") or "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+
 # How often to re-warm the YouTube pipeline, in minutes (0 disables).
 #
 # Warming once at boot is not enough. The PO token the provider mints carries

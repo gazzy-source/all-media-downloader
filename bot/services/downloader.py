@@ -925,12 +925,23 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 # curl_cffi cannot always negotiate TLS with a given host or
                 # network; the stdlib client usually can, so it is worth one
                 # retry without impersonation even when no cookies are involved.
-                transport = base.get("impersonate") is not None and (
-                    "sslerror" in err
-                    or "connection was reset" in err
-                    or "connection reset" in err
-                    or "recv failure" in err
-                    or "failed to perform" in err
+                # A proxy refusal is retryable no matter what client was in
+                # use, so it is checked outside the impersonation condition.
+                proxy_blip = (
+                    "socks5error" in err
+                    or "proxyerror" in err
+                    or "proxy error" in err
+                    or "connection refused" in err
+                )
+                transport = proxy_blip or (
+                    base.get("impersonate") is not None
+                    and (
+                        "sslerror" in err
+                        or "connection was reset" in err
+                        or "connection reset" in err
+                        or "recv failure" in err
+                        or "failed to perform" in err
+                    )
                 )
                 if wall or transport:
                     opts = dict(base)
@@ -1679,6 +1690,17 @@ class DownloadManager:
                         or "failed to perform" in err
                         or "connection aborted" in err
                         or "remote end closed" in err
+                        # A SOCKS proxy that momentarily refuses is the same
+                        # class of problem: it says nothing about the format or
+                        # the platform. Production lost a whole download to a
+                        # single sub-second WARP blip
+                        # (Socks5Error(5, 'Connection refused')) because this
+                        # matched nothing here and the ladder gave up instead
+                        # of retrying.
+                        or "socks5error" in err
+                        or "proxyerror" in err
+                        or "proxy error" in err
+                        or "connection refused" in err
                     )
                     # One format fallback for quality/403 before next strategy
                     if (format_issue or stream_fail) and fi == 0 and primary not in (
@@ -1993,6 +2015,16 @@ class DownloadManager:
         # Transport-level failures surfaced as raw Python repr, e.g. Tumblr's
         # "('Connection aborted.', RemoteDisconnected('Remote end closed
         # connection without response'))". That reads as a crash, not a hiccup.
+        # Distinguish OUR relay failing from the platform failing. The generic
+        # wording below told a user "the connection to the platform dropped"
+        # when in fact the bot's own proxy had refused the connection — which
+        # points the reader at the wrong thing entirely.
+        if "socks5error" in low or "proxyerror" in low or "proxy error" in low:
+            return (
+                "The bot's network relay refused the connection for a moment, "
+                "so this attempt could not reach the platform.\n\nNothing is "
+                "wrong with your link — please try again."
+            )
         if (
             "connection aborted" in low
             or "remotedisconnected" in low

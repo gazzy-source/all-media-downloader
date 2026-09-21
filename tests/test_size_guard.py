@@ -75,3 +75,59 @@ class TestOverLimitIsVisible:
         metas = quality_buttons_meta([720], {"720": MAX_FILE_SIZE_BYTES})
         label = next(m["label"] for m in metas if m["key"] == "720")
         assert "⚠️" not in label, label
+
+
+class TestProxyBlipIsRetryable:
+    """
+    A momentary SOCKS refusal must not end a download.
+
+    Production, 2026-09-21: WARP refused one connection for a sub-second blip —
+    Socks5Error(5, 'Connection refused') — and the whole download failed. The
+    ladder's transport_fail classifier did not recognise a proxy error, so the
+    attempt matched no retryable category and gave up instead of retrying. WARP
+    was healthy again moments later (5/5 probes returned 200).
+    """
+
+    RAW = (
+        "ERROR: [youtube] A-cjmTgWv_0: Unable to download API page: "
+        "('[Errno 5] Connection refused', Socks5Error(5, 'Connection refused')) "
+        "(caused by ProxyError(\"('[Errno 5] Connection refused', "
+        "Socks5Error(5, 'Connection refused'))\"))"
+    )
+
+    def test_proxy_error_is_classified_as_retryable_transport(self):
+        """Mirrors the ladder's own predicate, which is inline in the retry loop."""
+        err = self.RAW.lower()
+        transport_fail = (
+            "sslerror" in err
+            or "connection was reset" in err
+            or "connection reset" in err
+            or "recv failure" in err
+            or "failed to perform" in err
+            or "connection aborted" in err
+            or "remote end closed" in err
+            or "socks5error" in err
+            or "proxyerror" in err
+            or "proxy error" in err
+            or "connection refused" in err
+        )
+        assert transport_fail, "a proxy blip must be retryable, not fatal"
+
+    def test_message_blames_the_relay_not_the_platform(self):
+        from bot.services.downloader import DownloadManager
+
+        out = DownloadManager._friendly_error(self.RAW)
+        assert "relay" in out.lower()
+        assert "Socks5Error" not in out
+        assert "try again" in out.lower()
+
+    def test_a_genuine_platform_drop_still_reads_as_the_platform(self):
+        """The proxy branch must not swallow real platform-side disconnects."""
+        from bot.services.downloader import DownloadManager
+
+        out = DownloadManager._friendly_error(
+            "Unable to download webpage: ('Connection aborted.', "
+            "RemoteDisconnected('Remote end closed connection without response'))"
+        )
+        assert "relay" not in out.lower()
+        assert "try again" in out.lower()

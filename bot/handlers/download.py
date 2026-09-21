@@ -790,6 +790,37 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         except TelegramError:
             pass
 
+    # Refuse a doomed download BEFORE spending it, not after. The analysis pass
+    # already measured every quality, so when the estimate is over Telegram's
+    # limit the outcome is known in advance. Until now the bot downloaded the
+    # whole file first and only then said "60.1 MB exceeds the limit", costing
+    # the user the entire transfer for a guaranteed failure.
+    # Only acts on a confident over-estimate; a missing estimate downloads as
+    # before, and the post-download check still backstops an estimate that was
+    # too optimistic.
+    est = (session.estimated_sizes or {}).get(quality) if mode == "video" else None
+    if est and est > MAX_FILE_SIZE_BYTES:
+        fits = [
+            (q, sz) for q, sz in (session.estimated_sizes or {}).items()
+            if sz and sz <= MAX_FILE_SIZE_BYTES
+        ]
+        best = max(fits, key=lambda qs: qs[1])[0] if fits else None
+        tip = (
+            f"Pick <b>{QUALITY_MAP[best]['label']}</b> — it fits."
+            if best and best in QUALITY_MAP
+            else "Try 🎵 Audio instead."
+        )
+        sessions.remove(session.session_id)
+        await query.edit_message_text(
+            f"⚠️ <b>{QUALITY_MAP.get(quality, {}).get('label', quality)}</b> for this "
+            f"video is about <b>{format_size(est)}</b>, over Telegram's "
+            f"{format_size(MAX_FILE_SIZE_BYTES)} limit for bots.\n\n"
+            f"Nothing was downloaded, so you lost no time. {tip}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=quality_keyboard(session),
+        )
+        return
+
     inflight_add(chat_id, query.message.message_id)
     try:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)

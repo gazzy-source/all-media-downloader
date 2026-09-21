@@ -593,6 +593,11 @@ def _parse_formats(info: dict[str, Any]) -> tuple[bool, bool, bool, list[int], l
     heights: set[int] = set()
     image_sizes: list[tuple[int, int]] = []
     size_by_quality: dict[str, int] = {}
+    # Whether the format that currently owns each tier's estimate is video-only
+    # (DASH). Those get muxed with a separate audio track, so their size is not
+    # the final file's size — see the audio fix-up after the loop.
+    tier_is_video_only: dict[str, bool] = {}
+    best_audio_size = 0
 
     # Direct image entries (Instagram photos, Pinterest pins, etc.)
     ext = (info.get("ext") or "").lower()
@@ -642,8 +647,11 @@ def _parse_formats(info: dict[str, Any]) -> tuple[bool, bool, bool, list[int], l
                         prev = size_by_quality.get(qkey, 0)
                         if filesize and filesize > prev:
                             size_by_quality[qkey] = int(filesize)
+                            tier_is_video_only[qkey] = acodec == "none"
         if acodec != "none":
             has_audio = True
+            if vcodec == "none" and filesize:
+                best_audio_size = max(best_audio_size, int(filesize))
 
     # Single-format extractors return no `formats` list at all — just a
     # top-level url/ext/duration (Snapchat Spotlight, plain direct links).
@@ -696,6 +704,15 @@ def _parse_formats(info: dict[str, Any]) -> tuple[bool, bool, bool, list[int], l
     if formats and not has_video and not has_audio and not has_image:
         has_video = True
         has_audio = True
+
+    # Add the audio track to every tier whose estimate came from a video-only
+    # (DASH) format. Without this the wizard under-reported every quality above
+    # 360p on YouTube: a button labelled "~55 MB" produced a 60.1 MB file that
+    # Telegram then refused, after the user had waited out the whole download.
+    if best_audio_size:
+        for qkey, video_only in tier_is_video_only.items():
+            if video_only and size_by_quality.get(qkey):
+                size_by_quality[qkey] += best_audio_size
 
     unique_heights = sorted(heights)
     # Dedupe image sizes
@@ -2065,7 +2082,12 @@ def quality_buttons_meta(heights: list[int], estimated: dict[str, int] | None = 
         label = QUALITY_MAP[k]["label"]
         size = estimated.get(k)
         if size:
-            label = f"{label} (~{format_size(size)})"
+            # Mark what Telegram will refuse. The size was already shown, but a
+            # bare "1080p (~60.1 MB)" reads as a normal choice, so users picked
+            # it, waited out the whole download and only then learnt it could
+            # not be sent. The marker makes the dead end visible up front.
+            over = size > MAX_FILE_SIZE_BYTES
+            label = f"{label} (~{format_size(size)}{' ⚠️' if over else ''})"
         elif heights:
             max_h = max(heights)
             if k != "max":

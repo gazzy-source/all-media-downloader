@@ -969,6 +969,8 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
         base_strats = _yt_strategies(has_cookies=bool(cookie))
         strats, orig_indices = _order_yt_strategies(base_strats, download=False)
         last_err: Exception | None = None
+        # Shared across the ladder: a dead relay must not sleep at every rung.
+        meta_proxy_retries = 0
         # Self-imposed deadline, slightly inside the caller's asyncio cap.
         # asyncio.wait_for cannot cancel a thread that is already running, so
         # without this an extraction that blew the cap kept its worker busy and
@@ -1022,6 +1024,25 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 ):
                     # Permanent for every player client — fail fast
                     raise
+                # The analysis pass is where the user is actually waiting, and
+                # a proxy refusal here says nothing about the player client —
+                # advancing the ladder just burns every strategy against the
+                # same briefly-refusing relay. Wait once and retry this one.
+                if (
+                    "socks5error" in err
+                    or "proxyerror" in err
+                    or "proxy error" in err
+                    or "connection refused" in err
+                ) and meta_proxy_retries < PROXY_BLIP_RETRIES:
+                    meta_proxy_retries += 1
+                    logger.warning(
+                        "Proxy refused during analysis, retry %s/%s after %ss",
+                        meta_proxy_retries, PROXY_BLIP_RETRIES, PROXY_BLIP_BACKOFF,
+                    )
+                    time.sleep(PROXY_BLIP_BACKOFF)
+                    strats.insert(si + 1, strat)
+                    orig_indices.insert(si + 1, orig_indices[si])
+                    continue
                 # Any other client-specific failure (bot wall, page reload,
                 # throttling, transient 5xx) is worth a retry with the next
                 # strategy — different clients genuinely fail differently.

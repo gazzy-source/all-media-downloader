@@ -160,3 +160,59 @@ class TestProxyBlipBackoff:
         body = blk[: blk.index("# One format fallback")]
         assert "continue" in body, "must retry the same attempt"
         assert "break" not in body, "must not fall through to the next strategy"
+
+
+class TestMetadataProxyBackoff:
+    """
+    The ANALYSIS pass needs the backoff too — it is where the user waits.
+
+    The retest caught this: the download ladder had the retry but the metadata
+    path did not, so a blip during analysis still surfaced as a 12.1s failure.
+    """
+
+    def test_analysis_retries_the_same_strategy_on_a_proxy_blip(self, monkeypatch):
+        calls = {"n": 0}
+        seen_sleep = []
+
+        class Boom(dl.yt_dlp.utils.DownloadError):
+            def __init__(self):
+                super().__init__("Unable to download API page: Socks5Error(5, 'Connection refused')")
+
+        def fake_run(opts):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise Boom()
+            return {"title": "ok", "formats": [], "id": "x"}
+
+        monkeypatch.setattr(dl.time, "sleep", lambda s: seen_sleep.append(s))
+        monkeypatch.setattr(dl, "_cookie_jar_for_job", lambda: None)
+        monkeypatch.setattr(dl, "_normalize_info_dict", lambda u, i: i)
+
+        class FakeYDL:
+            def __init__(self, opts):
+                self.opts = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *e):
+                return False
+
+            def extract_info(self, *a, **k):
+                return fake_run(self.opts)
+
+        monkeypatch.setattr(dl.yt_dlp, "YoutubeDL", FakeYDL)
+        dl._META_CACHE.clear()
+        info = dl._extract_info_sync("https://www.youtube.com/watch?v=abc12345678")
+
+        assert info["title"] == "ok"
+        assert calls["n"] == 2, "must retry once after the blip"
+        assert seen_sleep, "must back off before retrying, not spin"
+
+    def test_backoff_budget_is_shared_not_per_rung(self):
+        import inspect
+
+        src = inspect.getsource(dl._extract_info_sync)
+        init_at = src.index("meta_proxy_retries = 0")
+        loop_at = src.index("for si, strat in enumerate(strats)")
+        assert init_at < loop_at

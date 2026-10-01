@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-import shutil
+import os
 import time
 from pathlib import Path
 
@@ -55,7 +55,39 @@ def _keep_domain(domain: str) -> bool:
         return True
     if raw in (".google.com", ".google.co.in") or raw.startswith(".google.co."):
         return True
-    return any(k in d for k in KEEP_DOMAIN_SUBSTR)
+    # Domain-label match: "x.com" must keep x.com and api.x.com — not
+    # netflix.com / dropbox.com / fox.com (a substring test kept those).
+    for k in KEEP_DOMAIN_SUBSTR:
+        if k.endswith("."):  # "pinterest." also covers pinterest.co.uk etc.
+            if d.startswith(k) or ("." + k) in d:
+                return True
+        elif d == k or d.endswith("." + k):
+            return True
+    return False
+
+
+def _write_private(dest: Path, data: bytes) -> None:
+    """
+    Atomic write, mode 0600 from creation. Writing then chmod-ing left the
+    operator's login cookies readable by other local users for a moment.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(dest, 0o600)
+    except OSError:
+        pass
 
 
 def sanitize_cookie_file(src: Path, dest: Path) -> Path | None:
@@ -86,6 +118,13 @@ def sanitize_cookie_file(src: Path, dest: Path) -> Path | None:
 
     for line in text.splitlines():
         raw = line.strip()
+        # "#HttpOnly_" rows are COOKIES, not comments — and they are the ones
+        # that carry the logins (Instagram sessionid, YouTube LOGIN_INFO /
+        # HSID / SSID / __Secure-*PSID). Skipping them silently stripped every
+        # login while leaving harmless cookies behind.
+        httponly = raw.startswith("#HttpOnly_")
+        if httponly:
+            raw = raw[len("#HttpOnly_"):]
         if not raw or raw.startswith("#"):
             continue
         # Netscape: domain, flag, path, secure, expiry, name, value
@@ -111,14 +150,15 @@ def sanitize_cookie_file(src: Path, dest: Path) -> Path | None:
             continue
         try:
             exp = int(float(expiry_s))
-        except ValueError:
+        except (ValueError, OverflowError):  # "inf"/"nan" crashed startup
             exp = 0
         # Drop long-expired (keep session cookies exp=0)
         if exp > 0 and exp < now - 86400:
             dropped_expired += 1
             continue
         out_lines.append(
-            f"{domain}\t{flag}\t{path}\t{secure}\t{exp}\t{name}\t{value}"
+            f"{'#HttpOnly_' if httponly else ''}{domain}\t{flag}\t{path}\t{secure}"
+            f"\t{exp}\t{name}\t{value}"
         )
         kept += 1
 
@@ -131,12 +171,7 @@ def sanitize_cookie_file(src: Path, dest: Path) -> Path | None:
         )
         return None
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
-    try:
-        dest.chmod(0o600)
-    except OSError:
-        pass
+    _write_private(dest, ("\n".join(out_lines) + "\n").encode("utf-8"))
     logger.info(
         "Cookies sanitized: kept=%s dropped_domain=%s dropped_expired=%s → %s",
         kept,
@@ -171,14 +206,9 @@ def make_runtime_cookie_copy(source: Path, runtime: Path) -> Path | None:
     try:
         if not source.is_file() or source.stat().st_size < 50:
             return None
-        runtime.parent.mkdir(parents=True, exist_ok=True)
-        # copyfile, not copy2: the copy must carry ITS OWN (fresh) mtime, or
-        # the hourly sweep of stale per-job jars sees a live one as old.
-        shutil.copyfile(source, runtime)
-        try:
-            runtime.chmod(0o600)
-        except OSError:
-            pass
+        # Written fresh (own mtime — the hourly sweep of stale per-job jars must
+        # not see a live one as old) and private from the first byte.
+        _write_private(runtime, source.read_bytes())
         return runtime
     except OSError as e:
         logger.warning("Cannot create runtime cookies from %s: %s", source, e)

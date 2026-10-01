@@ -222,8 +222,13 @@ class TestCleanupJob:
 
         empty = config.TEMP_DIR / "dl_empty"
         empty.mkdir(exist_ok=True)
+        old = time.time() - 48 * 3600  # only OLD empty dirs go (a live job's is empty)
+        os.utime(empty, (old, old))
+        fresh_empty = config.TEMP_DIR / "dl_running"
+        fresh_empty.mkdir(exist_ok=True)
 
         await cleanup_job(None)
+        assert fresh_empty.exists(), "a running job's (empty) work dir must survive"
         assert d.exists() and keep.exists()
         assert not empty.exists()
 

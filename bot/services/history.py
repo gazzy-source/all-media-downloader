@@ -12,6 +12,7 @@ from bot.config import DATA_DIR
 
 _HISTORY_FILE = DATA_DIR / "history.json"
 _STATS_FILE = DATA_DIR / "stats.json"
+_MAX_HISTORY_USERS = 5000
 _lock = threading.Lock()
 _MAX_USER_HISTORY = 50
 
@@ -88,9 +89,13 @@ def _record_download_sync(
     with _lock:
         hist = _read_json(_HISTORY_FILE, {})
         key = str(user_id)
-        items = hist.get(key, [])
+        items = hist.pop(key, [])  # re-insert last: dict order = recency
         items.insert(0, entry)
         hist[key] = items[:_MAX_USER_HISTORY]
+        # Bounded: the whole file is rewritten on every download, so keep the
+        # most recently active users only.
+        while len(hist) > _MAX_HISTORY_USERS:
+            hist.pop(next(iter(hist)))
         _write_json(_HISTORY_FILE, hist)
 
         stats = _read_json(
@@ -118,10 +123,14 @@ def _record_download_sync(
         bm = stats.setdefault("by_mode", {})
         bm[mode] = bm.get(mode, 0) + 1
 
-        users = set(stats.get("unique_users", []))
-        users.add(user_id)
-        # store as list for JSON
-        stats["unique_users"] = list(users)[-10_000:]
+        users = stats.get("unique_users", [])
+        if user_id not in users:
+            users.append(user_id)
+            stats["unique_user_total"] = stats.get("unique_user_total", len(users) - 1) + 1
+        # Insertion-ordered, trimmed oldest-first (trimming a set dropped an
+        # arbitrary user — possibly the one just added). The total keeps
+        # counting past the cap.
+        stats["unique_users"] = users[-10_000:]
         _write_json(_STATS_FILE, stats)
 
 
@@ -136,6 +145,6 @@ def get_stats() -> dict[str, Any]:
         stats = _read_json(_STATS_FILE, {})
         users = stats.get("unique_users", [])
         out = dict(stats)
-        out["unique_user_count"] = len(users)
+        out["unique_user_count"] = max(len(users), stats.get("unique_user_total", 0))
         out.pop("unique_users", None)
         return out

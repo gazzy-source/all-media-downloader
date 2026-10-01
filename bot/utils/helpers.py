@@ -15,11 +15,32 @@ URL_RE = re.compile(
 
 # Common short-link / social patterns without scheme
 BARE_URL_RE = re.compile(
-    r"(?:(?:youtube\.com|youtu\.be|instagram\.com|tiktok\.com|twitter\.com|x\.com|"
+    # (?<![\w.-]): "netflix.com/watch/1" must not yield "x.com/watch/1"
+    r"(?<![\w.-])(?:(?:youtube\.com|youtu\.be|instagram\.com|tiktok\.com|twitter\.com|x\.com|"
     r"facebook\.com|fb\.watch|pinterest\.com|pin\.it|reddit\.com|vimeo\.com|"
     r"soundcloud\.com|twitch\.tv|threads\.net|linkedin\.com)/[^\s<>\"']+)",
     re.IGNORECASE,
 )
+
+
+# Punctuation that ends a sentence, not a URL (ASCII + CJK/typographic).
+_TRAILING = ".,;:!?'\"]>…»」』）】，。、！？；："
+
+
+def _trim_url(url: str) -> str:
+    """
+    Drop sentence punctuation stuck to the end of a link ("…XcQ!" was read as
+    an invalid id). A ")" is kept when it closes a "(" inside the URL, as in
+    Wikipedia's Foo_(bar).
+    """
+    while url:
+        if url[-1] in _TRAILING:
+            url = url[:-1]
+        elif url[-1] == ")" and url.count(")") > url.count("("):
+            url = url[:-1]
+        else:
+            break
+    return url
 
 
 def extract_urls(text: str, *, expand: bool = True) -> list[str]:
@@ -33,13 +54,13 @@ def extract_urls(text: str, *, expand: bool = True) -> list[str]:
         return []
     found: list[str] = []
     for match in URL_RE.findall(text):
-        url = match.rstrip(").,;]'\"")
+        url = _trim_url(match)
         if url.lower().startswith("www."):
             url = "https://" + url
         found.append(url)
     if not found:
         for match in BARE_URL_RE.findall(text):
-            found.append("https://" + match.rstrip(").,;]'\""))
+            found.append("https://" + _trim_url(match))
     # Dedupe preserving order
     seen: set[str] = set()
     out: list[str] = []
@@ -144,7 +165,8 @@ def platform_from_url(url: str) -> str:
     if host in mapping:
         return mapping[host]
     for key, name in mapping.items():
-        if host.endswith("." + key) or key in host:
+        # Label match only: "x.com" in "netflix.com" is not X / Twitter.
+        if host.endswith("." + key):
             return name
     return host.split(".")[0].title() if host else "Unknown"
 
@@ -154,7 +176,7 @@ def format_duration(seconds: float | int | None) -> str:
         return "—"
     try:
         s = int(seconds)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # inf / nan
         return "—"
     if s < 0:
         return "—"
@@ -190,6 +212,8 @@ def format_views(n: int | float | None) -> str:
     try:
         v = float(n)
     except (TypeError, ValueError):
+        return "—"
+    if v != v or v in (float("inf"), float("-inf")):
         return "—"
     if v >= 1_000_000_000:
         return f"{v / 1_000_000_000:.1f}B"

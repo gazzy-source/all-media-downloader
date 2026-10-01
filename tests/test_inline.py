@@ -138,7 +138,7 @@ def _result(tmp_path, **kw):
     f = tmp_path / "clip.mp4"
     f.write_bytes(b"v" * 2048)
     base = dict(success=True, files=[f], primary=f, title="Cool Clip", mode="video",
-                file_size=2048, is_video=True)
+                file_size=2048, is_video=True, actual_height=720)
     base.update(kw)
     return DownloadResult(**base)
 

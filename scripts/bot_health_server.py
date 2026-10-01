@@ -11,15 +11,36 @@ HOST = "0.0.0.0"
 PORT = 9123
 
 
-POT_PING = "http://127.0.0.1:4416/ping"
+def _configured_pot_url() -> str | None:
+    """POT_PROVIDER_URL from the bot's .env (None = no provider configured)."""
+    import os
+    from pathlib import Path
+
+    url = os.getenv("POT_PROVIDER_URL")
+    if url is None:
+        env = Path(__file__).resolve().parent.parent / ".env"
+        try:
+            for line in env.read_text(encoding="utf-8").splitlines():
+                if line.strip().startswith("POT_PROVIDER_URL="):
+                    url = line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+    return url or None
 
 
 def pot_provider_up() -> bool:
-    """YouTube's PO-token provider: down means YouTube bot-walls every request."""
+    """
+    YouTube's PO-token provider, when one is configured (down = YouTube
+    bot-walls every request). Running without one is supported, so no
+    provider configured counts as fine.
+    """
     import urllib.request
 
+    url = _configured_pot_url()
+    if not url:
+        return True
     try:
-        with urllib.request.urlopen(POT_PING, timeout=3) as r:
+        with urllib.request.urlopen(url.rstrip("/") + "/ping", timeout=3) as r:
             return r.status == 200
     except Exception:
         return False

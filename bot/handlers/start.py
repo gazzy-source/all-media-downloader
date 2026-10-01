@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
@@ -128,7 +130,8 @@ async def cmd_platforms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message or not update.effective_user:
         return
-    items = get_user_history(update.effective_user.id, limit=10)
+    # File I/O: off the event loop, or one big history.json stalls everyone.
+    items = await asyncio.to_thread(get_user_history, update.effective_user.id, 10)
     if not items:
         await update.effective_message.reply_text(
             "🕘 No downloads yet. Send a media link to get started!",
@@ -167,7 +170,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=main_reply_keyboard(),
         )
         return
-    stats = get_stats()
+    stats = await asyncio.to_thread(get_stats)
     total = stats.get("total_downloads", 0)
     ok = stats.get("successful", 0)
     fail = stats.get("failed", 0)

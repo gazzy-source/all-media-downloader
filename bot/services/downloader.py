@@ -391,7 +391,7 @@ def _platform_flags(host: str) -> dict[str, bool]:
         "yt": "youtu" in h,
         "ig": "instagram" in h or "instagr.am" in h,
         "tt": "tiktok" in h,
-        "x": "twitter." in h or h.endswith("x.com") or ".x.com" in h or h == "x.com",
+        "x": "twitter." in h or h == "x.com" or h.endswith(".x.com"),
         "fb": "facebook." in h or "fb.watch" in h or h.endswith("fb.com"),
         "pin": "pinterest." in h or "pin.it" in h or "pinimg." in h,
         "rd": "reddit." in h or "redd.it" in h,
@@ -1199,10 +1199,11 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 # user by resending an age-restricted link.
                 if (
                     "not a bot" in err
-                    # Background warmup: rotate only while no one is
-                    # downloading — then a flagged IP gets replaced BEFORE a
-                    # user hits it, without cutting anyone's transfer.
-                    and (url != WARMUP_URL or download_manager.active == 0)
+                    # Never from the background warmup: "no downloads" is not
+                    # "idle" (analyses, inline searches and prefetches share
+                    # the proxy), and it would burn the cooldown a real user
+                    # may need a minute later. A user's request rotates at once.
+                    and url != WARMUP_URL
                     and _platform_flags(urlparse(url).netloc.lower())["yt"]
                     and opts.get("proxy")
                     and not any(s.get("_warp_retry") for s in strats)

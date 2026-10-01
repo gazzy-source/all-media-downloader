@@ -69,6 +69,14 @@ def find_ffmpeg() -> Path | None:
     Return path to the ffmpeg binary, or None if not found.
     Also ensures the bin directory is on PATH for subprocesses yt-dlp may spawn.
     """
+    # 0. An explicit FFMPEG_LOCATION / FFMPEG_PATH wins over whatever is on
+    #    PATH, and may name the binary itself (e.g. /opt/ff/ffmpeg7).
+    env = os.getenv("FFMPEG_LOCATION") or os.getenv("FFMPEG_PATH")
+    if env and Path(env).is_file():
+        _ensure_path(Path(env).parent)
+        logger.info("FFmpeg from FFMPEG_LOCATION: %s", env)
+        return Path(env)
+
     # 1. PATH
     which = shutil.which("ffmpeg")
     if which:

@@ -147,6 +147,10 @@ INLINE_SEARCH_ENABLED: bool = os.getenv("INLINE_SEARCH_ENABLED", "1").strip().lo
 )
 INLINE_SEARCH_PAGE: int = max(1, min(int(os.getenv("INLINE_SEARCH_PAGE", "10")), 20))
 INLINE_SEARCH_MAX: int = max(1, min(int(os.getenv("INLINE_SEARCH_MAX", "30")), 50))
+# Search lists only media up to this long (seconds). Beyond an hour a video is
+# almost always over Telegram's 50 MB bot limit (and slow to fetch), so
+# offering it would mostly lead to "too big" — keep the list to what works.
+INLINE_SEARCH_MAX_DURATION: int = int(os.getenv("INLINE_SEARCH_MAX_DURATION", "3600"))
 # Public URL prefix for the placeholder clip/track that a picked search result
 # shows until the real file replaces it (Telegram fetches it by URL). Default:
 # this repo's bot/assets via jsDelivr's GitHub CDN (correct MIME types).

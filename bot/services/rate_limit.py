@@ -15,6 +15,8 @@ class RateLimiter:
 
     def allow(self, user_id: int) -> tuple[bool, int]:
         """Return (allowed, seconds_until_reset)."""
+        if self.max_per_hour <= 0:
+            return True, 0  # 0 / negative = unlimited (it used to IndexError)
         now = time.time()
         window = 3600.0
         q = self._hits[user_id]

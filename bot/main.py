@@ -21,6 +21,7 @@ from telegram.ext import (
 
 from bot import __bot_bio__, __bot_name__, __version__
 from bot.config import (
+    POT_PROVIDER_URL,
     ADMIN_IDS,
     DATA_DIR,
     BOT_TOKEN,
@@ -99,7 +100,9 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if p.is_file() and p.stat().st_mtime < cutoff:
                     p.unlink(missing_ok=True)
                     removed_files += 1
-                elif p.is_dir():
+                elif p.is_dir() and p.stat().st_mtime < cutoff:
+                    # Old empty dirs only: a running job's work dir is empty
+                    # during extraction, and removing it broke the job's write.
                     try:
                         next(p.iterdir())
                     except StopIteration:
@@ -263,6 +266,10 @@ async def post_init(app: Application) -> None:
                 detail,
             )
     else:
+        if POT_PROVIDER_URL:
+            # Configured but not answering yet: the provider container often
+            # finishes booting after the bot. Keep checking for a while.
+            app.bot_data["_pot_recheck_task"] = asyncio.create_task(_recheck_pot())
         logger.info(
             "YouTube: no PO-token provider — public videos still download "
             "cookielessly, but the highest formats may 403 and fall back to the "
@@ -350,7 +357,9 @@ def build_app() -> Application:
         if not base.endswith("/bot"):
             base = base + "/bot"
         builder = builder.base_url(base + "/")
-        builder = builder.base_file_url(base.replace("/bot", "/file/bot") + "/")
+        # Replace only the trailing "/bot": a host like http://botapi:8081
+        # contains "//bot" too, and a blanket replace mangled the host.
+        builder = builder.base_file_url(base[: -len("/bot")] + "/file/bot/")
         logger.info("Using custom Telegram API base: %s", base)
 
     app = builder.build()

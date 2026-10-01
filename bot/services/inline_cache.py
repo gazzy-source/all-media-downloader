@@ -42,8 +42,30 @@ def repeat_key(mode: str, quality: str = "", audio_format: str = "") -> str | No
 _YT_ID = __import__("re").compile(
     r"^(?:https?://)?(?:www\.|m\.|music\.)?"
     r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|live/|embed/)|youtu\.be/)"
-    r"([A-Za-z0-9_-]{11})"
+    # Not playlist/channel embeds ("videoseries", "live_stream" are 11 chars
+    # too — every playlist embed collapsed into one slot) and exactly 11.
+    r"(?!videoseries|live_stream)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])"
 )
+
+
+def good_enough(mode: str, quality: str, result) -> bool:
+    """
+    Only a file that IS what the slot promises may be cached. When YouTube
+    refuses the top formats the downloader falls back to 360p; caching that
+    under video@1080 served 360p to everyone, instantly, with no expiry.
+    """
+    if mode != "video":
+        return True
+    from bot.config import QUALITY_MAP
+
+    want = (QUALITY_MAP.get(quality) or {}).get("height") or 0
+    got = getattr(result, "actual_height", None)
+    if not got:
+        return False  # unknown: don't promise anything
+    # The fallback client is capped at 360p: anything above that is the real
+    # thing (incl. a video whose own best is 480p); at or below 360 it only
+    # counts when that is all that was asked for.
+    return got > 360 or got >= want
 
 
 def _norm(url: str) -> str:

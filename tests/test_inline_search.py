@@ -149,6 +149,47 @@ class TestSearchService:
                   "https://m.youtube.com/watch?feature=share&v=dQw4w9WgXcQ"):
             assert inline_cache.get(u, "video@720")["file_id"] == "F"
 
+    def test_results_over_an_hour_are_left_out(self, monkeypatch):
+        monkeypatch.setattr(yt_search, "INLINE_SEARCH_MAX_DURATION", 3600)
+        base = {"id": "b" * 11, "ie_key": "Youtube", "title": "T"}
+        assert yt_search._hit({**base, "duration": 3600}) is not None
+        assert yt_search._hit({**base, "duration": 3601}) is None
+
+    def test_identical_concurrent_searches_hit_youtube_once(self, monkeypatch):
+        import threading
+
+        calls = []
+        gate = threading.Event()
+
+        class Y:
+            def __init__(self, opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def extract_info(self, q, download=False):
+                calls.append(q)
+                gate.wait(5)
+                return {"entries": [{"id": "c" * 11, "ie_key": "Youtube", "duration": 60,
+                                     "title": "T"}]}
+
+        monkeypatch.setattr(yt_search.yt_dlp, "YoutubeDL", Y)
+        yt_search._CACHE.clear()
+        out = []
+        threads = [threading.Thread(target=lambda: out.append(yt_search.search("dup query")))
+                   for _ in range(3)]
+        for th in threads:
+            th.start()
+        gate.set()
+        for th in threads:
+            th.join(10)
+        assert len(calls) == 1 and len(out) == 3 and all(o == out[0] for o in out)
+        yt_search._CACHE.clear()
+
     def test_human_formats(self):
         assert yt_search.human_views(136_639_906) == "136.6M views"
         assert yt_search.human_views(1_000) == "1K views"

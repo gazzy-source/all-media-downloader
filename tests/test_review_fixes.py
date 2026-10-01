@@ -100,7 +100,7 @@ def _ok(tmp_path):
     f = tmp_path / "clip.mp4"
     f.write_bytes(b"v" * 100)
     return DownloadResult(success=True, files=[f], primary=f, title="T", mode="video",
-                          file_size=100, is_video=True)
+                          file_size=100, is_video=True, actual_height=720)
 
 
 async def _sender(kind="video", file_id="FID"):

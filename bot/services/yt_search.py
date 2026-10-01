@@ -10,6 +10,7 @@ query so the same search from anyone is instant for a while.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import threading
 import time
@@ -18,12 +19,19 @@ from typing import Any
 
 import yt_dlp
 
-from bot.config import INLINE_SEARCH_MAX, MAX_MEDIA_DURATION, PROXY
+from bot.config import INLINE_SEARCH_MAX, INLINE_SEARCH_MAX_DURATION, MAX_MEDIA_DURATION, PROXY
 
 logger = logging.getLogger(__name__)
 
 _CACHE: dict[str, tuple[float, list["SearchHit"]]] = {}
 _CACHE_LOCK = threading.Lock()
+# Searches running right now, by query: an identical query arriving meanwhile
+# (two users, or one user's client re-asking) waits for that result instead of
+# hitting YouTube a second time.
+_RUNNING: dict[str, threading.Event] = {}
+# Own pool: a slow YouTube/WARP must not tie up the default executor that
+# link checks, short-link expansion and title lookups share.
+EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="ytsearch")
 _CACHE_TTL = 900.0
 _CACHE_MAX = 300
 
@@ -76,8 +84,8 @@ def _hit(entry: dict[str, Any]) -> SearchHit | None:
     duration = entry.get("duration")
     if not duration:
         return None  # live streams / premieres list without one — refused anyway
-    if duration > MAX_MEDIA_DURATION:
-        return None
+    if duration > min(INLINE_SEARCH_MAX_DURATION, MAX_MEDIA_DURATION):
+        return None  # long mixes/compilations: usually too big for Telegram
     return SearchHit(
         id=str(vid),
         title=str(entry.get("title") or "Untitled")[:200],
@@ -97,17 +105,40 @@ def search(query: str) -> list[SearchHit]:
         hit = _CACHE.get(key)
         if hit and now - hit[0] < _CACHE_TTL:
             return hit[1]
-    started = time.monotonic()
-    with yt_dlp.YoutubeDL(_opts()) as ydl:
-        info = ydl.extract_info(f"ytsearch{INLINE_SEARCH_MAX}:{key}", download=False)
-    hits = [h for h in (_hit(e) for e in (info or {}).get("entries") or []) if h]
-    logger.info("inline search %r: %s hits in %.1fs", key[:40], len(hits), time.monotonic() - started)
-    with _CACHE_LOCK:
-        if len(_CACHE) >= _CACHE_MAX:
-            for k, _ in sorted(_CACHE.items(), key=lambda kv: kv[1][0])[: _CACHE_MAX // 4]:
-                _CACHE.pop(k, None)
-        _CACHE[key] = (now, hits)
-    return hits
+        running = _RUNNING.get(key)
+        if running is None:
+            _RUNNING[key] = threading.Event()
+    if running is not None:
+        running.wait(timeout=25)
+        with _CACHE_LOCK:
+            hit = _CACHE.get(key)
+        if hit:
+            return hit[1]
+        raise RuntimeError("the same search failed a moment ago")
+    try:
+        started = time.monotonic()
+        with yt_dlp.YoutubeDL(_opts()) as ydl:
+            info = ydl.extract_info(f"ytsearch{INLINE_SEARCH_MAX}:{key}", download=False)
+        hits, seen = [], set()
+        for h in (_hit(e) for e in (info or {}).get("entries") or []):
+            # yt-dlp does not dedupe across result pages, and one duplicate id
+            # makes Telegram reject the whole answer (RESULT_ID_DUPLICATE).
+            if h and h.id not in seen:
+                seen.add(h.id)
+                hits.append(h)
+        logger.info("inline search %r: %s hits in %.1fs", key[:40], len(hits),
+                    time.monotonic() - started)
+        with _CACHE_LOCK:
+            if len(_CACHE) >= _CACHE_MAX:
+                for k, _ in sorted(_CACHE.items(), key=lambda kv: kv[1][0])[: _CACHE_MAX // 4]:
+                    _CACHE.pop(k, None)
+            _CACHE[key] = (time.monotonic(), hits)
+        return hits
+    finally:
+        with _CACHE_LOCK:
+            ev = _RUNNING.pop(key, None)
+        if ev is not None:
+            ev.set()
 
 
 def cached(query: str) -> list[SearchHit] | None:

@@ -68,7 +68,7 @@ class TestInstantRepeats:
 
         async def fake_download(**kw):
             return DownloadResult(success=True, files=[f], primary=f, title="T", mode="video",
-                                  file_size=64, is_video=True)
+                                  file_size=64, is_video=True, actual_height=1080)
 
         async def fake_send(*a, **k):
             return SimpleNamespace(video=SimpleNamespace(file_id="UP1"), animation=None,
@@ -122,13 +122,13 @@ class TestInstantRepeats:
         assert msg.replies == []  # no "Downloading" status for an instant send
 
 
-def test_warmup_rotates_only_when_idle():
+def test_warmup_never_rotates_warp():
     from pathlib import Path
 
     import bot.services.downloader as dl
 
     src = Path(dl.__file__).read_text(encoding="utf-8")
-    assert "url != WARMUP_URL or download_manager.active == 0" in src
+    assert "and url != WARMUP_URL" in src
 
 
 async def test_telegram_polling_hiccup_is_not_an_unhandled_error(caplog):

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from telegram import InputFile, Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import ContextTypes
 
 from bot.config import (
@@ -283,6 +283,7 @@ async def auto_download_flow(
             context, chat.id, hit,
             "" if is_chan else f"🎬 <b>{title}</b>\n⚡ Instant · All-Media Downloader · Gazzy Labs",
             reply_markup=None if is_chan else after_download_keyboard(url, user_id=actor),
+            url=url, key=repeat,
         )
         if sent is not None:
             if (is_chan and CHANNEL_REPLACE_LINK and replace_source
@@ -290,7 +291,6 @@ async def auto_download_flow(
                 await _try_delete(context, chat.id, msg.message_id)
             record_download(actor, url, hit.get("title") or "", platform, mode, quality, True)
             return True
-        inline_cache.forget(url, repeat)
 
     status = await msg.reply_text(
         f"⚡ <b>Downloading</b> · {kind}",
@@ -418,14 +418,15 @@ async def auto_download_flow(
         ):
             outcome = await _replace_channel_post(
                 context, chat.id, msg.message_id, path, result,
-                remember=lambda sent: _remember_upload(url, repeat, sent, result.title or ""),
+                remember=lambda sent: _remember_upload(
+                    url, repeat, sent, result.title or "", result, mode, quality),
             )
             logger.info("Channel post handling: %s", outcome)
         else:
             sent = await _send_media(
                 context, chat.id, path, result, caption, reply_markup=actions
             )
-            _remember_upload(url, repeat, sent, result.title or "")
+            _remember_upload(url, repeat, sent, result.title or "", result, mode, quality)
         record_download(
             actor, url, result.title or "", platform, mode, quality, True,
             file_size=size,
@@ -830,15 +831,25 @@ def _sent_file(msg) -> tuple[str, str] | None:
     return None
 
 
-def _remember_upload(url: str, key: str | None, sent, title: str) -> None:
+def _remember_upload(url: str, key: str | None, sent, title: str, result=None,
+                     mode: str = "", quality: str = "") -> None:
     """After a real upload: the next request for this link+quality is instant."""
     found = _sent_file(sent) if key and sent is not None else None
-    if found:
+    if found and (result is None or inline_cache.good_enough(mode, quality, result)):
         inline_cache.put(url, key, file_id=found[1], kind=found[0], title=title or "")
 
 
-async def _send_cached(context, chat_id: int, hit: dict, caption: str, reply_markup=None):
-    """Re-send a file Telegram already has. Returns the Message, or None on refusal."""
+_DELIVERED_UNCONFIRMED = object()
+
+
+async def _send_cached(context, chat_id: int, hit: dict, caption: str, reply_markup=None,
+                       *, url: str = "", key: str | None = None):
+    """
+    Re-send a file Telegram already has. Returns the Message (or, after a
+    timeout, a marker: it probably arrived — never send it twice), or None to
+    download normally. Only a refused FILE forgets the cache entry; a chat that
+    can't take videos, or a network blip, must not wipe it for everyone.
+    """
     field = hit.get("kind") if hit.get("kind") in ("video", "audio", "animation", "photo") else "document"
     send = getattr(context.bot, f"send_{field}")
     kw: dict = {field: hit["file_id"], "reply_markup": reply_markup}
@@ -846,9 +857,16 @@ async def _send_cached(context, chat_id: int, hit: dict, caption: str, reply_mar
         kw.update(caption=caption[:1024], parse_mode=ParseMode.HTML)
     try:
         return await send(chat_id, **kw)
+    except TimedOut:
+        return _DELIVERED_UNCONFIRMED
+    except BadRequest as e:
+        text = str(e).lower()
+        if url and key and ("file" in text or "wrong type" in text or "identifier" in text):
+            logger.info("cached file refused (%s) — forgetting it", e)
+            inline_cache.forget(url, key)
+        return None
     except TelegramError as e:
-        # A file_id Telegram no longer honours: forget it, download normally.
-        logger.info("cached file refused (%s) — downloading afresh", e)
+        logger.info("cached send failed (%s) — downloading normally", e)
         return None
 
 
@@ -1021,6 +1039,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
             context, chat_id, hit,
             f"🎬 <b>{title}</b>\n⚡ Instant · All-Media Downloader",
             reply_markup=after_download_keyboard(session.url, user_id=session.user_id),
+            url=session.url, key=repeat,
         )
         if sent is not None:
             record_download(session.user_id, session.url, session.title, session.platform,
@@ -1031,7 +1050,6 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
             except TelegramError:
                 pass
             return
-        inline_cache.forget(session.url, repeat)
 
     inflight_add(chat_id, query.message.message_id)
     try:
@@ -1150,7 +1168,8 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
             sent = await _send_media(
                 context, chat_id, path, result, caption, reply_markup=actions
             )
-            _remember_upload(session.url, repeat, sent, result.title or session.title)
+            _remember_upload(session.url, repeat, sent, result.title or session.title,
+                             result, mode, quality)
             if result.subtitle_file and result.subtitle_file.exists() and mode == "video_subs":
                 try:
                     await context.bot.send_document(

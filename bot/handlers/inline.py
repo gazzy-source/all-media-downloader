@@ -332,7 +332,9 @@ _AUDIO_PREFIXES = ("audio ", "mp3 ", "music ", "song ", "🎵")
 # Per user: the newest query id. A search starts only once typing pauses, so a
 # word typed letter by letter costs one YouTube search, not one per keystroke.
 _LATEST: dict[int, str] = {}
-_DEBOUNCE = 0.4
+# Measured in production: people pause 0.5-1.7s between words, so 0.4s still
+# searched "meet me on the l", "…la", "…lab" separately.
+_DEBOUNCE = 0.65
 _SEARCH_SLOTS = asyncio.Semaphore(3)
 
 
@@ -352,12 +354,14 @@ async def _search(q, text: str) -> None:
             text="🎵 Now type a song or video name", start_parameter="inline"), cache_time=60)
         return
     uid = q.from_user.id
+    # Every query (cached or not) becomes the user's latest, so an older one
+    # still waiting out the debounce stands down.
+    _LATEST.pop(uid, None)
+    _LATEST[uid] = q.id
+    while len(_LATEST) > 5000:
+        _LATEST.pop(next(iter(_LATEST)))  # oldest first, not everyone at once
     hits = yt_search.cached(terms)
     if hits is None:
-        _LATEST[uid] = q.id
-        if len(_LATEST) > 5000:
-            _LATEST.clear()
-            _LATEST[uid] = q.id
         await asyncio.sleep(_DEBOUNCE)
         if _LATEST.get(uid) != q.id:
             return  # still typing: a newer query will search (Telegram drops this one)
@@ -368,10 +372,14 @@ async def _search(q, text: str) -> None:
             return
         try:
             async with _SEARCH_SLOTS:
+                # 20s: the first search after a restart also pays yt-dlp's cold
+                # start (two timed out at 12s in production). The thread keeps
+                # running past a timeout and still fills the cache for the retry.
                 hits = await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(None, yt_search.search, terms), 12)
+                    asyncio.get_running_loop().run_in_executor(
+                        yt_search.EXECUTOR, yt_search.search, terms), 20)
         except Exception as e:
-            logger.warning("inline search failed for %r: %s", terms[:40], e)
+            logger.warning("inline search failed for %r: %r", terms[:40], e)
             await _answer(q, [], button=InlineQueryResultsButton(
                 text="⚠️ Search is unavailable right now — paste a link instead",
                 start_parameter="inline"), cache_time=5)
@@ -564,10 +572,11 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
             await caption("❌ Telegram refused this file here. Tap <b>Open bot</b> to get it.",
                           force=True, final=True)
             return
-        # Cached only once Telegram has accepted it in a message: an invalid
-        # file_id in the cache would make every later inline answer for this
-        # link fail as a whole.
-        inline_cache.put(url, _key(mode), file_id=file_id, kind=kind, title=title)
+        # Cached only once Telegram has accepted it in a message (an invalid
+        # file_id would make every later inline answer for this link fail as
+        # a whole) — and only if it IS the promised quality, not a fallback.
+        if inline_cache.good_enough(mode, INLINE_QUALITY, result):
+            inline_cache.put(url, _key(mode), file_id=file_id, kind=kind, title=title)
         if STORAGE_CHAT_ID is None:
             await _quiet_delete(context, chat, sent.message_id)
         record_download(user_id, url, title, platform, mode, INLINE_QUALITY, True, file_size=size)

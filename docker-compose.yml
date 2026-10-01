@@ -26,7 +26,12 @@ services:
     pids_limit: 256
 
   bgutil-provider:
-    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    # Pinned by digest (the build verified on production, 2026-09-08): a
+    # third-party image on the bot's network must not change underneath us.
+    # To update: docker pull brainicism/bgutil-ytdlp-pot-provider:latest,
+    # check the plugin's major version still matches requirements.txt, then
+    # paste the new digest from `docker image inspect --format '{{index .RepoDigests 0}}'`.
+    image: brainicism/bgutil-ytdlp-pot-provider@sha256:ed86b6fdd5e430ddd7c8ce1adb55e1ab54db7c7dbc1bcbf3a82454a85b971164
     container_name: bgutil-provider
     restart: unless-stopped
     # NOTE: if you set PROXY in .env to a HOST-LOCAL address (127.0.0.1:...,

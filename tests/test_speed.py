@@ -165,3 +165,35 @@ class TestInlinePrefetch:
         await inl.handle_chosen_inline_result(
             SimpleNamespace(chosen_inline_result=chosen), SimpleNamespace(bot=Bot()))
         assert seen["quality"] == "720"
+
+
+class TestWebClientFormatsNotReplayed:
+    def test_web_client_urls_are_dropped_before_reuse(self, fake_ydl, tmp_path, monkeypatch):
+        seen = {}
+
+        def capture(self, info, download=True):
+            seen["formats"] = [f["format_id"] for f in info["formats"]]
+            seen["requested"] = "requested_formats" in info
+            return info
+
+        monkeypatch.setattr(FakeYDL, "process_ie_result", capture)
+        dl._meta_cache_put("https://youtu.be/w", {
+            "id": "w", "title": "T", "extractor": "youtube",
+            "requested_formats": [{"format_id": "137"}],
+            "formats": [
+                {"format_id": "web", "url": "https://rr1.googlevideo.com/videoplayback?c=WEB&itag=18"},
+                {"format_id": "mweb", "url": "https://rr1.googlevideo.com/videoplayback?c=MWEB&itag=18"},
+                {"format_id": "vis", "url": "https://rr1.googlevideo.com/videoplayback?c=VISIONOS&itag=18"},
+            ],
+        })
+        DownloadManager()._download_from_analysis(
+            {"outtmpl": str(tmp_path / "t")}, "https://youtu.be/w", "h", "b")
+        assert seen["formats"] == ["vis"] and seen["requested"] is False
+
+    def test_only_web_formats_means_no_reuse(self, fake_ydl, tmp_path):
+        dl._meta_cache_put("https://youtu.be/o", {
+            "id": "o", "extractor": "youtube",
+            "formats": [{"format_id": "web", "url": "https://x.googlevideo.com/v?c=WEB"}],
+        })
+        assert DownloadManager()._download_from_analysis(
+            {"outtmpl": str(tmp_path / "t")}, "https://youtu.be/o", "h", "b") is None

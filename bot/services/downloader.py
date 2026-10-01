@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+import urllib.parse
 from urllib.parse import unquote, urlparse
 
 import yt_dlp
@@ -946,6 +947,13 @@ def _order_yt_strategies(
         indices = [wi, *range(0, wi), *range(wi + 1, len(base_strats))]
         return ordered, indices
     return list(base_strats), list(range(len(base_strats)))
+
+
+def _is_web_client_url(fmt: dict[str, Any]) -> bool:
+    """A googlevideo URL minted for YouTube's WEB / MWEB player (c=WEB...)."""
+    q = urllib.parse.parse_qs(urlparse(str(fmt.get("url") or "")).query)
+    client = (q.get("c") or [""])[0].upper()
+    return client.startswith(("WEB", "MWEB"))
 
 
 def _meta_cache_get(url: str, max_age: float | None = None) -> dict[str, Any] | None:
@@ -1996,12 +2004,23 @@ class DownloadManager:
         cached = _meta_cache_get(url, max_age=DOWNLOAD_REUSE_TTL)
         if not cached or not cached.get("formats") or cached.get("_type", "video") != "video":
             return None
+        info_in = copy.deepcopy(cached)
+        # YouTube's WEB-client URLs need a GVS PO token bound at download time
+        # and 403 when replayed from a saved extraction (verified on the
+        # server; cookies make no difference). Other clients' URLs (VISIONOS,
+        # ANDROID_VR, …) replay fine and carry the same itags, so selection
+        # just picks from those.
+        info_in["formats"] = [f for f in info_in["formats"] if not _is_web_client_url(f)]
+        for stale in ("requested_formats", "requested_downloads", "format_id"):
+            info_in.pop(stale, None)
+        if not info_in["formats"]:
+            return None
         started = time.monotonic()
         reuse_opts = dict(opts)
         reuse_opts["format"] = primary
         try:
             with yt_dlp.YoutubeDL(reuse_opts) as ydl:
-                info = ydl.process_ie_result(copy.deepcopy(cached), download=True)
+                info = ydl.process_ie_result(info_in, download=True)
                 if info is None:
                     return None
                 prepared = ydl.prepare_filename(info)

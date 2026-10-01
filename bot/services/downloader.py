@@ -43,11 +43,12 @@ from bot.config import (
     PROXY_BLIP_RETRIES,
     SB_GUARD,
     TEMP_DIR,
+    WARMUP_URL,
     YT_LEAN_DOWNLOAD,
     YT_LEAN_METADATA,
 )
 from bot.utils.ffmpeg import ffmpeg_location_dir
-from bot.utils.safe_fetch import UnsafeURLError, check_public_url
+from bot.utils.safe_fetch import UnresolvableURLError, UnsafeURLError, check_public_url
 from bot.utils.warp import rotate_warp_ip
 from bot.utils.helpers import (
     IMAGE_EXTS,
@@ -751,6 +752,23 @@ _INTERNAL_DETAIL_RE = re.compile(
     re.IGNORECASE,
 )
 
+class JobRefused(yt_dlp.utils.DownloadError):
+    """
+    A deliberate refusal from the match_filter (live, too long, private URL).
+    A DownloadError so yt-dlp's _match_entry lets it propagate (it swallows
+    DownloadCancelled there); its own class so no retry path re-runs the job.
+    """
+
+
+class JobAborted(yt_dlp.utils.DownloadCancelled):
+    """
+    The byte/time guard tripping mid-transfer. NOT a DownloadError: yt-dlp's
+    fragment loop catches DownloadError per fragment and carries on (native
+    HLS treats no fragment as fatal), so a DownloadError here produced a
+    truncated "successful" file instead of stopping. Reproduced locally.
+    """
+
+
 PRIVATE_URL_ERROR = (
     "That link points to a private or local network address, which this bot "
     "doesn't fetch."
@@ -769,12 +787,12 @@ def _download_match_filter(info: dict[str, Any], *, incomplete: bool = False) ->
     if incomplete:
         return None
     if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
-        raise yt_dlp.utils.DownloadError(
+        raise JobRefused(
             "Live streams can't be downloaded — send the link again once it has ended."
         )
     duration = info.get("duration")
     if duration and duration > MAX_MEDIA_DURATION:
-        raise yt_dlp.utils.DownloadError(
+        raise JobRefused(
             f"This is longer than the {MAX_MEDIA_DURATION // 3600}h this bot "
             "accepts — it wouldn't fit Telegram's upload size anyway."
         )
@@ -785,8 +803,10 @@ def _download_match_filter(info: dict[str, Any], *, incomplete: bool = False) ->
         if isinstance(target, str) and target.startswith("http"):
             try:
                 check_public_url(target)
+            except UnresolvableURLError:
+                continue  # the CDN host didn't resolve HERE; yt-dlp may via proxy
             except UnsafeURLError as e:
-                raise yt_dlp.utils.DownloadError(PRIVATE_URL_ERROR) from e
+                raise JobRefused(PRIVATE_URL_ERROR) from e
     return None
 
 
@@ -825,7 +845,10 @@ def _min_sizes_by_quality(info: dict[str, Any]) -> dict[str, int]:
         top = max(int(f["height"]) for f in cands)
         sizes = []
         for f in cands:
-            if int(f["height"]) != top:
+            # The selectors lead with b[height<=N] — a progressive format at ANY
+            # height <= N can be the pick — then fall back to the top height.
+            progressive = f.get("acodec") not in (None, "none")
+            if int(f["height"]) != top and not progressive:
                 continue
             sz = int(f.get("filesize") or f.get("filesize_approx") or 0)
             if not sz:
@@ -1176,6 +1199,7 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 # user by resending an age-restricted link.
                 if (
                     "not a bot" in err
+                    and url != WARMUP_URL  # background job: never cut users' transfers
                     and _platform_flags(urlparse(url).netloc.lower())["yt"]
                     and opts.get("proxy")
                     and not any(s.get("_warp_retry") for s in strats)
@@ -1507,6 +1531,8 @@ class DownloadManager:
         # body back as a "video" file.
         try:
             check_public_url(url)
+        except UnresolvableURLError:
+            pass  # a typo/dead domain: let yt-dlp report it (or reach it via proxy)
         except UnsafeURLError:
             return DownloadResult(success=False, error=PRIVATE_URL_ERROR, mode=mode)
 
@@ -1562,18 +1588,20 @@ class DownloadManager:
             elif status == "finished":
                 _emit(100, "⚙️ Finishing…")
 
+        tripped: dict[str, str] = {}
+
         def guard(d: dict[str, Any]) -> None:
             """Abort mid-transfer: endless streams and huge files stop HERE."""
             if d.get("status") != "downloading":
                 return
+            reason = None
             if (d.get("downloaded_bytes") or 0) > DOWNLOAD_MAX_BYTES:
-                raise yt_dlp.utils.DownloadError(
-                    "File is larger than max-filesize for Telegram"
-                )
-            if time.monotonic() - job_started > DOWNLOAD_MAX_SECONDS:
-                raise yt_dlp.utils.DownloadError(
-                    f"Download timed out after {DOWNLOAD_MAX_SECONDS // 60} min"
-                )
+                reason = "File is larger than max-filesize for Telegram"
+            elif time.monotonic() - job_started > DOWNLOAD_MAX_SECONDS:
+                reason = f"Download timed out after {DOWNLOAD_MAX_SECONDS // 60} min"
+            if reason:
+                tripped["reason"] = reason
+                raise JobAborted(reason)
 
         host = urlparse(url).netloc.lower()
         # Disposable jar for every download so concurrent jobs never corrupt cookies
@@ -1669,6 +1697,10 @@ class DownloadManager:
                 opts, url, title_hint, job_cookies=job_cookies,
                 on_stage=_emit,
             )
+            if tripped:
+                # The guard fired but something downstream swallowed it: the
+                # file on disk is cut short. Never hand that over as a success.
+                raise JobAborted(tripped["reason"])
 
             files = sorted(
                 [p for p in work_dir.iterdir() if p.is_file() and not p.name.endswith(".part")],
@@ -1727,6 +1759,18 @@ class DownloadManager:
                 subtitle_file=sub_file,
                 actual_height=_delivered_height(info),
             )
+        except (JobRefused, JobAborted) as e:
+            # Deliberate refusals / limits: expected, no traceback needed.
+            logger.warning("Download refused for %s: %s", url[:80], e)
+            self._cleanup_dir(work_dir)
+            if isinstance(e, JobAborted):
+                # Concurrent fragment threads can still be finishing a write
+                # when the abort lands; sweep again once they have stopped.
+                t = threading.Timer(5.0, self._cleanup_dir, args=(work_dir,))
+                t.daemon = True
+                t.start()
+            return DownloadResult(success=False, error=self._friendly_error(str(e)),
+                                  mode=mode, quality=quality)
         except yt_dlp.utils.DownloadError as e:
             msg = str(e).split("\n")[-1][:300]
             # Expected failures: keep logs light for speed/noise
@@ -2004,21 +2048,20 @@ class DownloadManager:
         cached = _meta_cache_get(url, max_age=DOWNLOAD_REUSE_TTL)
         if not cached or not cached.get("formats") or cached.get("_type", "video") != "video":
             return None
-        info_in = copy.deepcopy(cached)
-        # YouTube's WEB-client URLs need a GVS PO token bound at download time
-        # and 403 when replayed from a saved extraction (verified on the
-        # server; cookies make no difference). Other clients' URLs (VISIONOS,
-        # ANDROID_VR, …) replay fine and carry the same itags, so selection
-        # just picks from those.
-        info_in["formats"] = [f for f in info_in["formats"] if not _is_web_client_url(f)]
-        for stale in ("requested_formats", "requested_downloads", "format_id"):
-            info_in.pop(stale, None)
-        if not info_in["formats"]:
-            return None
         started = time.monotonic()
         reuse_opts = dict(opts)
         reuse_opts["format"] = primary
         try:
+            info_in = copy.deepcopy(cached)
+            # YouTube's WEB-client URLs need a GVS PO token bound at download
+            # time and 403 when replayed from a saved extraction (verified on
+            # the server; cookies make no difference). Other clients' URLs
+            # (VISIONOS, ANDROID_VR, …) replay fine and carry the same itags.
+            info_in["formats"] = [f for f in info_in["formats"] if not _is_web_client_url(f)]
+            for stale in ("requested_formats", "requested_downloads", "format_id"):
+                info_in.pop(stale, None)
+            if not info_in["formats"]:
+                return None
             with yt_dlp.YoutubeDL(reuse_opts) as ydl:
                 info = ydl.process_ie_result(info_in, download=True)
                 if info is None:
@@ -2029,6 +2072,10 @@ class DownloadManager:
                 time.monotonic() - started, url[:80],
             )
             return info, prepared, str(info.get("title") or title_hint)[:200]
+        except (JobRefused, JobAborted):
+            # The answer would be the same after a fresh extraction — and for
+            # the size cap, the bot would download up to 3x the limit AGAIN.
+            raise
         except Exception as e:
             logger.warning(
                 "Reusing the analysis failed (%s) — extracting afresh: %s",
@@ -2213,6 +2260,8 @@ class DownloadManager:
         # "[youtube] <id>:" prefix, which is often the only thing naming the
         # platform. Branches that tailor advice per platform need it.
         raw_low = (msg or "").lower()
+        if PRIVATE_URL_ERROR.lower() in raw_low:
+            return PRIVATE_URL_ERROR  # not "private video, needs cookies"
         msg = _clean_extractor_message(msg)
         low = msg.lower()
         if (

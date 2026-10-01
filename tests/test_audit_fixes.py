@@ -65,6 +65,9 @@ class TestFragmentDetection:
 class TestFetchUrlFile:
     def test_internal_target_fetches_nothing_and_leaves_no_file(self, monkeypatch, tmp_path):
         _resolve_to(monkeypatch, "127.0.0.1")
+        # Prove the guard stopped it — not a closed port refusing the connection.
+        monkeypatch.setattr(sf._OPENER, "open",
+                            lambda *a, **k: pytest.fail("guard let the request through"))
         dest = tmp_path / "x.jpg"
         assert DownloadManager()._fetch_url_file("http://127.0.0.1:4416/", dest) is None
         assert not dest.exists()
@@ -162,6 +165,7 @@ class TestWarpRotation:
         monkeypatch.setattr(warp, "PROXY", "socks5://127.0.0.1:40000")
         monkeypatch.setattr(warp, "WARP_ROTATE_COOLDOWN", 120)
         monkeypatch.setattr(warp, "_LAST_ROTATION", 0.0)
+        monkeypatch.setattr(warp, "_LAST_SUCCESS", 0.0)
         monkeypatch.setattr(warp.shutil, "which", lambda n: "/usr/bin/warp-cli")
 
         def fake(*args, timeout=15):
@@ -184,6 +188,7 @@ class TestWarpRotation:
         assert calls.count("disconnect") == 1
         # Later, still inside the cooldown: no flapping.
         monkeypatch.setattr(warp, "_LAST_ROTATION", warp.time.monotonic() - 60)
+        monkeypatch.setattr(warp, "_LAST_SUCCESS", warp.time.monotonic() - 60)
         assert warp.rotate_warp_ip() is False
         assert calls.count("disconnect") == 1
 
@@ -195,6 +200,22 @@ class TestWarpRotation:
             raise subprocess.CalledProcessError(1, "warp-cli")
 
         monkeypatch.setattr(warp, "_warp_cli", boom)
+        assert warp.rotate_warp_ip() is False
+
+    def test_failed_rotation_reconnects_and_no_one_rides_it(self, monkeypatch):
+        calls: list[str] = []
+        self._arm(monkeypatch, calls)
+
+        def connect_fails_once(*args, timeout=15):
+            calls.append(args[0])
+            if args[0] == "connect" and calls.count("connect") == 1:
+                raise subprocess.CalledProcessError(1, "warp-cli")
+            return "Status update: Disconnected"
+
+        monkeypatch.setattr(warp, "_warp_cli", connect_fails_once)
+        assert warp.rotate_warp_ip() is False
+        assert calls[-1] == "connect", "tunnel must be brought back up"
+        # A concurrent job must not "ride" a rotation that failed.
         assert warp.rotate_warp_ip() is False
 
 

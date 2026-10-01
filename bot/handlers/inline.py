@@ -32,10 +32,12 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineQueryResultCachedAudio,
     InlineQueryResultCachedDocument,
+    InlineQueryResultCachedMpeg4Gif,
     InlineQueryResultCachedPhoto,
     InlineQueryResultCachedVideo,
     InlineQueryResultsButton,
     InputFile,
+    InputMediaAnimation,
     InputMediaAudio,
     InputMediaDocument,
     InputMediaPhoto,
@@ -61,7 +63,12 @@ from bot.services.history import record_download
 from bot.services.rate_limit import RateLimiter, rate_limiter
 from bot.services.url_tokens import put_url
 from bot.utils.helpers import extract_urls, format_size, platform_from_url, progress_bar
-from bot.utils.safe_fetch import UnsafeURLError, check_public_url, open_public
+from bot.utils.safe_fetch import (
+    UnresolvableURLError,
+    UnsafeURLError,
+    check_public_url,
+    open_public,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +216,8 @@ async def _is_public(url: str) -> bool:
             asyncio.get_running_loop().run_in_executor(None, check_public_url, url), 3
         )
         return True
+    except UnresolvableURLError:
+        return True  # a typo/dead domain: the download will say so itself
     except (UnsafeURLError, asyncio.TimeoutError):
         return False
 
@@ -284,6 +293,9 @@ def _cached_result(code: str, mode: str, url: str, hit: dict):
     if kind == "photo":
         return InlineQueryResultCachedPhoto(id=rid, photo_file_id=fid, title=title,
                                             caption=caption, parse_mode=ParseMode.HTML)
+    if kind == "animation":
+        return InlineQueryResultCachedMpeg4Gif(id=rid, mpeg4_file_id=fid, title=title,
+                                               caption=caption, parse_mode=ParseMode.HTML)
     return InlineQueryResultCachedDocument(id=rid, document_file_id=fid, title=title,
                                            caption=caption, parse_mode=ParseMode.HTML)
 
@@ -304,12 +316,16 @@ def _input_media(kind: str, file_id: str, caption: str):
         return InputMediaAudio(file_id, **common)
     if kind == "photo":
         return InputMediaPhoto(file_id, **common)
+    if kind == "animation":
+        return InputMediaAnimation(file_id, **common)
     return InputMediaDocument(file_id, **common)
 
 
 def _file_of(msg) -> tuple[str, str] | None:
     """(kind, file_id) of an uploaded message."""
-    for kind in ("video", "audio", "document"):
+    # animation first: Telegram turns a soundless MP4 sent via sendVideo into
+    # an animation, and such a message carries BOTH .animation and .document.
+    for kind in ("animation", "video", "audio", "document"):
         obj = getattr(msg, kind, None)
         if obj is not None:
             return kind, obj.file_id
@@ -333,21 +349,34 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
     me = context.bot.username or ""
     give_up = _open_bot_markup(me, f"dl_{put_url(url, user_id)}")
     last = {"t": 0.0}
+    # Progress edits are fired from yt-dlp's thread without waiting, so a late
+    # "Finishing…" could land AFTER the final caption and leave the card stuck
+    # on Preparing. One lock orders the edits; once a stage is terminal (or the
+    # upload began), progress stops editing for good.
+    edits = asyncio.Lock()
+    state = {"done": False}
     started = time.monotonic()
     logger.info("inline %s chosen by %s: %s", mode, user_id, url[:80])
 
-    async def caption(text: str, *, force: bool = False, final: bool = False) -> None:
-        now = time.monotonic()
-        if not force and now - last["t"] < 3:
-            return  # Telegram limits how often one message may be edited
-        last["t"] = now
-        try:
-            await context.bot.edit_message_caption(
-                inline_message_id=imid, caption=text, parse_mode=ParseMode.HTML,
-                reply_markup=give_up if final else _preparing_markup(),
-            )
-        except TelegramError:
-            pass
+    async def caption(
+        text: str, *, force: bool = False, final: bool = False, progress: bool = False
+    ) -> None:
+        async with edits:
+            if progress and state["done"]:
+                return
+            if not progress:
+                state["done"] = True
+            now = time.monotonic()
+            if not force and now - last["t"] < 3:
+                return  # Telegram limits how often one message may be edited
+            last["t"] = now
+            try:
+                await context.bot.edit_message_caption(
+                    inline_message_id=imid, caption=text[:1024], parse_mode=ParseMode.HTML,
+                    reply_markup=give_up if final else _preparing_markup(),
+                )
+            except TelegramError as e:
+                logger.info("inline caption edit failed: %s", e)
 
     allowed, retry = rate_limiter.allow(user_id)
     if not allowed and user_id not in ADMIN_IDS:
@@ -359,15 +388,19 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
 
     hit = inline_cache.get(url, mode)
     if hit:  # fetched by someone else while this user was choosing
-        await _swap_in(context, imid, hit["kind"], hit["file_id"], hit.get("title", ""))
-        return
+        if await _swap_in(context, imid, hit["kind"], hit["file_id"], hit.get("title", "")):
+            return
+        inline_cache.forget(url, mode)  # Telegram refused it: fetch afresh below
 
     async def on_progress(pct: float, msg: str) -> None:
         # The last stages (finishing / converting) must always show — dropped
         # by the throttle, the card sat on an early "7%" for the whole tail.
-        await caption(f"{progress_bar(pct)}\n<code>{_esc(msg)}</code>", force=pct >= 99)
+        await caption(
+            f"{progress_bar(pct)}\n<code>{_esc(msg)}</code>", force=pct >= 99, progress=True
+        )
 
-    await caption("⏳ <b>Starting…</b>", force=True)
+    await caption("⏳ <b>Starting…</b>", force=True, progress=True)
+    inline_cache.add_pending(imid)
     result = None
     platform = platform_from_url(url)
     try:
@@ -379,7 +412,8 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         )
         if not result.success or not result.primary:
             record_download(user_id, url, "", platform, mode, INLINE_QUALITY, False, error=result.error)
-            await caption(f"❌ <b>Download failed</b>\n{_esc(result.error or 'Unknown error')}", force=True, final=True)
+            error = (result.error or "Unknown error")[:700]
+            await caption(f"❌ <b>Download failed</b>\n{_esc(error)}", force=True, final=True)
             return
         size = result.file_size or result.primary.stat().st_size
         if size > MAX_FILE_SIZE_BYTES:
@@ -406,8 +440,14 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
             return
         kind, file_id = found
         title = (result.title or "")[:200]
+        if not await _swap_in(context, imid, kind, file_id, title):
+            await caption("❌ Telegram refused this file here. Tap <b>Open bot</b> to get it.",
+                          force=True, final=True)
+            return
+        # Cached only once Telegram has accepted it in a message: an invalid
+        # file_id in the cache would make every later inline answer for this
+        # link fail as a whole.
         inline_cache.put(url, mode, file_id=file_id, kind=kind, title=title)
-        await _swap_in(context, imid, kind, file_id, title)
         if STORAGE_CHAT_ID is None:
             await _quiet_delete(context, chat, sent.message_id)
         record_download(user_id, url, title, platform, mode, INLINE_QUALITY, True, file_size=size)
@@ -417,15 +457,37 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         logger.exception("inline download failed for %s", url[:80])
         await caption("❌ <b>Something went wrong.</b> Please try again.", force=True, final=True)
     finally:
+        inline_cache.drop_pending(imid)
         if result is not None:
             download_manager.cleanup_result_files(result)
 
 
-async def _swap_in(context, imid: str, kind: str, file_id: str, title: str) -> None:
+async def _swap_in(context, imid: str, kind: str, file_id: str, title: str) -> bool:
     cap = f"<b>{_esc(title)}</b>" if title else ""
     try:
         await context.bot.edit_message_media(
             inline_message_id=imid, media=_input_media(kind, file_id, cap)
         )
+        return True
     except TelegramError:
         logger.exception("could not swap the inline placeholder for the media")
+        return False
+
+
+async def rescue_interrupted(app) -> None:
+    """
+    Inline jobs live in memory. After a restart their cards would sit on
+    "Preparing…" forever (and the button would keep saying "still
+    downloading"), so tell those users what happened.
+    """
+    me = app.bot.username or ""
+    for imid in inline_cache.drain_pending():
+        try:
+            await app.bot.edit_message_caption(
+                inline_message_id=imid,
+                caption="⚠️ <b>Interrupted</b> — the bot restarted. Send the link again.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_open_bot_markup(me),
+            )
+        except TelegramError as e:
+            logger.debug("could not flag interrupted inline job: %s", e)

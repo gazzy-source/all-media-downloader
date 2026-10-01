@@ -97,10 +97,12 @@ class TestDownloadSyncGuards:
         self._run()
         guard = hooks["guard"]
         guard({"status": "downloading", "downloaded_bytes": 999})
-        with pytest.raises(yt_dlp.utils.DownloadError, match="max-filesize"):
+        # A cancel, not a DownloadError: yt-dlp's fragment loop swallows the latter.
+        with pytest.raises(dl.JobAborted, match="max-filesize"):
             guard({"status": "downloading", "downloaded_bytes": 1001})
+        assert not isinstance(dl.JobAborted("x"), yt_dlp.utils.DownloadError)
         monkeypatch.setattr(dl, "DOWNLOAD_MAX_SECONDS", -1)
-        with pytest.raises(yt_dlp.utils.DownloadError, match="timed out"):
+        with pytest.raises(dl.JobAborted, match="timed out"):
             guard({"status": "downloading", "downloaded_bytes": 1})
 
 

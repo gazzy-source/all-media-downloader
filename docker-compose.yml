@@ -10,10 +10,15 @@ services:
       POT_PROVIDER_URL: http://bgutil-provider:4416
     depends_on:
       - bgutil-provider
+    # Named volumes, not bind mounts: the image runs as the unprivileged
+    # `bot` user (uid 10001), and a bind-mounted host dir is root-owned, so the
+    # bot could not even create its lock file. Docker seeds a NEW named volume
+    # with the image's ownership. Migrating from the old ./compose-data:
+    #   docker compose cp ./compose-data/. bot:/app/data  (then restart)
     volumes:
-      - ./downloads:/app/downloads
-      - ./compose-data:/app/data
-      - ./temp:/app/temp
+      - bot-downloads:/app/downloads
+      - bot-data:/app/data
+      - bot-temp:/app/temp
       # Optional: only needed for private/age-restricted content now
       # - ./cookies.txt:/app/cookies.txt:ro
     # Hostile input (media, HTML) is parsed here: no privilege escalation, no
@@ -22,6 +27,8 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # Enough for the default 49 MB uploads. With a local Bot API server and a
+    # ~2 GB MAX_FILE_SIZE_MB, raise this: uploads are read into memory.
     mem_limit: 1g
     pids_limit: 256
 
@@ -48,3 +55,8 @@ services:
     # To use with host-installed yt-dlp outside compose, uncomment:
     # ports:
     #   - "127.0.0.1:4416:4416"
+
+volumes:
+  bot-downloads:
+  bot-data:
+  bot-temp:

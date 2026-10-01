@@ -172,7 +172,9 @@ def make_runtime_cookie_copy(source: Path, runtime: Path) -> Path | None:
         if not source.is_file() or source.stat().st_size < 50:
             return None
         runtime.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, runtime)
+        # copyfile, not copy2: the copy must carry ITS OWN (fresh) mtime, or
+        # the hourly sweep of stale per-job jars sees a live one as old.
+        shutil.copyfile(source, runtime)
         try:
             runtime.chmod(0o600)
         except OSError:

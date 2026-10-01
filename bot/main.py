@@ -35,6 +35,7 @@ from bot.handlers.download import handle_callback, handle_message
 from bot.handlers.inline import (
     handle_chosen_inline_result,
     handle_inline_query,
+    rescue_interrupted,
     warm_placeholders,
 )
 from bot.handlers.start import (
@@ -252,6 +253,7 @@ async def post_init(app: Application) -> None:
     app.bot_data["_warmup_task"] = asyncio.create_task(_warm_youtube_pipeline())
     # Inline placeholders: best effort, never blocks startup.
     app.bot_data["_inline_warm_task"] = asyncio.create_task(warm_placeholders(app))
+    app.bot_data["_inline_rescue_task"] = asyncio.create_task(rescue_interrupted(app))
 
     # Command menu only — do NOT overwrite name/description/about from BotFather
     # unless explicitly set in .env (BOT_NAME / BOT_DESCRIPTION / BOT_SHORT_DESCRIPTION).

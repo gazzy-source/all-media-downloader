@@ -13,7 +13,8 @@ from bot.config import PROXY, WARP_ROTATE_COOLDOWN, WARP_ROTATE_ON_BOTCHECK
 logger = logging.getLogger(__name__)
 
 _LOCK = threading.Lock()
-_LAST_ROTATION = 0.0
+_LAST_ROTATION = 0.0  # last attempt — drives the cooldown
+_LAST_SUCCESS = 0.0   # last working rotation — lets concurrent jobs ride it
 
 
 def _warp_cli(*args: str, timeout: float = 15) -> str:
@@ -36,16 +37,16 @@ def rotate_warp_ip() -> bool:
     WARP_ROTATE_COOLDOWN so a video that is blocked for real can't make the
     bot flap the tunnel under every other in-flight download.
     """
-    global _LAST_ROTATION
+    global _LAST_ROTATION, _LAST_SUCCESS
     if not (WARP_ROTATE_ON_BOTCHECK and PROXY):
         return False
     if shutil.which("warp-cli") is None:
         return False
     with _LOCK:
-        since = time.monotonic() - _LAST_ROTATION
-        if _LAST_ROTATION and since < 10:
+        if _LAST_SUCCESS and time.monotonic() - _LAST_SUCCESS < 10:
             # Another job rotated moments ago — its fresh IP is ours too.
             return True
+        since = time.monotonic() - _LAST_ROTATION
         if _LAST_ROTATION and since < WARP_ROTATE_COOLDOWN:
             return False
         _LAST_ROTATION = time.monotonic()
@@ -56,9 +57,16 @@ def rotate_warp_ip() -> bool:
             while time.monotonic() < deadline:
                 if "Connected" in _warp_cli("status", timeout=5):
                     logger.warning("Rotated WARP exit IP after a YouTube bot check")
+                    _LAST_SUCCESS = time.monotonic()
                     return True
                 time.sleep(0.5)
             logger.error("WARP did not reconnect within 15s after rotation")
         except (OSError, subprocess.SubprocessError) as e:
             logger.error("WARP rotation failed: %s", e)
+        # Never leave the tunnel down: every proxied platform depends on it,
+        # and a disconnected WARP would never trigger another rotation.
+        try:
+            _warp_cli("connect")
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.error("WARP reconnect after a failed rotation also failed: %s", e)
         return False

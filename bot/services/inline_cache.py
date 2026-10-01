@@ -75,6 +75,41 @@ def put(url: str, mode: str, *, file_id: str, kind: str, title: str = "") -> Non
         _save(data)
 
 
+def forget(url: str, mode: str) -> None:
+    with _lock:
+        data = _load()
+        if data.pop(_key(url, mode), None) is not None:
+            _save(data)
+
+
+# In-flight inline jobs (inline_message_ids), so a restart can tell those users.
+def add_pending(imid: str) -> None:
+    with _lock:
+        data = _load()
+        pend = data.setdefault("meta|pending", {"kind": "meta", "t": time.time(), "ids": []})
+        if imid not in pend["ids"]:
+            pend["ids"] = (pend["ids"] + [imid])[-200:]
+            _save(data)
+
+
+def drop_pending(imid: str) -> None:
+    with _lock:
+        data = _load()
+        pend = data.get("meta|pending")
+        if pend and imid in pend.get("ids", []):
+            pend["ids"].remove(imid)
+            _save(data)
+
+
+def drain_pending() -> list[str]:
+    with _lock:
+        data = _load()
+        pend = data.pop("meta|pending", None)
+        if pend is not None:
+            _save(data)
+        return list((pend or {}).get("ids", []))
+
+
 def get_meta(name: str) -> str | None:
     """Bot-level values (e.g. the placeholder photos' file_ids)."""
     with _lock:

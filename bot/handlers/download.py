@@ -39,7 +39,7 @@ from bot.services.inflight import add as inflight_add, remove as inflight_remove
 from bot.services.media_detect import detect_mode
 from bot.services.rate_limit import rate_limiter
 from bot.services.session import DownloadSession, sessions
-from bot.utils.safe_fetch import UnsafeURLError, check_public_url
+from bot.utils.safe_fetch import UnresolvableURLError, UnsafeURLError, check_public_url
 from bot.utils.helpers import (
     analysing_percent,
     extract_urls,
@@ -191,11 +191,15 @@ def _is_link_only_post(msg) -> bool:
     A photo/video whose caption carries a link is content in its own right —
     deleting it to make room for the linked media would destroy what was posted.
     """
-    return bool(
-        msg is not None
-        and getattr(msg, "text", None)
-        and getattr(msg, "message_id", None)
-    )
+    text = getattr(msg, "text", None) if msg is not None else None
+    if not text or not getattr(msg, "message_id", None):
+        return False
+    # Only links (and whitespace): "Great talks: url1 url2" is commentary that
+    # would be lost, since the media goes up without a caption.
+    rest = text
+    for u in extract_urls(text, expand=False):
+        rest = rest.replace(u, "")
+    return not rest.strip(" \n\t,;|-•")
 
 
 async def auto_download_flow(
@@ -637,9 +641,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Only the person the button was made for (or an admin). callback_data
         # is client-controlled, so the old "raw URL in the token" fallback let
         # a modified client make the bot fetch and post ANY URL into a group.
-        url = get_url(token, None if user_id in ADMIN_IDS else user_id)
+        chat = update.effective_chat
+        private = chat is not None and chat.type == "private"
+        # Owner-only in private chats. In a group or channel the button belongs
+        # to a link already posted there (and in channels the "owner" is the
+        # channel itself, so no member could ever match). The old raw-URL
+        # fallback is gone, so a token can only ever name a link the bot saw.
+        url = get_url(token, None if (user_id in ADMIN_IDS or not private) else user_id)
         if not url:
-            if query.message:
+            if query.message and private:  # never a public "expired" reply
                 await query.message.reply_text(
                     "🔗 Link expired. Please paste the URL again."
                 )
@@ -800,6 +810,8 @@ async def _refuse_private_url(msg, url: str, *, quiet: bool = False) -> bool:
     try:
         await asyncio.get_running_loop().run_in_executor(None, check_public_url, url)
         return False
+    except UnresolvableURLError:
+        return False  # a typo or dead domain is not "private": yt-dlp will say so
     except UnsafeURLError:
         logger.warning("Refused non-public URL %s", url[:80])
         if not quiet:

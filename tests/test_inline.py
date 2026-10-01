@@ -67,7 +67,13 @@ def ctx(monkeypatch, tmp_path):
     monkeypatch.setattr(inl, "record_download", lambda *a, **k: None)
     monkeypatch.setattr(inl.rate_limiter, "allow", lambda uid: (True, 0))
     monkeypatch.setattr(inl.inline_query_limiter, "allow", lambda uid: (True, 0))
-    return SimpleNamespace(bot=InlineBot())
+    prefetched = []
+
+    async def fake_prefetch(url):
+        prefetched.append(url)
+
+    monkeypatch.setattr(inl, "_prefetch", fake_prefetch)
+    return SimpleNamespace(bot=InlineBot(), prefetched=prefetched)
 
 
 def _update(**kw):

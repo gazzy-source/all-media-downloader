@@ -48,8 +48,8 @@ from telegram.ext import ContextTypes
 
 from bot.config import (
     ADMIN_IDS,
-    AUTO_QUALITY,
     INLINE_ENABLED,
+    INLINE_QUALITY,
     INLINE_QUERIES_PER_HOUR,
     MAX_FILE_SIZE_BYTES,
     STORAGE_CHAT_ID,
@@ -74,6 +74,26 @@ inline_query_limiter = RateLimiter(max_per_hour=INLINE_QUERIES_PER_HOUR)
 
 _TITLE_CACHE: dict[str, tuple[float, str]] = {}
 _TITLE_TTL = 3600.0
+
+# Links being pre-extracted while the user picks Video or Audio. Choosing takes
+# a second or two — enough to finish most of the 2-20s extraction before the
+# download even starts, which then reuses it (DOWNLOAD_REUSE_TTL).
+_PREFETCHING: set[str] = set()
+_BACKGROUND: set[asyncio.Task] = set()  # strong refs: tasks must not be GC'd
+_PREFETCH_SLOTS = asyncio.Semaphore(2)
+
+
+async def _prefetch(url: str) -> None:
+    if url in _PREFETCHING or len(_PREFETCHING) >= 8:
+        return
+    _PREFETCHING.add(url)
+    try:
+        async with _PREFETCH_SLOTS:
+            await asyncio.wait_for(download_manager.extract_info(url), 90)
+    except Exception as e:  # best effort: the download extracts by itself
+        logger.debug("inline prefetch skipped for %s: %s", url[:80], e)
+    finally:
+        _PREFETCHING.discard(url)
 
 
 def _esc(text: str) -> str:
@@ -214,6 +234,10 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     platform = platform_from_url(url)
+    if not (inline_cache.get(url, "video") and inline_cache.get(url, "audio")):
+        task = asyncio.create_task(_prefetch(url))
+        _BACKGROUND.add(task)
+        task.add_done_callback(_BACKGROUND.discard)
     title = await asyncio.get_running_loop().run_in_executor(None, _fetch_title, url)
     label = title or f"{platform} link"
     results = []
@@ -350,16 +374,16 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         result = await download_manager.download(
             # m4a: YouTube's own AAC stream, remuxed — no minute-long MP3
             # re-encode on a small VPS. Telegram plays it as audio natively.
-            url=url, mode=mode, quality=AUTO_QUALITY, audio_format="m4a",
+            url=url, mode=mode, quality=INLINE_QUALITY, audio_format="m4a",
             title_hint="media", progress_cb=on_progress,
         )
         if not result.success or not result.primary:
-            record_download(user_id, url, "", platform, mode, AUTO_QUALITY, False, error=result.error)
+            record_download(user_id, url, "", platform, mode, INLINE_QUALITY, False, error=result.error)
             await caption(f"❌ <b>Download failed</b>\n{_esc(result.error or 'Unknown error')}", force=True, final=True)
             return
         size = result.file_size or result.primary.stat().st_size
         if size > MAX_FILE_SIZE_BYTES:
-            record_download(user_id, url, result.title or "", platform, mode, AUTO_QUALITY,
+            record_download(user_id, url, result.title or "", platform, mode, INLINE_QUALITY,
                             False, file_size=size, error="File too large")
             await caption(
                 f"⚠️ This is <b>{format_size(size)}</b> — over Telegram's "
@@ -386,7 +410,7 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         await _swap_in(context, imid, kind, file_id, title)
         if STORAGE_CHAT_ID is None:
             await _quiet_delete(context, chat, sent.message_id)
-        record_download(user_id, url, title, platform, mode, AUTO_QUALITY, True, file_size=size)
+        record_download(user_id, url, title, platform, mode, INLINE_QUALITY, True, file_size=size)
         logger.info("inline %s delivered in %.1fs (%s): %s", mode,
                     time.monotonic() - started, format_size(size), url[:80])
     except Exception:

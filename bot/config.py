@@ -222,6 +222,23 @@ WARMUP_INTERVAL_MIN: int = int(os.getenv("WARMUP_INTERVAL_MIN", "45"))
 
 # Metadata extract cache TTL (seconds) — speeds repeated DM analyzes
 META_CACHE_TTL: int = int(os.getenv("META_CACHE_TTL", "180"))
+
+# The download reuses the analysis pass's extraction when it is at most this
+# old, instead of extracting the same link again. Measured on the 2-core VPS:
+# a YouTube extraction is 2-20s (mostly the JS challenge solved in deno), the
+# transfer itself 0.3-2s — extracting twice was most of every DM download.
+# Media URLs stay valid for hours; if one has gone stale (or WARP changed
+# IP) the download falls back to a fresh extraction automatically.
+DOWNLOAD_REUSE_TTL: int = int(os.getenv("DOWNLOAD_REUSE_TTL", "1800"))
+# The FIRST download attempt on YouTube also skips the HLS manifest (measured
+# 21.0s -> 10.7s extraction). Retries still extract in full, so HLS remains
+# the fallback the note on YT_LEAN_METADATA asks for.
+YT_LEAN_DOWNLOAD: bool = (os.getenv("YT_LEAN_DOWNLOAD", "1") or "1").strip().lower() not in (
+    "0", "false", "no",
+)
+# Inline results default to 720p: phone-sized, roughly half of 1080p's bytes
+# to fetch and upload, and far more often under Telegram's 50 MB bot limit.
+INLINE_QUALITY: str = (os.getenv("INLINE_QUALITY", "720") or "720").strip().lower()
 AUTO_QUALITY: str = (os.getenv("AUTO_QUALITY", "1080") or "1080").strip().lower()
 if AUTO_QUALITY not in ("480", "720", "1080", "max"):
     AUTO_QUALITY = "1080"

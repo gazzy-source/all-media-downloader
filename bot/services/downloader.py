@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import importlib.util
 import logging
 import re
@@ -23,6 +24,7 @@ from bot.config import (
     DATA_DIR,
     DOWNLOAD_ATTEMPT_BUDGET,
     DOWNLOAD_MAX_BYTES,
+    DOWNLOAD_REUSE_TTL,
     DOWNLOAD_MAX_SECONDS,
     EXTRACT_TIMEOUT,
     FORMAT_FALLBACK,
@@ -40,6 +42,7 @@ from bot.config import (
     PROXY_BLIP_RETRIES,
     SB_GUARD,
     TEMP_DIR,
+    YT_LEAN_DOWNLOAD,
     YT_LEAN_METADATA,
 )
 from bot.utils.ffmpeg import ffmpeg_location_dir
@@ -945,16 +948,25 @@ def _order_yt_strategies(
     return list(base_strats), list(range(len(base_strats)))
 
 
-def _meta_cache_get(url: str) -> dict[str, Any] | None:
+def _meta_cache_get(url: str, max_age: float | None = None) -> dict[str, Any] | None:
+    """
+    Cached extraction. `max_age` defaults to META_CACHE_TTL (re-analysis); the
+    download passes the longer DOWNLOAD_REUSE_TTL — an entry too old to show
+    in the wizard is still good for its media URLs, so it is only dropped
+    once it is too old for both.
+    """
     key = url.strip()
     now = time.time()
+    limit = META_CACHE_TTL if max_age is None else max_age
     with _META_CACHE_LOCK:
         hit = _META_CACHE.get(key)
         if not hit:
             return None
         ts, info = hit
-        if now - ts > META_CACHE_TTL:
+        if now - ts > max(META_CACHE_TTL, DOWNLOAD_REUSE_TTL):
             _META_CACHE.pop(key, None)
+            return None
+        if now - ts > limit:
             return None
         return info
 
@@ -1775,6 +1787,10 @@ class DownloadManager:
             strategies = [{}, {"drop_impersonate": True}]
             orig_indices = [0, 1]
 
+        reused = self._download_from_analysis(opts, url, title_hint, primary)
+        if reused is not None:
+            return reused
+
         last_err: Exception | None = None
         # Budget for transient proxy refusals, shared across the whole ladder so
         # a persistently down relay still fails fast instead of sleeping per step.
@@ -1800,6 +1816,13 @@ class DownloadManager:
                 # Merge so the PO-token provider block survives a client pin.
                 attempt_base["extractor_args"] = _merge_extractor_args(
                     opts.get("extractor_args"), strat["extractor_args"]
+                )
+            if is_yt and YT_LEAN_DOWNLOAD and si == 0:
+                # First attempt only: no HLS manifest round trip (~10s on this
+                # VPS). Every retry below extracts in full, HLS included.
+                attempt_base["extractor_args"] = _merge_extractor_args(
+                    attempt_base.get("extractor_args"),
+                    {"youtube": {"skip": ["hls", "translated_subs"]}},
                 )
             if strat.get("use_cookies") is False:
                 attempt_base.pop("cookiefile", None)
@@ -1958,6 +1981,50 @@ class DownloadManager:
         if last_err:
             raise last_err
         raise RuntimeError("Download failed with all format selectors.")
+
+    def _download_from_analysis(
+        self, opts: dict[str, Any], url: str, title_hint: str, primary: str
+    ) -> tuple[dict[str, Any], str, str] | None:
+        """
+        Download from the analysis pass's extraction instead of repeating it.
+
+        This is yt-dlp's own --load-info-json path: format selection and the
+        download run on the cached info dict. Any failure (expired or IP-bound
+        URL after a WARP rotation, a format gone) returns None and the normal
+        ladder extracts afresh — so this can only make a download faster.
+        """
+        cached = _meta_cache_get(url, max_age=DOWNLOAD_REUSE_TTL)
+        if not cached or not cached.get("formats") or cached.get("_type", "video") != "video":
+            return None
+        started = time.monotonic()
+        reuse_opts = dict(opts)
+        reuse_opts["format"] = primary
+        try:
+            with yt_dlp.YoutubeDL(reuse_opts) as ydl:
+                info = ydl.process_ie_result(copy.deepcopy(cached), download=True)
+                if info is None:
+                    return None
+                prepared = ydl.prepare_filename(info)
+            logger.info(
+                "download reused the analysis extraction (%.1fs): %s",
+                time.monotonic() - started, url[:80],
+            )
+            return info, prepared, str(info.get("title") or title_hint)[:200]
+        except Exception as e:
+            logger.warning(
+                "Reusing the analysis failed (%s) — extracting afresh: %s",
+                str(e).split("\n")[-1][:120], url[:80],
+            )
+            # A half-written file must not be resumed by the fresh attempt.
+            outtmpl = opts.get("outtmpl")
+            work_dir = Path(outtmpl).parent if isinstance(outtmpl, str) else None
+            if work_dir is not None and work_dir.is_dir() and work_dir != TEMP_DIR:
+                for f in work_dir.iterdir():
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+            return None
 
     def _download_image_page(
         self,

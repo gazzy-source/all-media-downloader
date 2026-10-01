@@ -26,6 +26,19 @@ _lock = threading.Lock()
 _data: dict[str, dict[str, Any]] | None = None
 
 
+def repeat_key(mode: str, quality: str = "", audio_format: str = "") -> str | None:
+    """
+    Cache slot for one deliverable: the same link at the same quality (or
+    audio format) is the same file wherever it was first fetched — inline,
+    DM or a group. Subtitled and image downloads are not cached.
+    """
+    if mode == "audio":
+        return f"audio@{audio_format or 'mp3'}"
+    if mode == "video":
+        return f"video@{quality or 'max'}"
+    return None
+
+
 def _norm(url: str) -> str:
     return (url or "").strip().split("#")[0]
 

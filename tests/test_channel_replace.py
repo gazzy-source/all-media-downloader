@@ -146,7 +146,7 @@ class TestChannelFlowUsesReplacement:
 
         calls = []
 
-        async def spy(context, chat_id, mid, path, result):
+        async def spy(context, chat_id, mid, path, result, **kw):
             calls.append(mid)
             return "replaced"
 

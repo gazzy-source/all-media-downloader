@@ -122,7 +122,7 @@ class TestInlineSwapFailures:
         monkeypatch.setattr(hd, "_send_media", fake_send)
         bot = InlineBot(refuse_media=True)
         await inl.handle_chosen_inline_result(_chosen(), SimpleNamespace(bot=bot))
-        assert inline_cache.get("https://youtu.be/abc", "video") is None
+        assert inline_cache.get("https://youtu.be/abc", inl._key("video")) is None
         text, markup = bot.captions[-1]
         assert "refused" in text and markup.inline_keyboard[0][0].url
 
@@ -142,7 +142,7 @@ class TestInlineSwapFailures:
         bot = InlineBot()
         await inl.handle_chosen_inline_result(_chosen(), SimpleNamespace(bot=bot))
         assert isinstance(bot.media[0], InputMediaAnimation)
-        assert inline_cache.get("https://youtu.be/abc", "video")["kind"] == "animation"
+        assert inline_cache.get("https://youtu.be/abc", inl._key("video"))["kind"] == "animation"
 
     async def test_long_errors_fit_the_caption_limit(self, inline_env, monkeypatch):
         async def fake_download(**kw):

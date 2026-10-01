@@ -1199,7 +1199,10 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 # user by resending an age-restricted link.
                 if (
                     "not a bot" in err
-                    and url != WARMUP_URL  # background job: never cut users' transfers
+                    # Background warmup: rotate only while no one is
+                    # downloading — then a flagged IP gets replaced BEFORE a
+                    # user hits it, without cutting anyone's transfer.
+                    and (url != WARMUP_URL or download_manager.active == 0)
                     and _platform_flags(urlparse(url).netloc.lower())["yt"]
                     and opts.get("proxy")
                     and not any(s.get("_warp_retry") for s in strats)

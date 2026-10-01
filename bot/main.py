@@ -64,6 +64,13 @@ logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from telegram.error import NetworkError
+
+    if isinstance(context.error, NetworkError) and update is None:
+        # Telegram's own hiccups (502 Bad Gateway, timeouts) while polling:
+        # PTB retries by itself. Not a bug, not worth a traceback.
+        logger.warning("Telegram network hiccup (retrying): %s", context.error)
+        return
     logger.exception("Unhandled error: %s", context.error)
     # Duck-typed access: works for Update and any object carrying effective_message
     msg = getattr(update, "effective_message", None)
@@ -189,6 +196,25 @@ async def _warm_youtube_pipeline() -> None:
         )
 
 
+async def _recheck_pot() -> None:
+    """
+    The provider container often finishes booting after the bot (seen after
+    reboots and package upgrades). Re-check for a few minutes so the log says
+    when it recovered — and so the first YouTube requests are not blamed on it.
+    """
+    from bot.services.downloader import pot_provider_mint_check
+
+    for _ in range(10):
+        await asyncio.sleep(30)
+        ok, detail = await asyncio.get_running_loop().run_in_executor(
+            None, pot_provider_mint_check
+        )
+        if ok:
+            logger.info("YouTube: PO-token provider recovered (%s)", detail)
+            return
+    logger.error("YouTube: PO-token provider still cannot mint after 5 minutes")
+
+
 async def post_init(app: Application) -> None:
     from bot.utils.ffmpeg import find_ffmpeg
 
@@ -227,6 +253,7 @@ async def post_init(app: Application) -> None:
                 detail,
             )
         else:
+            app.bot_data["_pot_recheck_task"] = asyncio.create_task(_recheck_pot())
             logger.warning(
                 "YouTube: PO-token provider answers but CANNOT MINT (%s). "
                 "Expect 'Sign in to confirm you're not a bot' on YouTube. If "

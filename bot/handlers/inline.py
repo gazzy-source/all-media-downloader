@@ -107,6 +107,11 @@ def _esc(text: str) -> str:
     return html.escape(text or "", quote=False)
 
 
+def _key(mode: str) -> str:
+    """Cache slot shared with DM/group downloads of the same link+quality."""
+    return inline_cache.repeat_key(mode, INLINE_QUALITY, "m4a")
+
+
 def _result_id(kind: str, url: str) -> str:
     """kind: 'vp'/'ap' placeholder, 'vc'/'ac' cached. Max 64 bytes."""
     return f"{kind}:{hashlib.sha1(url.encode()).hexdigest()[:24]}"
@@ -243,7 +248,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     platform = platform_from_url(url)
-    if not (inline_cache.get(url, "video") and inline_cache.get(url, "audio")):
+    if not (inline_cache.get(url, _key("video")) and inline_cache.get(url, _key("audio"))):
         task = asyncio.create_task(_prefetch(url))
         _BACKGROUND.add(task)
         task.add_done_callback(_BACKGROUND.discard)
@@ -251,7 +256,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     label = title or f"{platform} link"
     results = []
     for code, mode in MODES.items():
-        hit = inline_cache.get(url, mode)
+        hit = inline_cache.get(url, _key(mode))
         if hit:
             results.append(_cached_result(code, mode, url, hit))
             continue
@@ -386,11 +391,11 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         await caption(f"🚫 {_esc(PRIVATE_URL_ERROR)}", force=True, final=True)
         return
 
-    hit = inline_cache.get(url, mode)
+    hit = inline_cache.get(url, _key(mode))
     if hit:  # fetched by someone else while this user was choosing
         if await _swap_in(context, imid, hit["kind"], hit["file_id"], hit.get("title", "")):
             return
-        inline_cache.forget(url, mode)  # Telegram refused it: fetch afresh below
+        inline_cache.forget(url, _key(mode))  # Telegram refused it: fetch afresh below
 
     async def on_progress(pct: float, msg: str) -> None:
         # The last stages (finishing / converting) must always show — dropped
@@ -447,7 +452,7 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         # Cached only once Telegram has accepted it in a message: an invalid
         # file_id in the cache would make every later inline answer for this
         # link fail as a whole.
-        inline_cache.put(url, mode, file_id=file_id, kind=kind, title=title)
+        inline_cache.put(url, _key(mode), file_id=file_id, kind=kind, title=title)
         if STORAGE_CHAT_ID is None:
             await _quiet_delete(context, chat, sent.message_id)
         record_download(user_id, url, title, platform, mode, INLINE_QUALITY, True, file_size=size)

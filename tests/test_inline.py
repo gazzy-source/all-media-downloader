@@ -108,7 +108,7 @@ class TestInlineQuery:
         assert len(ctx.bot.photos) == 2
 
     async def test_cached_link_answers_with_the_finished_file(self, ctx):
-        inline_cache.put("https://youtu.be/abc", "video", file_id="VID1", kind="video", title="T")
+        inline_cache.put("https://youtu.be/abc", inl._key("video"), file_id="VID1", kind="video", title="T")
         q = FakeInlineQuery("https://youtu.be/abc")
         await inl.handle_inline_query(_update(inline_query=q), ctx)
         results, _ = q.answers[0]
@@ -160,7 +160,7 @@ class TestChosenResult:
         assert uploads == [(1, True)], "uploaded silently to the storage chat"
         imid, media = ctx.bot.media_edits[0]
         assert imid == "IMID" and isinstance(media, InputMediaVideo) and media.media == "NEWVID"
-        assert inline_cache.get("https://youtu.be/abc", "video")["file_id"] == "NEWVID"
+        assert inline_cache.get("https://youtu.be/abc", inl._key("video"))["file_id"] == "NEWVID"
         assert (1, 9) in ctx.bot.deleted, "storage copy removed from the admin DM"
         assert cleaned == [res]
 

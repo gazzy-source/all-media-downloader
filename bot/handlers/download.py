@@ -33,6 +33,7 @@ from bot.keyboards.menus import (
     quality_keyboard,
     subtitle_lang_keyboard,
 )
+from bot.services import inline_cache
 from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
 from bot.services.history import record_download
 from bot.services.inflight import add as inflight_add, remove as inflight_remove
@@ -273,6 +274,24 @@ async def auto_download_flow(
         kind = "🎵 Audio"
     else:
         kind = f"🎥 {q_label}"
+    repeat = inline_cache.repeat_key(mode, quality, "mp3")
+    hit = inline_cache.get(url, repeat) if repeat else None
+    if hit:
+        is_chan = chat.type == "channel"
+        title = _esc((hit.get("title") or "Media")[:100])
+        sent = await _send_cached(
+            context, chat.id, hit,
+            "" if is_chan else f"🎬 <b>{title}</b>\n⚡ Instant · All-Media Downloader · Gazzy Labs",
+            reply_markup=None if is_chan else after_download_keyboard(url, user_id=actor),
+        )
+        if sent is not None:
+            if (is_chan and CHANNEL_REPLACE_LINK and replace_source
+                    and _is_link_only_post(msg)):
+                await _try_delete(context, chat.id, msg.message_id)
+            record_download(actor, url, hit.get("title") or "", platform, mode, quality, True)
+            return True
+        inline_cache.forget(url, repeat)
+
     status = await msg.reply_text(
         f"⚡ <b>Downloading</b> · {kind}",
         parse_mode=ParseMode.HTML,
@@ -398,13 +417,15 @@ async def auto_download_flow(
             and _is_link_only_post(msg)
         ):
             outcome = await _replace_channel_post(
-                context, chat.id, msg.message_id, path, result
+                context, chat.id, msg.message_id, path, result,
+                remember=lambda sent: _remember_upload(url, repeat, sent, result.title or ""),
             )
             logger.info("Channel post handling: %s", outcome)
         else:
-            await _send_media(
+            sent = await _send_media(
                 context, chat.id, path, result, caption, reply_markup=actions
             )
+            _remember_upload(url, repeat, sent, result.title or "")
         record_download(
             actor, url, result.title or "", platform, mode, quality, True,
             file_size=size,
@@ -797,6 +818,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
 
+def _sent_file(msg) -> tuple[str, str] | None:
+    """(kind, file_id) of a message we uploaded; animation first (see inline)."""
+    for kind in ("animation", "video", "audio", "document"):
+        obj = getattr(msg, kind, None)
+        if obj is not None and getattr(obj, "file_id", None):
+            return kind, obj.file_id
+    photos = getattr(msg, "photo", None)
+    if photos:
+        return "photo", photos[-1].file_id
+    return None
+
+
+def _remember_upload(url: str, key: str | None, sent, title: str) -> None:
+    """After a real upload: the next request for this link+quality is instant."""
+    found = _sent_file(sent) if key and sent is not None else None
+    if found:
+        inline_cache.put(url, key, file_id=found[1], kind=found[0], title=title or "")
+
+
+async def _send_cached(context, chat_id: int, hit: dict, caption: str, reply_markup=None):
+    """Re-send a file Telegram already has. Returns the Message, or None on refusal."""
+    field = hit.get("kind") if hit.get("kind") in ("video", "audio", "animation", "photo") else "document"
+    send = getattr(context.bot, f"send_{field}")
+    kw: dict = {field: hit["file_id"], "reply_markup": reply_markup}
+    if caption:
+        kw.update(caption=caption[:1024], parse_mode=ParseMode.HTML)
+    try:
+        return await send(chat_id, **kw)
+    except TelegramError as e:
+        # A file_id Telegram no longer honours: forget it, download normally.
+        logger.info("cached file refused (%s) — downloading afresh", e)
+        return None
+
+
 _MODES = frozenset({"video", "video_subs", "audio", "image"})
 _AUDIO_FORMATS = frozenset({"mp3", "m4a", "opus"})
 
@@ -956,6 +1011,28 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         )
         return
 
+    repeat = inline_cache.repeat_key(mode, quality, session.audio_format)
+    hit = inline_cache.get(session.url, repeat) if repeat else None
+    if hit:
+        # Fetched before (by anyone, inline or not) at this exact quality:
+        # Telegram already has the file, so this is instant.
+        title = _esc((hit.get("title") or session.title or "Media")[:100])
+        sent = await _send_cached(
+            context, chat_id, hit,
+            f"🎬 <b>{title}</b>\n⚡ Instant · All-Media Downloader",
+            reply_markup=after_download_keyboard(session.url, user_id=session.user_id),
+        )
+        if sent is not None:
+            record_download(session.user_id, session.url, session.title, session.platform,
+                            mode, quality, True)
+            sessions.remove(session.session_id)
+            try:
+                await query.message.delete()
+            except TelegramError:
+                pass
+            return
+        inline_cache.forget(session.url, repeat)
+
     inflight_add(chat_id, query.message.message_id)
     try:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
@@ -1070,9 +1147,10 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
             )
         else:
             # One output only: media with caption + action buttons
-            await _send_media(
+            sent = await _send_media(
                 context, chat_id, path, result, caption, reply_markup=actions
             )
+            _remember_upload(session.url, repeat, sent, result.title or session.title)
             if result.subtitle_file and result.subtitle_file.exists() and mode == "video_subs":
                 try:
                     await context.bot.send_document(
@@ -1145,7 +1223,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
 
 
 async def _replace_channel_post(
-    context, chat_id: int, source_message_id: int, path: Path, result
+    context, chat_id: int, source_message_id: int, path: Path, result, remember=None
 ) -> str:
     """
     Post the media as a new message, then remove the link post.
@@ -1159,7 +1237,9 @@ async def _replace_channel_post(
     (the bot needs the "Delete messages" right); the media is delivered either
     way.
     """
-    await _send_media(context, chat_id, path, result, caption="", reply_markup=None)
+    sent = await _send_media(context, chat_id, path, result, caption="", reply_markup=None)
+    if remember is not None:
+        remember(sent)
     if await _try_delete(context, chat_id, source_message_id):
         return "replaced"
     return "sent"

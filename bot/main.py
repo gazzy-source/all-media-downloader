@@ -11,8 +11,10 @@ from telegram import Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChosenInlineResultHandler,
     CommandHandler,
     ContextTypes,
+    InlineQueryHandler,
     MessageHandler,
     filters,
 )
@@ -30,6 +32,11 @@ from bot.config import (
     WARMUP_URL,
 )
 from bot.handlers.download import handle_callback, handle_message
+from bot.handlers.inline import (
+    handle_chosen_inline_result,
+    handle_inline_query,
+    warm_placeholders,
+)
 from bot.handlers.start import (
     cmd_cancel,
     cmd_help,
@@ -243,6 +250,8 @@ async def post_init(app: Application) -> None:
     # user waits on this. Held on the Application so it is not garbage
     # collected mid-flight, which asyncio permits for bare tasks.
     app.bot_data["_warmup_task"] = asyncio.create_task(_warm_youtube_pipeline())
+    # Inline placeholders: best effort, never blocks startup.
+    app.bot_data["_inline_warm_task"] = asyncio.create_task(warm_placeholders(app))
 
     # Command menu only — do NOT overwrite name/description/about from BotFather
     # unless explicitly set in .env (BOT_NAME / BOT_DESCRIPTION / BOT_SHORT_DESCRIPTION).
@@ -326,6 +335,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
+    # Inline mode: @bot <link> in any chat
+    app.add_handler(InlineQueryHandler(handle_inline_query))
+    app.add_handler(ChosenInlineResultHandler(handle_chosen_inline_result))
     # Private + group messages
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)

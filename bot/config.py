@@ -124,6 +124,20 @@ DOWNLOAD_MAX_BYTES: int = int(
 )
 DOWNLOAD_MAX_SECONDS: int = int(os.getenv("DOWNLOAD_MAX_SECONDS", "900"))
 
+# Inline mode (@bot <link> in any chat). The finished file is uploaded once to
+# a "storage" chat to get a reusable file_id, then swapped into the inline
+# message. STORAGE_CHAT_ID: a private channel with the bot as admin (kept as an
+# archive). Unset = the first admin's private chat, where each upload is
+# deleted again right after (file_ids stay valid after deletion).
+INLINE_ENABLED: bool = os.getenv("INLINE_ENABLED", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+STORAGE_CHAT_ID: int | None = (
+    int(os.environ["STORAGE_CHAT_ID"]) if os.getenv("STORAGE_CHAT_ID", "").strip() else None
+)
+# Inline queries arrive per keystroke; this caps answers per user per hour.
+INLINE_QUERIES_PER_HOUR: int = int(os.getenv("INLINE_QUERIES_PER_HOUR", "300"))
+
 # Warm the YouTube pipeline in the background right after startup.
 #
 # The first YouTube analysis in a fresh process pays costs no later one does:

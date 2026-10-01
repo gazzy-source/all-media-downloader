@@ -93,6 +93,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # must not download (and in channels, repost) the whole thing again.
     if update.edited_message or update.edited_channel_post:
         return
+    # A message sent through our own inline mode is already being handled by
+    # the inline flow — auto-download in a group must not fetch it twice.
+    via = getattr(update.effective_message, "via_bot", None)
+    if via is not None and via.id == context.bot.id:
+        return
     # Channel posts often have no effective_user — still process them
     if not update.effective_user and not _is_channel_chat(update):
         return
@@ -1171,8 +1176,14 @@ async def _send_media(
     caption: str,
     reply_markup=None,
     attempts: int = 3,
-) -> None:
-    """Upload media with long timeouts and retries on TimedOut."""
+    *,
+    silent: bool = False,
+):
+    """
+    Upload media with long timeouts and retries on TimedOut.
+
+    Returns the sent Message (its file_id is what inline mode re-sends).
+    """
     filename = path.name
     if len(caption) > 1024:
         caption = caption[:1000] + "…"
@@ -1180,10 +1191,10 @@ async def _send_media(
     last_err: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            await _send_media_once(
-                context, chat_id, path, result, caption, filename, reply_markup
+            return await _send_media_once(
+                context, chat_id, path, result, caption, filename, reply_markup,
+                silent=silent,
             )
-            return
         except RetryAfter as e:
             last_err = e
             wait = int(getattr(e, "retry_after", 5)) + 1
@@ -1226,8 +1237,12 @@ async def _send_media_once(
     caption: str,
     filename: str,
     reply_markup=None,
-) -> None:
+    *,
+    silent: bool = False,
+):
     kw = dict(_UPLOAD_KW)
+    if silent:
+        kw["disable_notification"] = True
     # Empty caption → omit (clean channel posts)
     cap = (caption or "").strip()
     cap_kw: dict = {}
@@ -1240,7 +1255,7 @@ async def _send_media_once(
     if result.is_audio:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
         with path.open("rb") as f:
-            await context.bot.send_audio(
+            return await context.bot.send_audio(
                 chat_id,
                 audio=InputFile(f, filename=filename),
                 title=result.title[:64] if result.title else None,
@@ -1248,13 +1263,12 @@ async def _send_media_once(
                 **cap_kw,
                 **kw,
             )
-        return
 
     if result.is_image:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
         with path.open("rb") as f:
             try:
-                await context.bot.send_photo(
+                return await context.bot.send_photo(
                     chat_id,
                     photo=InputFile(f, filename=filename),
                     **cap_kw,
@@ -1269,26 +1283,24 @@ async def _send_media_once(
             except TelegramError as e:
                 logger.info("send_photo failed (%s), falling back to document", e)
                 f.seek(0)
-                await context.bot.send_document(
+                return await context.bot.send_document(
                     chat_id,
                     document=InputFile(f, filename=filename),
                     **cap_kw,
                     **kw,
                 )
-        return
 
     if result.is_video:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
         with path.open("rb") as f:
             try:
-                await context.bot.send_video(
+                return await context.bot.send_video(
                     chat_id,
                     video=InputFile(f, filename=filename),
                     supports_streaming=True,
                     **cap_kw,
                     **kw,
                 )
-                return
             except RetryAfter:
                 # Flood control must be waited out by the retry loop —
                 # falling back to document here would hit the same limit again.
@@ -1298,17 +1310,16 @@ async def _send_media_once(
             except TelegramError as e:
                 logger.info("send_video failed (%s), falling back to document", e)
                 f.seek(0)
-                await context.bot.send_document(
+                return await context.bot.send_document(
                     chat_id,
                     document=InputFile(f, filename=filename),
                     **cap_kw,
                     **kw,
                 )
-                return
 
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
     with path.open("rb") as f:
-        await context.bot.send_document(
+        return await context.bot.send_document(
             chat_id,
             document=InputFile(f, filename=filename),
             **cap_kw,

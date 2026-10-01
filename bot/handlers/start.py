@@ -76,6 +76,17 @@ Built with ❤️ by <b>Gazzy Labs</b>
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message:
         return
+    # t.me/<bot>?start=dl_<token>: inline mode's "Open bot" for a file too big
+    # to send inline — continue with the normal quality wizard for that link.
+    args = getattr(context, "args", None) or []
+    if args and args[0].startswith("dl_") and update.effective_user:
+        from bot.handlers.download import start_url_flow
+        from bot.services.url_tokens import get_url
+
+        url = get_url(args[0][3:], update.effective_user.id)
+        if url:
+            await start_url_flow(update, context, url)
+            return
     await update.effective_message.reply_text(
         WELCOME,
         parse_mode=ParseMode.HTML,

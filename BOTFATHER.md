@@ -95,3 +95,11 @@ If the token ever leaks (chat, screenshot, git history):
 1. BotFather → your bot → **API Token** → **Revoke**  
 2. Put the new token in `.env` only  
 3. Restart the bot  
+
+## Inline mode
+
+1. `/setinline` → pick the bot → placeholder: `Paste a media link…`
+2. `/setinlinefeedback` → pick the bot → **Enabled**. Without it the bot never
+   learns which result was chosen, and the placeholder never turns into media.
+
+Then type `@yourbot https://…` in any chat and pick 🎬 Video or 🎵 Audio.

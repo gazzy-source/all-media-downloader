@@ -26,6 +26,7 @@ class InlineBot:
 
     def __init__(self):
         self.photos, self.deleted, self.captions, self.media_edits = [], [], [], []
+        self.markups = []
         self._mid = 100
 
     async def send_photo(self, chat_id, photo=None, **kw):
@@ -39,6 +40,7 @@ class InlineBot:
 
     async def edit_message_caption(self, inline_message_id=None, caption=None, **kw):
         self.captions.append(caption)
+        self.markups.append(kw.get("reply_markup"))
 
     async def edit_message_media(self, inline_message_id=None, media=None, **kw):
         self.media_edits.append((inline_message_id, media))
@@ -192,6 +194,7 @@ class TestChosenResult:
         monkeypatch.setattr(hd, "_send_media", lambda *a, **k: pytest.fail("must not upload"))
         await inl.handle_chosen_inline_result(_update(chosen_inline_result=_chosen("vp:x")), ctx)
         assert "Open bot" in ctx.bot.captions[-1] and ctx.bot.media_edits == []
+        assert ctx.bot.markups[-1].inline_keyboard[0][0].url.startswith("https://t.me/mediabot?start=dl_")
 
     async def test_failure_is_shown_in_the_message(self, ctx, monkeypatch):
         async def fake_download(**kw):
@@ -248,3 +251,68 @@ class TestDeepLinkAndGroups:
 
 def test_result_ids_fit_telegram_limit():
     assert len(inl._result_id("vp", "https://example.com/" + "x" * 500)) <= 64
+
+
+class TestNoDuplicateDownloads:
+    async def test_placeholder_button_does_not_open_the_bot(self, ctx):
+        q = FakeInlineQuery("https://youtu.be/abc")
+        await inl.handle_inline_query(_update(inline_query=q), ctx)
+        btn = q.answers[0][0][0].reply_markup.inline_keyboard[0][0]
+        assert btn.callback_data == "inl:wait" and btn.url is None
+
+    async def test_progress_keeps_the_wait_button(self, ctx, monkeypatch, tmp_path):
+        async def fake_download(**kw):
+            await kw["progress_cb"](40, "x")
+            return DownloadResult(success=False, error="nope", mode="video")
+
+        monkeypatch.setattr(inl.download_manager, "download", fake_download)
+        monkeypatch.setattr(inl.download_manager, "cleanup_result_files", lambda r: None)
+        await inl.handle_chosen_inline_result(_update(chosen_inline_result=_chosen("vp:x")), ctx)
+        during = [m.inline_keyboard[0][0] for m in ctx.bot.markups[:-1]]
+        assert all(b.callback_data == "inl:wait" for b in during)
+        assert ctx.bot.markups[-1].inline_keyboard[0][0].url  # failure offers the bot
+
+    async def test_finishing_stage_is_never_throttled(self, ctx, monkeypatch, tmp_path):
+        async def fake_download(**kw):
+            await kw["progress_cb"](7, "early")
+            await kw["progress_cb"](100, "Finishing")  # within 3s of the last edit
+            return DownloadResult(success=False, error="nope", mode="video")
+
+        monkeypatch.setattr(inl.download_manager, "download", fake_download)
+        monkeypatch.setattr(inl.download_manager, "cleanup_result_files", lambda r: None)
+        await inl.handle_chosen_inline_result(_update(chosen_inline_result=_chosen("vp:x")), ctx)
+        assert any("Finishing" in (c or "") for c in ctx.bot.captions)
+
+    async def test_inline_audio_skips_the_mp3_reencode(self, ctx, monkeypatch):
+        seen = {}
+
+        async def fake_download(**kw):
+            seen.update(kw)
+            return DownloadResult(success=False, error="nope", mode="audio")
+
+        monkeypatch.setattr(inl.download_manager, "download", fake_download)
+        monkeypatch.setattr(inl.download_manager, "cleanup_result_files", lambda r: None)
+        await inl.handle_chosen_inline_result(_update(chosen_inline_result=_chosen("ap:x")), ctx)
+        assert seen["audio_format"] == "m4a"
+
+    async def test_wait_button_just_reassures(self, fx):
+        from tests.conftest import FakeCallbackQuery
+
+        q = FakeCallbackQuery(data="inl:wait")
+        await hd.handle_callback(fx.update(callback_query=q), fx.ctx)
+        assert "Still downloading" in q.answers[0][0]
+
+
+def test_suite_never_touches_real_data():
+    """Running the tests on the server used to write into its data/."""
+    import os
+    from pathlib import Path
+
+    import bot.config as cfg
+    import bot.services.history as history
+    import bot.services.inflight as inflight
+
+    real = (Path(cfg.BASE_DIR) / "data").resolve()
+    for p in (cfg.DATA_DIR, history._HISTORY_FILE, inflight._PATH, inline_cache._PATH):
+        assert real not in Path(p).resolve().parents and Path(p).resolve() != real
+    assert not os.path.isfile(cfg.COOKIES_FILE or ""), "tests must run without cookies"

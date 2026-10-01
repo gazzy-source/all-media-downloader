@@ -26,7 +26,9 @@ MAX_FILE_SIZE_BYTES: int = int(MAX_FILE_SIZE_MB * 1024 * 1024)
 
 DOWNLOAD_DIR: Path = Path(os.getenv("DOWNLOAD_DIR", str(BASE_DIR / "downloads")))
 TEMP_DIR: Path = Path(os.getenv("TEMP_DIR", str(BASE_DIR / "temp")))
-DATA_DIR: Path = BASE_DIR / "data"
+# Overridable so the test suite can never write into a live deployment's data
+# (history, stats, in-flight jobs, inline cache, cookie copies).
+DATA_DIR: Path = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
 
 _cookies_env = (os.getenv("COOKIES_FILE") or "").strip()
 if _cookies_env:

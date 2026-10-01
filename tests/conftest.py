@@ -20,10 +20,15 @@ if str(ROOT) not in sys.path:
 _SANDBOX = Path(tempfile.mkdtemp(prefix="amb_test_"))
 os.environ["TEMP_DIR"] = str(_SANDBOX / "temp")
 os.environ["DOWNLOAD_DIR"] = str(_SANDBOX / "downloads")
+# Never the deployment's data/: running the suite on the server used to append
+# fake rows to the real history.json / stats.json and touch inflight.json.
+os.environ["DATA_DIR"] = str(_SANDBOX / "data")
 os.environ["AUTO_DOWNLOAD_ALWAYS"] = "0"
 os.environ["DM_FAST_AUTO"] = "0"
 os.environ["AUTO_DOWNLOAD_GROUPS"] = "1"
-os.environ.pop("COOKIES_FILE", None)  # keep cookies out of the test run
+# Keep cookies out of the test run. Unsetting is not enough: config falls back
+# to <app>/cookies.txt, which on the server is the operator's real login.
+os.environ["COOKIES_FILE"] = str(_SANDBOX / "no-cookies.txt")
 
 
 # ---------------------------------------------------------------------------

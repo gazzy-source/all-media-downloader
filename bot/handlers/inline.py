@@ -148,8 +148,11 @@ async def warm_placeholders(app) -> None:
     """Upload both placeholders at startup so no user's first query waits on it."""
     if not INLINE_ENABLED:
         return
-    for mode in ("video", "audio"):
-        await _placeholder_file_id(app, mode)
+    try:
+        ok = [m for m in ("video", "audio") if await _placeholder_file_id(app, m)]
+        logger.info("Inline mode ready (placeholders: %s)", ", ".join(ok) or "none")
+    except Exception:
+        logger.exception("Inline placeholder warmup failed")
 
 
 async def _quiet_delete(context, chat_id: int, message_id: int) -> None:
@@ -159,9 +162,21 @@ async def _quiet_delete(context, chat_id: int, message_id: int) -> None:
         pass
 
 
-def _open_bot_markup(bot_username: str, start: str = "inline") -> InlineKeyboardMarkup:
+WAIT_CALLBACK = "inl:wait"
+
+
+def _preparing_markup() -> InlineKeyboardMarkup:
     # An inline keyboard is REQUIRED: without one Telegram omits the
     # inline_message_id, and the message could never be edited into the media.
+    # It must NOT lead anywhere while the download runs — an "Open bot" link
+    # here started a second, parallel download of the same link in the DM.
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⏳ Preparing…", callback_data=WAIT_CALLBACK)]]
+    )
+
+
+def _open_bot_markup(bot_username: str, start: str = "inline") -> InlineKeyboardMarkup:
+    """Only once the inline attempt is over (failed / too big for Telegram)."""
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("🤖 Open bot", url=f"https://t.me/{bot_username}?start={start}")]]
     )
@@ -200,7 +215,6 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     platform = platform_from_url(url)
     title = await asyncio.get_running_loop().run_in_executor(None, _fetch_title, url)
     label = title or f"{platform} link"
-    me = context.bot.username or ""
     results = []
     for code, mode in MODES.items():
         hit = inline_cache.get(url, mode)
@@ -210,7 +224,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         photo = await _placeholder_file_id(context, mode)
         if not photo:
             continue
-        verb = "🎬 Video" if mode == "video" else "🎵 Audio (MP3)"
+        verb = "🎬 Video" if mode == "video" else "🎵 Audio"
         results.append(
             InlineQueryResultCachedPhoto(
                 id=_result_id(f"{code}p", url),
@@ -219,7 +233,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
                 description=f"{platform} — downloads after you send it",
                 caption=f"⏳ <b>Preparing</b> {_esc(label)}…",
                 parse_mode=ParseMode.HTML,
-                reply_markup=_open_bot_markup(me),
+                reply_markup=_preparing_markup(),
             )
         )
     if not results:
@@ -292,11 +306,12 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         return
     url, user_id, imid = urls[0], ch.from_user.id, ch.inline_message_id
     me = context.bot.username or ""
-    deep = f"dl_{put_url(url, user_id)}"
-    markup = _open_bot_markup(me, deep)
+    give_up = _open_bot_markup(me, f"dl_{put_url(url, user_id)}")
     last = {"t": 0.0}
+    started = time.monotonic()
+    logger.info("inline %s chosen by %s: %s", mode, user_id, url[:80])
 
-    async def caption(text: str, *, force: bool = False) -> None:
+    async def caption(text: str, *, force: bool = False, final: bool = False) -> None:
         now = time.monotonic()
         if not force and now - last["t"] < 3:
             return  # Telegram limits how often one message may be edited
@@ -304,17 +319,17 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         try:
             await context.bot.edit_message_caption(
                 inline_message_id=imid, caption=text, parse_mode=ParseMode.HTML,
-                reply_markup=markup,
+                reply_markup=give_up if final else _preparing_markup(),
             )
         except TelegramError:
             pass
 
     allowed, retry = rate_limiter.allow(user_id)
     if not allowed and user_id not in ADMIN_IDS:
-        await caption(f"⏳ Rate limit reached — try again in {retry}s.", force=True)
+        await caption(f"⏳ Rate limit reached — try again in {retry}s.", force=True, final=True)
         return
     if not await _is_public(url):
-        await caption(f"🚫 {_esc(PRIVATE_URL_ERROR)}", force=True)
+        await caption(f"🚫 {_esc(PRIVATE_URL_ERROR)}", force=True, final=True)
         return
 
     hit = inline_cache.get(url, mode)
@@ -323,19 +338,23 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         return
 
     async def on_progress(pct: float, msg: str) -> None:
-        await caption(f"{progress_bar(pct)}\n<code>{_esc(msg)}</code>")
+        # The last stages (finishing / converting) must always show — dropped
+        # by the throttle, the card sat on an early "7%" for the whole tail.
+        await caption(f"{progress_bar(pct)}\n<code>{_esc(msg)}</code>", force=pct >= 99)
 
     await caption("⏳ <b>Starting…</b>", force=True)
     result = None
     platform = platform_from_url(url)
     try:
         result = await download_manager.download(
-            url=url, mode=mode, quality=AUTO_QUALITY, audio_format="mp3",
+            # m4a: YouTube's own AAC stream, remuxed — no minute-long MP3
+            # re-encode on a small VPS. Telegram plays it as audio natively.
+            url=url, mode=mode, quality=AUTO_QUALITY, audio_format="m4a",
             title_hint="media", progress_cb=on_progress,
         )
         if not result.success or not result.primary:
             record_download(user_id, url, "", platform, mode, AUTO_QUALITY, False, error=result.error)
-            await caption(f"❌ <b>Download failed</b>\n{_esc(result.error or 'Unknown error')}", force=True)
+            await caption(f"❌ <b>Download failed</b>\n{_esc(result.error or 'Unknown error')}", force=True, final=True)
             return
         size = result.file_size or result.primary.stat().st_size
         if size > MAX_FILE_SIZE_BYTES:
@@ -345,12 +364,12 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
                 f"⚠️ This is <b>{format_size(size)}</b> — over Telegram's "
                 f"{format_size(MAX_FILE_SIZE_BYTES)} limit for bots.\n"
                 "Tap <b>Open bot</b> to pick a lower quality.",
-                force=True,
+                force=True, final=True,
             )
             return
         chat = _storage_chat()
         if chat is None:
-            await caption("❌ Inline mode isn't set up on this server yet.", force=True)
+            await caption("❌ Inline mode isn't set up on this server yet.", force=True, final=True)
             return
         await caption("📤 <b>Uploading…</b>", force=True)
         sent = await download_handlers._send_media(
@@ -358,7 +377,7 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         )
         found = _file_of(sent)
         if not found:
-            await caption("❌ Upload failed.", force=True)
+            await caption("❌ Upload failed.", force=True, final=True)
             return
         kind, file_id = found
         title = (result.title or "")[:200]
@@ -367,9 +386,11 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         if STORAGE_CHAT_ID is None:
             await _quiet_delete(context, chat, sent.message_id)
         record_download(user_id, url, title, platform, mode, AUTO_QUALITY, True, file_size=size)
+        logger.info("inline %s delivered in %.1fs (%s): %s", mode,
+                    time.monotonic() - started, format_size(size), url[:80])
     except Exception:
         logger.exception("inline download failed for %s", url[:80])
-        await caption("❌ <b>Something went wrong.</b> Please try again.", force=True)
+        await caption("❌ <b>Something went wrong.</b> Please try again.", force=True, final=True)
     finally:
         if result is not None:
             download_manager.cleanup_result_files(result)

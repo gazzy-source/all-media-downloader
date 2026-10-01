@@ -22,7 +22,7 @@ from telegram.ext import (
 from bot import __bot_bio__, __bot_name__, __version__
 from bot.config import (
     ADMIN_IDS,
-    BASE_DIR,
+    DATA_DIR,
     BOT_TOKEN,
     TEMP_DIR,
     TEMP_CLEANUP_HOURS,
@@ -379,7 +379,7 @@ def build_app() -> Application:
 
 def main() -> None:
     # Prevent multiple polling processes (causes duplicate replies)
-    acquire_single_instance(BASE_DIR / "data" / "bot.lock")
+    acquire_single_instance(DATA_DIR / "bot.lock")
 
     app = build_app()
     logger.info("Starting polling…")

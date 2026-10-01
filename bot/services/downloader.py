@@ -20,6 +20,7 @@ import yt_dlp
 from bot.config import (
     BASE_DIR,
     COOKIES_FILE,
+    DATA_DIR,
     DOWNLOAD_ATTEMPT_BUDGET,
     DOWNLOAD_MAX_BYTES,
     DOWNLOAD_MAX_SECONDS,
@@ -199,7 +200,7 @@ def _resolved_cookie_source() -> Path | None:
         candidates.append(BASE_DIR / COOKIES_FILE)
     candidates.append(BASE_DIR / "cookies.txt")
     candidates.append(Path("cookies.txt"))
-    dest = BASE_DIR / "data" / "cookies.sanitized.txt"
+    dest = DATA_DIR / "cookies.sanitized.txt"
     filtered = prepare_cookies(candidates, dest)
     source: Path | None = filtered
     if source is None:
@@ -228,7 +229,7 @@ def _cookie_jar_for_job() -> Path | None:
     source = _resolved_cookie_source()
     if source is None:
         return None
-    dest = BASE_DIR / "data" / f"cookies.job_{short_id(10)}.txt"
+    dest = DATA_DIR / f"cookies.job_{short_id(10)}.txt"
     return make_runtime_cookie_copy(source, dest)
 
 

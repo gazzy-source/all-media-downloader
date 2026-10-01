@@ -43,6 +43,7 @@ from bot.utils.helpers import (
     analysing_percent,
     extract_urls,
     format_size,
+    platform_from_url,
     progress_bar,
     short_id,
 )
@@ -137,10 +138,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"📎 Starting <b>{len(batch)}</b> downloads…",
                 parse_mode=ParseMode.HTML,
             )
-        await asyncio.gather(
-            *[auto_download_flow(update, context, u) for u in batch],
+        # With several links, no single job may remove the shared source post:
+        # link A succeeding must not delete link B that failed. Collect every
+        # outcome and decide once.
+        multi = len(batch) > 1
+        outcomes = await asyncio.gather(
+            *[
+                auto_download_flow(update, context, u, replace_source=not multi)
+                for u in batch
+            ],
             return_exceptions=True,
         )
+        for u, out in zip(batch, outcomes):
+            if isinstance(out, BaseException):
+                logger.error(
+                    "auto download for %s raised", u[:80], exc_info=out
+                )
+        msg = update.effective_message
+        chat = update.effective_chat
+        if (
+            multi
+            and chat is not None
+            and chat.type == "channel"
+            and CHANNEL_REPLACE_LINK
+            and _is_link_only_post(msg)
+            and len(urls) == len(batch)  # links past the first 5 were never tried
+            and all(out is True for out in outcomes)
+        ):
+            await _try_delete(context, chat.id, msg.message_id)
         return
 
     # Private DM (default): mode / quality / format button wizard
@@ -153,18 +178,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await start_url_flow(update, context, urls[0])
 
 
+def _is_link_only_post(msg) -> bool:
+    """
+    A plain text post, the only kind a channel may replace with its media.
+
+    A photo/video whose caption carries a link is content in its own right —
+    deleting it to make room for the linked media would destroy what was posted.
+    """
+    return bool(
+        msg is not None
+        and getattr(msg, "text", None)
+        and getattr(msg, "message_id", None)
+    )
+
+
 async def auto_download_flow(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, url: str
-) -> None:
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+    *,
+    replace_source: bool = True,
+) -> bool:
     """
     Group / channel / instant mode: download immediately at AUTO_QUALITY.
     No mode/quality wizard.
+
+    Returns True once the media was delivered. `replace_source=False` leaves
+    the channel's source post alone (the caller decides for a multi-link post).
     """
     chat = update.effective_chat
     msg = update.effective_message
     actor = _actor_id(update)
     if not chat or not msg or actor is None:
-        return
+        return False
+    platform = platform_from_url(url)
 
     allowed, retry = rate_limiter.allow(actor)
     if not allowed and actor not in ADMIN_IDS:
@@ -175,7 +222,7 @@ async def auto_download_flow(
             )
         except TelegramError:
             pass
-        return
+        return False
 
     quality = AUTO_QUALITY
     q_label = QUALITY_MAP.get(quality, {}).get("label", quality)
@@ -252,7 +299,7 @@ async def auto_download_flow(
         )
     except Exception as e:
         logger.exception("auto download crashed")
-        record_download(actor, url, "", "?", "video", quality, False, error=str(e))
+        record_download(actor, url, "", platform, mode, quality, False, error=str(e))
         try:
             await status.edit_text(
                 f"❌ Download failed:\n<code>{_esc(str(e)[:280])}</code>",
@@ -261,15 +308,15 @@ async def auto_download_flow(
         except TelegramError:
             pass
         inflight_remove(chat.id, status.message_id)
-        return
+        return False
 
     if not result.success or not result.primary:
         record_download(
             actor,
             url,
             result.title or "",
-            "?",
-            "video",
+            platform,
+            mode,
             quality,
             False,
             error=result.error,
@@ -282,10 +329,12 @@ async def auto_download_flow(
         except TelegramError:
             pass
         inflight_remove(chat.id, status.message_id)
-        return
+        download_manager.cleanup_result_files(result)
+        return False
 
     path = result.primary
     size = result.file_size or path.stat().st_size
+    delivered = False
     try:
         await status.edit_text(
             f"📤 Uploading… ({format_size(size)})",
@@ -323,13 +372,18 @@ async def auto_download_flow(
                     parse_mode=ParseMode.HTML,
                 )
             record_download(
-                actor, url, result.title or "", "?", "video", quality, False,
+                actor, url, result.title or "", platform, mode, quality, False,
                 file_size=size, error="File too large",
             )
             inflight_remove(chat.id, status.message_id)
-            return
+            return False
 
-        if is_channel and CHANNEL_REPLACE_LINK and getattr(msg, "message_id", None):
+        if (
+            is_channel
+            and CHANNEL_REPLACE_LINK
+            and replace_source
+            and _is_link_only_post(msg)
+        ):
             outcome = await _replace_channel_post(
                 context, chat.id, msg.message_id, path, result
             )
@@ -339,8 +393,10 @@ async def auto_download_flow(
                 context, chat.id, path, result, caption, reply_markup=actions
             )
         record_download(
-            actor, url, result.title or "", "?", "video", quality, True, file_size=size
+            actor, url, result.title or "", platform, mode, quality, True,
+            file_size=size,
         )
+        delivered = True
         try:
             await status.delete()
         except TelegramError:
@@ -352,7 +408,7 @@ async def auto_download_flow(
     except TelegramError as e:
         logger.exception("auto upload failed")
         record_download(
-            actor, url, result.title or "", "?", "video", quality, False,
+            actor, url, result.title or "", platform, mode, quality, False,
             file_size=size, error=str(e),
         )
         try:
@@ -365,6 +421,7 @@ async def auto_download_flow(
     finally:
         inflight_remove(chat.id, status.message_id)
         download_manager.cleanup_result_files(result)
+    return delivered
 
 
 async def start_url_flow(
@@ -508,6 +565,7 @@ async def start_url_flow(
         available_heights=info.available_heights,
         available_image_sizes=info.available_image_sizes,
         estimated_sizes=info.estimated_sizes,
+        min_sizes=info.min_sizes,
         extractor=info.extractor,
         raw_info={},  # keep memory light
         status_message_id=status.message_id,
@@ -807,7 +865,10 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
     # before, and the post-download check still backstops an estimate that was
     # too optimistic.
     est = (session.estimated_sizes or {}).get(quality) if mode == "video" else None
-    if est and est > MAX_FILE_SIZE_BYTES:
+    # Refuse only when even the SMALLEST rendition at this height is over —
+    # the largest one alone can be a codec yt-dlp would never pick.
+    floor = (session.min_sizes or {}).get(quality) or est
+    if est and floor and floor > MAX_FILE_SIZE_BYTES:
         fits = [
             (q, sz) for q, sz in (session.estimated_sizes or {}).items()
             if sz and sz <= MAX_FILE_SIZE_BYTES
@@ -825,7 +886,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         session.quality = None
         await query.edit_message_text(
             f"⚠️ <b>{QUALITY_MAP.get(quality, {}).get('label', quality)}</b> for this "
-            f"video is about <b>{format_size(est)}</b>, over Telegram's "
+            f"video is at least <b>{format_size(floor)}</b>, over Telegram's "
             f"{format_size(MAX_FILE_SIZE_BYTES)} limit for bots.\n\n"
             f"Nothing was downloaded, so you lost no time. {tip}",
             parse_mode=ParseMode.HTML,
@@ -1161,7 +1222,14 @@ async def _send_media_once(
                     **cap_kw,
                     **kw,
                 )
-            except TelegramError:
+            except (RetryAfter, NetworkError):
+                # Flood control and transport failures (TimedOut included) go
+                # back to the retry loop. Re-sending as a document right away
+                # hit the same flood limit, or posted the image twice when the
+                # photo had in fact arrived before the timeout.
+                raise
+            except TelegramError as e:
+                logger.info("send_photo failed (%s), falling back to document", e)
                 f.seek(0)
                 await context.bot.send_document(
                     chat_id,
@@ -1187,7 +1255,7 @@ async def _send_media_once(
                 # Flood control must be waited out by the retry loop —
                 # falling back to document here would hit the same limit again.
                 raise
-            except TimedOut:
+            except NetworkError:  # TimedOut included: the retry loop owns it
                 raise
             except TelegramError as e:
                 logger.info("send_video failed (%s), falling back to document", e)

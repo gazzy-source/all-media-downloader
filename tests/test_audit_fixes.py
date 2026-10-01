@@ -221,3 +221,167 @@ def test_dockerignore_keeps_secrets_out():
     text = (Path(__file__).resolve().parents[1] / ".dockerignore").read_text()
     for needle in (".env", "cookies*.txt", "data/", ".git"):
         assert needle in text.splitlines()
+
+
+# ---------------------------------------------------------------------------
+# Second pass: channel posts, size floor, image uploads, history, logging
+# ---------------------------------------------------------------------------
+from telegram.error import TimedOut  # noqa: E402
+
+import bot.handlers.download as hd  # noqa: E402
+from bot.services.downloader import DownloadResult, _min_sizes_by_quality  # noqa: E402
+from bot.services.session import DownloadSession, sessions  # noqa: E402
+from tests.conftest import FakeCallbackQuery, FakeChat, FakeMessage  # noqa: E402
+
+
+def _video(tmp_path, name="clip.mp4") -> DownloadResult:
+    f = tmp_path / name
+    f.write_bytes(b"v" * 2048)
+    return DownloadResult(success=True, files=[f], primary=f, title="Clip",
+                          mode="video", quality="720", file_size=2048, is_video=True)
+
+
+def _quiet(monkeypatch, recorded=None):
+    monkeypatch.setattr(
+        hd, "record_download",
+        lambda *a, **k: recorded.append(a) if recorded is not None else None,
+    )
+    monkeypatch.setattr(hd.rate_limiter, "allow", lambda uid: (True, 0))
+    monkeypatch.setattr(hd.download_manager, "cleanup_result_files", lambda r: None)
+
+
+class TestMultiLinkChannelPost:
+    async def _post(self, fx, monkeypatch, tmp_path, fail_urls=()):
+        _quiet(monkeypatch)
+
+        async def fake_download(url, **kw):
+            if url in fail_urls:
+                return DownloadResult(success=False, error="nope", mode="video")
+            return _video(tmp_path, f"{url[-1]}.mp4")
+
+        monkeypatch.setattr(hd.download_manager, "download", fake_download)
+        fx.chat.type = "channel"
+        msg = fx.msg("https://youtu.be/a https://youtu.be/b")
+        await hd.handle_message(fx.update(msg), fx.ctx)
+        return msg
+
+    async def test_one_failure_keeps_the_source_post(self, fx, monkeypatch, tmp_path):
+        msg = await self._post(fx, monkeypatch, tmp_path, fail_urls=("https://youtu.be/b",))
+        assert (fx.chat.id, msg.message_id) not in fx.ctx.bot.deletes
+
+    async def test_all_succeed_deletes_the_source_once(self, fx, monkeypatch, tmp_path):
+        msg = await self._post(fx, monkeypatch, tmp_path)
+        assert fx.ctx.bot.deletes.count((fx.chat.id, msg.message_id)) == 1
+
+    async def test_media_post_with_link_caption_is_never_deleted(self, fx, monkeypatch, tmp_path):
+        _quiet(monkeypatch)
+
+        async def fake_download(**kw):
+            return _video(tmp_path)
+
+        monkeypatch.setattr(hd.download_manager, "download", fake_download)
+        fx.chat.type = "channel"
+        msg = FakeMessage(text=None, caption="https://youtu.be/a", chat=fx.chat)
+        await hd.handle_message(fx.update(msg), fx.ctx)
+        assert any(c[0] == "send_video" for c in fx.ctx.bot.sent)
+        assert (fx.chat.id, msg.message_id) not in fx.ctx.bot.deletes
+
+    async def test_crashing_job_is_logged(self, fx, monkeypatch, caplog):
+        async def boom(*a, **k):
+            raise RuntimeError("kaboom")
+
+        monkeypatch.setattr(hd, "auto_download_flow", boom)
+        fx.chat.type = "supergroup"
+        await hd.handle_message(fx.update(fx.msg("https://youtu.be/a")), fx.ctx)
+        assert "kaboom" in caplog.text
+
+
+class TestAutoHistoryFields:
+    async def test_records_real_mode_and_platform(self, fx, monkeypatch, tmp_path):
+        recorded: list = []
+        _quiet(monkeypatch, recorded)
+
+        async def fake_download(**kw):
+            return _video(tmp_path)
+
+        monkeypatch.setattr(hd.download_manager, "download", fake_download)
+        fx.chat.type = "supergroup"
+        await hd.auto_download_flow(
+            fx.update(fx.msg("x")), fx.ctx, "https://music.youtube.com/watch?v=1"
+        )
+        _, _, _, platform, mode, *_ = recorded[0]
+        assert platform != "?"
+        assert mode == "video"
+
+
+class TestSizeFloor:
+    def _info(self):
+        return {"formats": [
+            {"format_id": "137", "height": 720, "vcodec": "avc1", "acodec": "none",
+             "filesize": 52_000_000},
+            {"format_id": "398", "height": 720, "vcodec": "av01", "acodec": "none",
+             "filesize": 30_000_000},
+            {"format_id": "140", "vcodec": "none", "acodec": "mp4a", "filesize": 3_000_000},
+            {"format_id": "251", "vcodec": "none", "acodec": "opus", "filesize": 2_000_000},
+        ]}
+
+    def test_floor_is_smallest_top_height_plus_smallest_audio(self):
+        assert _min_sizes_by_quality(self._info())["720"] == 32_000_000
+
+    async def test_download_proceeds_when_a_rendition_fits(self, fx, monkeypatch, tmp_path):
+        monkeypatch.setattr(hd, "MAX_FILE_SIZE_BYTES", 50_000_000)
+        _quiet(monkeypatch)
+        started = []
+
+        async def fake_download(**kw):
+            started.append(1)
+            return _video(tmp_path)
+
+        monkeypatch.setattr(hd.download_manager, "download", fake_download)
+        s = DownloadSession(session_id="sF", user_id=42, chat_id=100,
+                            url="https://youtu.be/x", title="V", platform="YouTube",
+                            mode="video", quality="720",
+                            estimated_sizes={"720": 55_000_000},
+                            min_sizes={"720": 32_000_000})
+        sessions.put(s)
+        q = FakeCallbackQuery(data="quality:sF:720")
+        q.message = FakeMessage(chat=FakeChat(id=100))
+        await hd.execute_download(q, fx.ctx, s)
+        assert started == [1]
+
+    async def test_refusal_keeps_the_session_usable(self, fx, monkeypatch):
+        monkeypatch.setattr(hd, "MAX_FILE_SIZE_BYTES", 50_000_000)
+        s = DownloadSession(session_id="sR", user_id=42, chat_id=100,
+                            url="https://youtu.be/x", title="V", platform="YouTube",
+                            mode="video", quality="1080",
+                            estimated_sizes={"1080": 90_000_000, "480": 20_000_000},
+                            min_sizes={"1080": 80_000_000})
+        sessions.put(s)
+        q = FakeCallbackQuery(data="quality:sR:1080")
+        q.message = FakeMessage(chat=FakeChat(id=100))
+        await hd.execute_download(q, fx.ctx, s)
+        assert sessions.get("sR") is s
+        assert s.started is False and s.quality is None
+        sessions.remove("sR")
+
+
+class TestImageUploadNoDuplicate:
+    async def test_timeout_is_not_followed_by_a_document_resend(self, fx, monkeypatch, tmp_path):
+        f = tmp_path / "p.jpg"
+        f.write_bytes(b"i" * 1024)
+        res = DownloadResult(success=True, files=[f], primary=f, title="P",
+                             mode="image", is_image=True, file_size=1024)
+        sends = []
+
+        async def photo_timeout(chat_id, photo=None, **kw):
+            sends.append("photo")
+            raise TimedOut()
+
+        async def doc(chat_id, document=None, **kw):
+            sends.append("document")
+
+        monkeypatch.setattr(fx.ctx.bot, "send_photo", photo_timeout)
+        monkeypatch.setattr(fx.ctx.bot, "send_document", doc)
+        with pytest.raises(TimedOut):
+            await hd._send_media_once(fx.ctx, 1, f, res, "", f.name)
+        assert sends == ["photo"]

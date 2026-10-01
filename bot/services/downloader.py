@@ -76,6 +76,8 @@ class MediaInfo:
     available_heights: list[int] = field(default_factory=list)
     available_image_sizes: list[tuple[int, int]] = field(default_factory=list)
     estimated_sizes: dict[str, int] = field(default_factory=dict)
+    # Smallest plausible size per tier — the bar for refusing up front.
+    min_sizes: dict[str, int] = field(default_factory=dict)
     extractor: str = ""
     webpage_url: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
@@ -730,6 +732,54 @@ def _parse_formats(info: dict[str, Any]) -> tuple[bool, bool, bool, list[int], l
     return has_video, has_audio, has_image, unique_heights, uniq_imgs, size_by_quality
 
 
+def _min_sizes_by_quality(info: dict[str, Any]) -> dict[str, int]:
+    """
+    The SMALLEST plausible final size per quality tier.
+
+    `_parse_formats` reports the largest format in a tier (the honest number
+    for a button label), but that can be a fat avc1 rendition while yt-dlp
+    would pick a 40% smaller AV1/VP9 one at the same height. Refusing a
+    download up front is only safe when even this floor is over the limit.
+    Only formats at the tier's top height count — that is what the selectors
+    reach for first. Video-only formats get the smallest audio track added.
+    """
+    formats = info.get("formats") or []
+    smallest_audio = min(
+        (
+            int(f.get("filesize") or f.get("filesize_approx") or 0)
+            for f in formats
+            if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")
+        ),
+        default=0,
+    )
+    smallest_audio = smallest_audio if smallest_audio > 0 else 0
+    out: dict[str, int] = {}
+    for qkey, qmeta in QUALITY_MAP.items():
+        cands = [
+            f for f in formats
+            if f.get("vcodec") not in (None, "none", "images")
+            and f.get("height")
+            and int(f["height"]) <= qmeta["height"]
+            and f.get("format_note") != "storyboard"
+        ]
+        if not cands:
+            continue
+        top = max(int(f["height"]) for f in cands)
+        sizes = []
+        for f in cands:
+            if int(f["height"]) != top:
+                continue
+            sz = int(f.get("filesize") or f.get("filesize_approx") or 0)
+            if not sz:
+                continue
+            if f.get("acodec") == "none":
+                sz += smallest_audio
+            sizes.append(sz)
+        if sizes:
+            out[qkey] = min(sizes)
+    return out
+
+
 def _subtitle_langs(info: dict[str, Any]) -> list[str]:
     langs: set[str] = set()
     for key in ("subtitles", "automatic_captions"):
@@ -1116,6 +1166,7 @@ def build_media_info(url: str, info: dict[str, Any]) -> MediaInfo:
         available_heights=heights,
         available_image_sizes=img_sizes,
         estimated_sizes=sizes,
+        min_sizes=_min_sizes_by_quality(info),
         extractor=str(extractor),
         webpage_url=info.get("webpage_url") or url,
         raw=info,

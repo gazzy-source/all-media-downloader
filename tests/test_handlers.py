@@ -50,7 +50,7 @@ class TestHandleMessage:
     async def test_group_auto_downloads(self, fx, monkeypatch, no_rate_limit):
         fx.chat.type = "supergroup"
         results = []
-        async def fake_auto(update, context, url):
+        async def fake_auto(update, context, url, **kw):
             results.append(url)
         monkeypatch.setattr(hd, "auto_download_flow", fake_auto)
         msg = fx.msg("https://youtu.be/1 https://youtu.be/2 https://youtu.be/3")
@@ -60,7 +60,7 @@ class TestHandleMessage:
     async def test_group_caps_at_five_links(self, fx, monkeypatch, no_rate_limit):
         fx.chat.type = "supergroup"
         results = []
-        async def fake_auto(update, context, url):
+        async def fake_auto(update, context, url, **kw):
             results.append(url)
         monkeypatch.setattr(hd, "auto_download_flow", fake_auto)
         urls = " ".join(f"https://youtu.be/{i}" for i in range(8))
@@ -79,7 +79,7 @@ class TestHandleMessage:
         fx.chat.type = "channel"
         called = {}
 
-        async def fake_auto(update, context, url):
+        async def fake_auto(update, context, url, **kw):
             called["url"] = url
 
         monkeypatch.setattr(hd, "auto_download_flow", fake_auto)

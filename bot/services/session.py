@@ -40,6 +40,7 @@ class DownloadSession:
     available_heights: list[int] = field(default_factory=list)
     available_image_sizes: list[tuple[int, int]] = field(default_factory=list)
     estimated_sizes: dict[str, int] = field(default_factory=dict)  # quality -> bytes
+    min_sizes: dict[str, int] = field(default_factory=dict)  # quality -> smallest bytes
     extractor: str = ""
     raw_info: dict[str, Any] = field(default_factory=dict)
 

@@ -34,7 +34,9 @@ from telegram import (
     InlineQueryResultCachedDocument,
     InlineQueryResultCachedMpeg4Gif,
     InlineQueryResultCachedPhoto,
+    InlineQueryResultAudio,
     InlineQueryResultCachedVideo,
+    InlineQueryResultVideo,
     InlineQueryResultsButton,
     InputFile,
     InputMediaAnimation,
@@ -50,14 +52,17 @@ from telegram.ext import ContextTypes
 
 from bot.config import (
     ADMIN_IDS,
+    INLINE_ASSET_BASE,
     INLINE_ENABLED,
+    INLINE_SEARCH_ENABLED,
+    INLINE_SEARCH_PAGE,
     INLINE_QUALITY,
     INLINE_QUERIES_PER_HOUR,
     MAX_FILE_SIZE_BYTES,
     STORAGE_CHAT_ID,
 )
 from bot.handlers import download as download_handlers
-from bot.services import inline_cache
+from bot.services import inline_cache, yt_search
 from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
 from bot.services.history import record_download
 from bot.services.rate_limit import RateLimiter, rate_limiter
@@ -231,10 +236,15 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     q = update.inline_query
     if not q or not INLINE_ENABLED:
         return
-    hint = InlineQueryResultsButton(text="📥 Paste a media link after the bot's name", start_parameter="inline")
+    hint = InlineQueryResultsButton(
+        text="🔎 Type to search YouTube — or paste a link", start_parameter="inline")
     urls = extract_urls((q.query or "").strip(), expand=False)
     if not urls:
-        await _answer(q, [], button=hint, cache_time=3600)
+        text = yt_search.normalize_query(q.query or "")
+        if INLINE_SEARCH_ENABLED and len(text) >= 2:
+            await _search(q, text)
+        else:
+            await _answer(q, [], button=hint, cache_time=3600)
         return
     allowed, _ = inline_query_limiter.allow(q.from_user.id)
     if not allowed and q.from_user.id not in ADMIN_IDS:
@@ -305,12 +315,111 @@ def _cached_result(code: str, mode: str, url: str, hit: dict):
                                            caption=caption, parse_mode=ParseMode.HTML)
 
 
-async def _answer(q, results, *, button=None, cache_time: int = 300) -> None:
+async def _answer(
+    q, results, *, button=None, cache_time: int = 300, next_offset: str | None = None,
+    personal: bool = True,
+) -> None:
     try:
-        await q.answer(results, cache_time=cache_time, is_personal=True, button=button)
+        await q.answer(results, cache_time=cache_time, is_personal=personal, button=button,
+                       next_offset=next_offset)
     except TelegramError as e:
         # A query answered too late (slow network) is simply gone; nothing to do.
         logger.info("inline answer failed: %s", e)
+
+
+_VIDEO_ID = __import__("re").compile(r"[A-Za-z0-9_-]{11}")
+_AUDIO_PREFIXES = ("audio ", "mp3 ", "music ", "song ", "🎵")
+# Per user: the newest query id. A search starts only once typing pauses, so a
+# word typed letter by letter costs one YouTube search, not one per keystroke.
+_LATEST: dict[int, str] = {}
+_DEBOUNCE = 0.4
+_SEARCH_SLOTS = asyncio.Semaphore(3)
+
+
+def _split_mode(text: str) -> tuple[str, str]:
+    """'audio lofi beats' -> ('audio', 'lofi beats'); anything else is video."""
+    low = text.lower()
+    for p in _AUDIO_PREFIXES:
+        if low.startswith(p):
+            return "audio", text[len(p):].strip()
+    return "video", text
+
+
+async def _search(q, text: str) -> None:
+    mode, terms = _split_mode(text)
+    if len(terms) < 2:
+        await _answer(q, [], button=InlineQueryResultsButton(
+            text="🎵 Now type a song or video name", start_parameter="inline"), cache_time=60)
+        return
+    uid = q.from_user.id
+    hits = yt_search.cached(terms)
+    if hits is None:
+        _LATEST[uid] = q.id
+        if len(_LATEST) > 5000:
+            _LATEST.clear()
+            _LATEST[uid] = q.id
+        await asyncio.sleep(_DEBOUNCE)
+        if _LATEST.get(uid) != q.id:
+            return  # still typing: a newer query will search (Telegram drops this one)
+        allowed, _ = inline_query_limiter.allow(uid)
+        if not allowed and uid not in ADMIN_IDS:
+            await _answer(q, [], button=InlineQueryResultsButton(
+                text="⏳ Too many searches — try again later", start_parameter="inline"))
+            return
+        try:
+            async with _SEARCH_SLOTS:
+                hits = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(None, yt_search.search, terms), 12)
+        except Exception as e:
+            logger.warning("inline search failed for %r: %s", terms[:40], e)
+            await _answer(q, [], button=InlineQueryResultsButton(
+                text="⚠️ Search is unavailable right now — paste a link instead",
+                start_parameter="inline"), cache_time=5)
+            return
+    try:
+        start = max(0, int(q.offset or 0))
+    except ValueError:
+        start = 0
+    page = hits[start:start + INLINE_SEARCH_PAGE]
+    if not page and start == 0:
+        await _answer(q, [], button=InlineQueryResultsButton(
+            text=f"No results for “{terms[:30]}”", start_parameter="inline"), cache_time=60)
+        return
+    results = [_search_result(mode, h) for h in page]
+    nxt = start + INLINE_SEARCH_PAGE
+    # Not personal: everyone typing the same search gets the same list, so
+    # Telegram can answer repeats from its own cache without asking the bot.
+    await _answer(q, results, cache_time=300, personal=False,
+                  next_offset=str(nxt) if nxt < len(hits) else None,
+                  button=None if start else InlineQueryResultsButton(
+                      text=("🎵 Audio results — type without “audio” for video"
+                            if mode == "audio" else "🎬 Video results — start with “audio” for music"),
+                      start_parameter="inline"))
+
+
+def _search_result(mode: str, h: "yt_search.SearchHit"):
+    hit = inline_cache.get(h.url, _key(mode))
+    if hit:  # fetched before: send the finished file itself, instantly
+        return _cached_result("v" if mode == "video" else "a", mode, h.url, hit)
+    meta = " · ".join(x for x in (h.channel, yt_search.human_duration(h.duration),
+                                  yt_search.human_views(h.views)) if x)
+    caption = f"⏳ <b>Preparing</b> {_esc(h.title[:150])}…"
+    if mode == "audio":
+        # An audio placeholder swaps cleanly into the real track.
+        return InlineQueryResultAudio(
+            id=f"sa:{h.id}", audio_url=INLINE_ASSET_BASE + "placeholder_v1.mp3",
+            title=h.title[:100], performer=h.channel[:60] or None,
+            audio_duration=h.duration, caption=caption, parse_mode=ParseMode.HTML,
+            reply_markup=_preparing_markup(),
+        )
+    # A video result shows the real thumbnail, title and stats in the list; the
+    # sent message is a short placeholder clip that becomes the real video.
+    return InlineQueryResultVideo(
+        id=f"sv:{h.id}", video_url=INLINE_ASSET_BASE + "placeholder_v1.mp4",
+        mime_type="video/mp4", thumbnail_url=h.thumbnail, title=h.title[:100],
+        description=meta[:200] or None, caption=caption, parse_mode=ParseMode.HTML,
+        video_duration=h.duration, reply_markup=_preparing_markup(),
+    )
 
 
 def _input_media(kind: str, file_id: str, caption: str):
@@ -343,14 +452,20 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
     ch = update.chosen_inline_result
     if not ch or not ch.inline_message_id or not INLINE_ENABLED:
         return
-    code, _, _ = ch.result_id.partition(":")
-    if len(code) != 2 or code[1] != "p" or code[0] not in MODES:
+    code, _, ref = ch.result_id.partition(":")
+    if code in ("sv", "sa") and _VIDEO_ID.fullmatch(ref):
+        # A search result: the id IS the video; the query was search text.
+        mode = "video" if code == "sv" else "audio"
+        url = f"https://www.youtube.com/watch?v={ref}"
+    elif len(code) == 2 and code[1] == "p" and code[0] in MODES:
+        mode = MODES[code[0]]
+        urls = extract_urls(ch.query or "", expand=False)
+        if not urls:
+            return
+        url = urls[0]
+    else:
         return  # a cached result was sent as finished media already
-    mode = MODES[code[0]]
-    urls = extract_urls(ch.query or "", expand=False)
-    if not urls:
-        return
-    url, user_id, imid = urls[0], ch.from_user.id, ch.inline_message_id
+    user_id, imid = ch.from_user.id, ch.inline_message_id
     me = context.bot.username or ""
     give_up = _open_bot_markup(me, f"dl_{put_url(url, user_id)}")
     last = {"t": 0.0}

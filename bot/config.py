@@ -139,6 +139,21 @@ STORAGE_CHAT_ID: int | None = (
 )
 # Inline queries arrive per keystroke; this caps answers per user per hour.
 INLINE_QUERIES_PER_HOUR: int = int(os.getenv("INLINE_QUERIES_PER_HOUR", "300"))
+# Inline search: "@bot lofi beats" lists YouTube results ("@bot audio …" for
+# audio). Results are cached per query, and a search only runs once typing
+# pauses, so keystrokes cost nothing.
+INLINE_SEARCH_ENABLED: bool = os.getenv("INLINE_SEARCH_ENABLED", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+INLINE_SEARCH_PAGE: int = max(1, min(int(os.getenv("INLINE_SEARCH_PAGE", "10")), 20))
+INLINE_SEARCH_MAX: int = max(1, min(int(os.getenv("INLINE_SEARCH_MAX", "30")), 50))
+# Public URL prefix for the placeholder clip/track that a picked search result
+# shows until the real file replaces it (Telegram fetches it by URL). Default:
+# this repo's bot/assets via jsDelivr's GitHub CDN (correct MIME types).
+INLINE_ASSET_BASE: str = (
+    os.getenv("INLINE_ASSET_BASE")
+    or "https://cdn.jsdelivr.net/gh/gazzy-source/all-media-downloader@main/bot/assets/"
+).rstrip("/") + "/"
 
 # Warm the YouTube pipeline in the background right after startup.
 #

@@ -39,8 +39,22 @@ def repeat_key(mode: str, quality: str = "", audio_format: str = "") -> str | No
     return None
 
 
+_YT_ID = __import__("re").compile(
+    r"^(?:https?://)?(?:www\.|m\.|music\.)?"
+    r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|live/|embed/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{11})"
+)
+
+
 def _norm(url: str) -> str:
-    return (url or "").strip().split("#")[0]
+    """
+    youtu.be/X, watch?v=X&si=…, /shorts/X and m./music. hosts are one video:
+    they share a cache slot, so a search result and a pasted link hit the
+    same finished file.
+    """
+    url = (url or "").strip().split("#")[0]
+    m = _YT_ID.match(url)
+    return f"https://www.youtube.com/watch?v={m.group(1)}" if m else url
 
 
 def _key(url: str, mode: str) -> str:

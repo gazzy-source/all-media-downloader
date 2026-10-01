@@ -47,8 +47,13 @@ class InlineBot:
 
 
 class FakeInlineQuery:
-    def __init__(self, query, user_id=42):
+    _n = 0
+
+    def __init__(self, query, user_id=42, offset=""):
+        FakeInlineQuery._n += 1
+        self.id = f"q{FakeInlineQuery._n}"
         self.query = query
+        self.offset = offset
         self.from_user = SimpleNamespace(id=user_id)
         self.answers = []
 
@@ -84,7 +89,7 @@ def _update(**kw):
 
 class TestInlineQuery:
     async def test_no_link_answers_with_hint_only(self, ctx):
-        q = FakeInlineQuery("hello")
+        q = FakeInlineQuery("h")  # too short to search
         await inl.handle_inline_query(_update(inline_query=q), ctx)
         results, kw = q.answers[0]
         assert results == [] and kw["button"] is not None

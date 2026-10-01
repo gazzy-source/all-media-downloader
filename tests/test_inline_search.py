@@ -14,6 +14,7 @@ from telegram import (
 
 import bot.handlers.inline as inl
 from bot.services import inline_cache, yt_search
+from bot.services.downloader import DownloadResult
 from bot.services.yt_search import SearchHit
 from tests.test_inline import FakeInlineQuery, InlineBot, _update
 
@@ -108,10 +109,7 @@ class TestPickingASearchResult:
 
         async def fake_download(**kw):
             seen.update(kw)
-            return inl.download_handlers.DownloadResult(success=False, error="x", mode="video") \
-                if hasattr(inl.download_handlers, "DownloadResult") else \
-                __import__("bot.services.downloader", fromlist=["DownloadResult"]).DownloadResult(
-                    success=False, error="x", mode=kw["mode"])
+            return DownloadResult(success=False, error="x", mode=kw["mode"])
 
         monkeypatch.setattr(inl, "check_public_url", lambda u: None)
         monkeypatch.setattr(inl, "record_download", lambda *a, **k: None)

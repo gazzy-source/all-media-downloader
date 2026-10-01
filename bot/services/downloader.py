@@ -1276,7 +1276,7 @@ _YTDLP_NOISE = re.compile(
           ;?\s*please\ report\ this\ issue\ on\s+https?://\S+.*
         | ,?\s*filling\ out\ the\ appropriate\ issue\ template\.?
         | \s*Confirm\ you\ are\ on\ the\ latest\ version\ using\s+yt-dlp\ -U\.?
-        | \s*See\s+https?://github\.com/yt-dlp/\S+[^.]*\.
+        | \s*See\s+https?://github\.com/yt-dlp/\S+[^.]*(?:\.|$)
         | \s*Use\ --cookies(?:-from-browser)?[^.]*\.
     )""",
     re.IGNORECASE | re.VERBOSE | re.DOTALL,
@@ -2250,12 +2250,22 @@ class DownloadManager:
         # CLI flag that means nothing in a Telegram chat. Verified against
         # yt-dlp master and through the proxy: neither helps, because the post
         # is served only to signed-in viewers.
-        if "empty media response" in low or "empty response" in low:
+        # Gated on Instagram: a bare "empty response" is also what OnDemandKorea
+        # and Piksel say, and blaming Instagram for those would be nonsense.
+        # Instagram's other login walls ("registered users who follow this
+        # account", "redirected to the login page") are the same remedy — the
+        # redirect one also says "rate-limit" and would otherwise be told to
+        # wait a minute, which never helps an anonymous session.
+        if "instagram" in raw_low and (
+            "empty media response" in low
+            or "registered users" in low
+            or "redirected to the login page" in low
+        ):
             return (
                 "Instagram only serves this post to signed-in viewers, so the "
-                "bot cannot read it.\n\nPublic posts and reels still work. "
-                "For the rest, the server needs Instagram cookies added to its "
-                "cookies.txt."
+                "bot cannot read it.\n\nThe server needs valid Instagram "
+                "cookies in its cookies.txt (added, or refreshed if they have "
+                "expired)."
             )
         if "private" in low or "login required" in low or "sign in" in low:
             return (
@@ -2304,16 +2314,23 @@ class DownloadManager:
                 "Pick a lower quality (480p usually fits), or 🎵 Audio."
             )
         # Extractor broken against the live site — nothing the user can change.
-        if (
-            "unexpected response" in low
-            or "cannot parse data" in low
-            or "unable to extract" in low
-        ):
+        # "Cannot parse data" (Facebook) was verified to fail identically on
+        # yt-dlp master, so only that case may claim an update will not help;
+        # "unable to extract" / "unexpected response" are often fixed by one.
+        if "cannot parse data" in low:
             return (
                 "The bot could not read this link — the platform changed its "
-                "page format and there is no working extractor for it yet.\n\nNothing you did wrong, and updating would not help: this was checked "
-                "against the newest yt-dlp. If the post also has a normal "
-                "video/watch link, try that one."
+                "page format and there is no working extractor for it yet.\n\n"
+                "Nothing you did wrong, and updating would not help: this was "
+                "checked against the newest yt-dlp. If the post also has a "
+                "normal video/watch link, try that one."
+            )
+        if "unexpected response" in low or "unable to extract" in low:
+            return (
+                "The bot could not read this link — the platform changed its "
+                "page format, which usually needs a yt-dlp update on the "
+                "server.\n\nNothing you did wrong; try a different link or try "
+                "again later."
             )
         if (
             "is not supported" in low  # e.g. Substack: page type "newsletter"

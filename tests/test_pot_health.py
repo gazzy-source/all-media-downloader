@@ -197,6 +197,30 @@ class TestMetaPlatformMessages:
         out = self._f("ERROR: [Instagram] CUbHfeGsrRj: No video formats found!")
         assert "image" in out.lower()
 
-    def test_genuine_bot_wall_is_untouched_by_the_new_branch(self):
-        out = self._f("[youtube] x: Sign in to confirm you're not a bot")
-        assert "bot-walled" in out
+    def test_non_instagram_empty_response_is_not_blamed_on_instagram(self):
+        out = self._f(
+            "ERROR: [OnDemandKorea] 123: Got empty response from playback API"
+        )
+        assert "instagram" not in out.lower()
+
+    def test_other_instagram_login_walls_get_the_same_advice(self):
+        hint = (
+            " Use --cookies-from-browser or --cookies for the authentication. "
+            "See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-"
+            "cookies-to-yt-dlp  for how to manually pass cookies"
+        )
+        for body in (
+            "This content is only available for registered users who follow "
+            "this account.",
+            "The webpage request was redirected to the login page. You have "
+            "exceeded the rate-limit for accessing posts anonymously.",
+        ):
+            out = self._f(f"ERROR: [Instagram] abc: {body}{hint}")
+            assert "signed-in" in out.lower()
+            assert "github.com" not in out
+            assert "--cookies" not in out
+
+    def test_generic_extractor_failure_does_not_claim_updates_are_useless(self):
+        out = self._f("ERROR: [youtube] abc: Unable to extract uploader id")
+        assert "could not read this link" in out
+        assert "updating would not help" not in out.lower()

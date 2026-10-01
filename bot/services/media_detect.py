@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 import re
-from functools import lru_cache
-from urllib.request import Request, urlopen
+import threading
+import time
+from urllib.request import Request
 
 from bot.utils.helpers import IMAGE_EXTS
+from bot.utils.safe_fetch import open_public as urlopen
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +72,7 @@ def detect_mode(url: str) -> str:
     """
     if not url:
         return "video"
-    low = url.lower().split("?")[0]
+    low = url.lower().split("#")[0].split("?")[0]
 
     for e in IMAGE_EXTS:
         if low.endswith("." + e):
@@ -169,9 +171,37 @@ def _detect_via_ytdlp(url: str) -> str:
         return "video"
 
 
-@lru_cache(maxsize=128)
+_HTML_CACHE: dict[str, tuple[float, str]] = {}
+_HTML_CACHE_LOCK = threading.Lock()
+_HTML_CACHE_TTL = 600.0
+_HTML_CACHE_MAX = 32
+
+
 def _fetch_html_cached(url: str) -> str:
-    """Cache HTML probes (full page up to 1.5MB)."""
+    """
+    Fetch a page's HTML (up to 1.5MB), cached briefly.
+
+    Bounded and time-limited: an lru_cache kept up to 128 pages for the life of
+    the process, and also pinned the "" from a momentary network failure.
+    Failures are not cached.
+    """
+    now = time.monotonic()
+    with _HTML_CACHE_LOCK:
+        hit = _HTML_CACHE.get(url)
+        if hit and now - hit[0] < _HTML_CACHE_TTL:
+            return hit[1]
+    html = _fetch_html(url)
+    if html:
+        with _HTML_CACHE_LOCK:
+            for k in [k for k, (t, _) in _HTML_CACHE.items() if now - t >= _HTML_CACHE_TTL]:
+                del _HTML_CACHE[k]
+            while len(_HTML_CACHE) >= _HTML_CACHE_MAX:
+                del _HTML_CACHE[next(iter(_HTML_CACHE))]
+            _HTML_CACHE[url] = (now, html)
+    return html
+
+
+def _fetch_html(url: str) -> str:
     try:
         req = Request(
             url,
@@ -190,5 +220,5 @@ def _fetch_html_cached(url: str) -> str:
 
 
 def is_direct_image_url(url: str) -> bool:
-    low = (url or "").lower().split("?")[0]
+    low = (url or "").lower().split("#")[0].split("?")[0]
     return any(low.endswith("." + e) for e in IMAGE_EXTS)

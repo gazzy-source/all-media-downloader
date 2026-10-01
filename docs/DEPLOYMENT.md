@@ -30,7 +30,7 @@ docker compose logs -f bot
 
 ## Systemd (Linux bare metal)
 
-`/etc/systemd/system/all-media-bot.service`:
+`/etc/systemd/system/all-media-downloader.service`:
 
 ```ini
 [Unit]
@@ -41,9 +41,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=bot
-WorkingDirectory=/opt/all-media-downloader-bot
-Environment=PATH=/opt/all-media-downloader-bot/.venv/bin
-ExecStart=/opt/all-media-downloader-bot/.venv/bin/python run.py
+WorkingDirectory=/opt/all-media-downloader
+Environment=PATH=/opt/all-media-downloader/.venv/bin
+ExecStart=/opt/all-media-downloader/.venv/bin/python run.py
 Restart=on-failure
 RestartSec=5
 
@@ -53,7 +53,7 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now all-media-bot
+sudo systemctl enable --now all-media-downloader
 ```
 
 ## Production checklist

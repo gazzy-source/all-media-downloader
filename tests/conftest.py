@@ -102,6 +102,9 @@ class FakeUpdate:
             message.from_user = effective_user or FakeUser()
         self.effective_message = message
         self.callback_query = callback_query
+        # Real Updates always carry these; set when the message is an edit.
+        self.edited_message = None
+        self.edited_channel_post = None
         self.effective_user = effective_user or (
             message.from_user if message is not None else
             (callback_query.from_user if callback_query else None)

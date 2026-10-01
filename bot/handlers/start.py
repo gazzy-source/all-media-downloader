@@ -202,7 +202,14 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not update.effective_message or not update.effective_user:
         return
     s = sessions.get_for_user(update.effective_user.id)
-    if s:
+    if s and s.started:
+        # Downloads can't be interrupted mid-transfer; don't claim otherwise.
+        await update.effective_message.reply_text(
+            "⏳ That download is already running and will finish shortly — "
+            "it can't be stopped mid-transfer.",
+            reply_markup=main_reply_keyboard(),
+        )
+    elif s:
         sessions.remove(s.session_id)
         await update.effective_message.reply_text(
             "❌ Cancelled. Send a new link whenever you're ready.",

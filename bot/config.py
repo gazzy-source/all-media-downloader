@@ -143,6 +143,19 @@ WARMUP_URL: str = (
 PROXY_BLIP_RETRIES: int = int(os.getenv("PROXY_BLIP_RETRIES", "2"))
 PROXY_BLIP_BACKOFF: float = float(os.getenv("PROXY_BLIP_BACKOFF", "1.5"))
 
+# When YouTube answers "Sign in to confirm you're not a bot" through the proxy,
+# the WARP exit IP itself has been flagged — every strategy shares it, so the
+# whole ladder fails in seconds (production: 19 of ~80 warmups, plus real user
+# links, over 2026-09-29..10-01). A `warp-cli disconnect && connect` hands out
+# a fresh exit IP in ~2s. 1 = rotate WARP and retry once (needs warp-cli on
+# PATH and PROXY pointing at WARP); 0 = off, the default.
+WARP_ROTATE_ON_BOTCHECK: bool = os.getenv(
+    "WARP_ROTATE_ON_BOTCHECK", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+# Minimum seconds between rotations, so a genuinely blocked video can't make
+# the bot flap WARP for every other in-flight download.
+WARP_ROTATE_COOLDOWN: float = float(os.getenv("WARP_ROTATE_COOLDOWN", "120"))
+
 # Skip YouTube's HLS manifest and translated-subtitle enumeration during the
 # ANALYSIS pass only (1 = skip, the default; 0 = restore the old behaviour).
 #

@@ -87,6 +87,10 @@ def _should_auto_download(update: Update) -> bool:
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message:
         return
+    # PTB's message filters also match edits. Fixing a typo in a link message
+    # must not download (and in channels, repost) the whole thing again.
+    if update.edited_message or update.edited_channel_post:
+        return
     # Channel posts often have no effective_user — still process them
     if not update.effective_user and not _is_channel_chat(update):
         return
@@ -542,7 +546,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = update.effective_user.id
 
     if data == "new":
-        await query.message.reply_text(  # type: ignore[union-attr]
+        if not query.message:  # message too old for Telegram to hand back
+            return
+        await query.message.reply_text(
             "📥 Paste a media link to download.",
             reply_markup=main_reply_keyboard(),
         )
@@ -563,7 +569,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         "🔗 Link expired. Please paste the URL again."
                     )
                 return
-        await query.message.reply_text(  # type: ignore[union-attr]
+        if not query.message:
+            return
+        await query.message.reply_text(
             f"🔄 Re-analyzing…\n<code>{_esc(url[:100])}</code>",
             parse_mode=ParseMode.HTML,
         )
@@ -810,7 +818,11 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
             if best and best in QUALITY_MAP
             else "Try 🎵 Audio instead."
         )
-        sessions.remove(session.session_id)
+        # Keep the session alive and re-armed: the keyboard below is the way
+        # out, and removing the session (or leaving `started` set) made every
+        # one of its buttons a dead end.
+        session.started = False
+        session.quality = None
         await query.edit_message_text(
             f"⚠️ <b>{QUALITY_MAP.get(quality, {}).get('label', quality)}</b> for this "
             f"video is about <b>{format_size(est)}</b>, over Telegram's "
@@ -845,6 +857,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
             False,
             error=str(e),
         )
+        inflight_remove(chat_id, query.message.message_id)
         sessions.remove(session.session_id)
         await context.bot.send_message(
             chat_id,
@@ -865,6 +878,10 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
             False,
             error=result.error,
         )
+        # Or the next restart "rescues" this job and overwrites the real error
+        # with a false "Interrupted" notice.
+        inflight_remove(chat_id, query.message.message_id)
+        download_manager.cleanup_result_files(result)
         sessions.remove(session.session_id)
         # Single error message (edit status; don't also send a second one)
         try:

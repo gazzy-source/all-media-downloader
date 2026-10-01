@@ -39,6 +39,7 @@ from bot.config import (
     YT_LEAN_METADATA,
 )
 from bot.utils.ffmpeg import ffmpeg_location_dir
+from bot.utils.warp import rotate_warp_ip
 from bot.utils.helpers import (
     IMAGE_EXTS,
     VIDEO_EXTS,
@@ -1043,6 +1044,18 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                     strats.insert(si + 1, strat)
                     orig_indices.insert(si + 1, orig_indices[si])
                     continue
+                # A bot wall through the proxy: the WARP exit IP is flagged and
+                # every remaining strategy shares it. Rotate once and retry this
+                # strategy on the fresh IP (the marker keeps it to one rotation).
+                if (
+                    ("not a bot" in err or "sign in to confirm" in err)
+                    and opts.get("proxy")
+                    and not any(s.get("_warp_retry") for s in strats)
+                    and rotate_warp_ip()
+                ):
+                    strats.insert(si + 1, {**strat, "_warp_retry": True})
+                    orig_indices.insert(si + 1, orig_indices[si])
+                    continue
                 # Any other client-specific failure (bot wall, page reload,
                 # throttling, transient 5xx) is worth a retry with the next
                 # strategy — different clients genuinely fail differently.
@@ -1458,13 +1471,18 @@ class DownloadManager:
                     }
                 )
             elif mode == "image":
-                return self._download_image_page(
+                res = self._download_image_page(
                     url=url,
                     work_dir=work_dir,
                     title_hint=title_hint,
                     progress_cb=progress_cb,
                     loop=loop,
                 )
+                if not res.success:
+                    # It never raises, so the except-branch cleanup below never
+                    # runs for it — and the caller only cleans result.files.
+                    self._cleanup_dir(work_dir)
+                return res
             elif mode == "video_subs":
                 lang = subtitle_lang or "en.*"
                 opts.update(
@@ -1623,6 +1641,7 @@ class DownloadManager:
         # Budget for transient proxy refusals, shared across the whole ladder so
         # a persistently down relay still fails fast instead of sleeping per step.
         proxy_retries = 0
+        warp_rotated = False
         # No NEW attempt starts past this; an in-flight transfer still finishes.
         attempt_deadline = time.monotonic() + DOWNLOAD_ATTEMPT_BUDGET
         for si, strat in enumerate(strategies):
@@ -1762,6 +1781,19 @@ class DownloadManager:
                         time.sleep(PROXY_BLIP_BACKOFF)
                         continue  # same strategy, same format
 
+                    # A bot wall through the proxy means the WARP exit IP is
+                    # flagged, and every later strategy shares it. One fresh IP
+                    # beats walking the rest of the ladder into the same wall.
+                    if (
+                        bot_check
+                        and is_yt
+                        and not warp_rotated
+                        and attempt_opts.get("proxy")
+                        and rotate_warp_ip()
+                    ):
+                        warp_rotated = True
+                        continue  # same strategy, same format, new exit IP
+
                     # One format fallback for quality/403 before next strategy
                     if (format_issue or stream_fail) and fi == 0 and primary not in (
                         "b/best",
@@ -1873,7 +1905,8 @@ class DownloadManager:
     ) -> list[str]:
         """Find direct image URLs from a social/image page (Pinterest, etc.)."""
         found: list[str] = []
-        if any(page_url.lower().endswith(f".{e}") for e in IMAGE_EXTS):
+        bare = page_url.lower().split("#")[0].split("?")[0]
+        if any(bare.endswith(f".{e}") for e in IMAGE_EXTS):
             return [page_url]
 
         if html is None:
@@ -1918,6 +1951,8 @@ class DownloadManager:
         try:
             import urllib.request
 
+            from bot.utils.safe_fetch import open_public
+
             req = urllib.request.Request(
                 url,
                 headers={
@@ -1930,12 +1965,21 @@ class DownloadManager:
                     "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
                 },
             )
-            with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:
-                shutil.copyfileobj(resp, f)
-            return dest if dest.exists() and dest.stat().st_size > 0 else None
+            # Public addresses only, and never more than Telegram would accept —
+            # an og:image pointing at a huge file must not fill the disk.
+            with open_public(req, timeout=60) as resp, open(dest, "wb") as f:
+                written = 0
+                while chunk := resp.read(256 * 1024):
+                    written += len(chunk)
+                    if written > MAX_FILE_SIZE_BYTES:
+                        raise ValueError("image larger than the upload limit")
+                    f.write(chunk)
+            if dest.exists() and dest.stat().st_size > 0:
+                return dest
         except Exception:
             logger.exception("Failed to fetch image %s", url)
-            return None
+        dest.unlink(missing_ok=True)  # never leave a partial file behind
+        return None
 
     @staticmethod
     def _friendly_error(msg: str) -> str:
@@ -2005,6 +2049,10 @@ class DownloadManager:
                 "The bot will retry as image automatically; "
                 "in private chat pick 🖼 Image."
             )
+        # Before "not found": yt-dlp says "ffprobe and ffmpeg not found", which
+        # would otherwise blame the user's link for a server misconfiguration.
+        if "ffmpeg" in low or "ffprobe" in low:
+            return "FFmpeg is required for this format. Install FFmpeg and try again."
         if "geo" in low or "region" in low or "not available in your country" in low:
             return "This media is blocked in the server's region."
         if (
@@ -2053,8 +2101,6 @@ class DownloadManager:
                 "than a video, audio or image post. Send the direct link to the "
                 "media itself."
             )
-        if "ffmpeg" in low or "ffprobe" in low:
-            return "FFmpeg is required for this format. Install FFmpeg and try again."
         if "timed out" in low or "timeout" in low:
             return "The download timed out. Please try again."
         if "rate-limit" in low or "rate limit" in low or "too many requests" in low:

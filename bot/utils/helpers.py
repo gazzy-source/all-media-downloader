@@ -203,7 +203,12 @@ def safe_filename(name: str, max_len: int = 80) -> str:
     name = re.sub(r"\s+", " ", name).strip(" ._")
     if not name:
         name = "media"
-    return name[:max_len]
+    name = name[:max_len]
+    # Linux caps a filename at 255 BYTES. 80 CJK characters are 240 bytes, and
+    # yt-dlp appends ".f30080.mp4.part" — so cap the UTF-8 size too.
+    while len(name.encode("utf-8")) > 150:
+        name = name[:-1]
+    return name.rstrip(" ._") or "media"
 
 
 def progress_bar(percent: float, width: int = 12) -> str:

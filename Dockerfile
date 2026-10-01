@@ -16,7 +16,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p downloads temp data
+# Unprivileged user: ffmpeg and the extractors parse hostile media and HTML,
+# so a parser bug must not hand out root in the container.
+RUN useradd --system --uid 10001 --home-dir /app bot     && mkdir -p downloads temp data     && chown -R bot:bot /app
+USER bot
 
 ENV PYTHONUNBUFFERED=1
 

@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main, master]
 
+# Least privilege: the suite only needs to read the code.
+permissions:
+  contents: read
+
 jobs:
   smoke:
     runs-on: ubuntu-latest

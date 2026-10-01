@@ -24,7 +24,7 @@ YouTube often returns:
 4. Click the extension → **Export** → save as:
 
 ```
-C:\Users\gajal\Downloads\GL\cookies.txt
+C:\path\to\cookies.txt
 ```
 
 5. **Immediately** close that YouTube tab (do not open YouTube again yet).
@@ -35,11 +35,11 @@ Optional: also open Instagram logged-in, then export “all cookies” once for 
 ## 2. Upload to VPS (PowerShell)
 
 ```powershell
-scp -i "C:\Users\gajal\Downloads\GL\ssh-key-2026-07-13.key" `
-  "C:\Users\gajal\Downloads\GL\cookies.txt" `
-  ubuntu@130.210.38.240:/opt/all-media-downloader/cookies.txt
+scp -i "C:\path\to\your-ssh-key.key" `
+  "C:\path\to\cookies.txt" `
+  ubuntu@YOUR_SERVER_IP:/opt/all-media-downloader/cookies.txt
 
-ssh -i "C:\Users\gajal\Downloads\GL\ssh-key-2026-07-13.key" ubuntu@130.210.38.240 `
+ssh -i "C:\path\to\your-ssh-key.key" ubuntu@YOUR_SERVER_IP `
   "chmod 600 /opt/all-media-downloader/cookies.txt; rm -f /opt/all-media-downloader/data/cookies.sanitized.txt /opt/all-media-downloader/data/cookies.runtime.txt; sudo systemctl restart all-media-downloader"
 ```
 

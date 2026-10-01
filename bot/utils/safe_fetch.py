@@ -9,10 +9,18 @@ becomes a proxy into localhost, the Docker bridge and the tailnet.
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import socket
 from urllib.parse import urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import (
+    HTTPHandler,
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
 
 
 class UnsafeURLError(OSError):
@@ -33,11 +41,54 @@ def check_public_url(url: str) -> None:
     except socket.gaierror as e:
         raise UnsafeURLError(f"cannot resolve {p.hostname}") from e
     for info in infos:
-        ip = ipaddress.ip_address(str(info[4][0]).split("%")[0])
-        if ip.version == 6 and ip.ipv4_mapped:
-            ip = ip.ipv4_mapped
-        if not ip.is_global:
-            raise UnsafeURLError(f"refusing non-public address {ip} for {p.hostname}")
+        _require_global(str(info[4][0]), p.hostname)
+
+
+def _require_global(addr: str, host: str) -> None:
+    ip = ipaddress.ip_address(addr.split("%")[0])
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if not ip.is_global:
+        raise UnsafeURLError(f"refusing non-public address {ip} for {host}")
+
+
+def _check_peer(conn: http.client.HTTPConnection) -> None:
+    """
+    Check the address the socket ACTUALLY connected to.
+
+    check_public_url resolves the name, then urllib resolves it again to
+    connect. A rebinding DNS server (TTL 0) can answer public the first time
+    and 127.0.0.1 the second; only the connected peer can't lie.
+    """
+    try:
+        _require_global(conn.sock.getpeername()[0], conn.host)
+    except UnsafeURLError:
+        conn.close()
+        raise
+
+
+class _PeerCheckedHTTPConnection(http.client.HTTPConnection):
+    def connect(self):
+        super().connect()
+        _check_peer(self)
+
+
+class _PeerCheckedHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        super().connect()  # TCP + TLS; peer known either way
+        _check_peer(self)
+
+
+class _GuardedHTTPHandler(HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_PeerCheckedHTTPConnection, req)
+
+
+class _GuardedHTTPSHandler(HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(
+            _PeerCheckedHTTPSConnection, req, context=self._context
+        )
 
 
 class _GuardedRedirect(HTTPRedirectHandler):
@@ -46,7 +97,11 @@ class _GuardedRedirect(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_OPENER = build_opener(_GuardedRedirect)
+# ProxyHandler({}) ignores env proxies: through one, the "peer" would be the
+# proxy rather than the target, and the peer check would mean nothing.
+_OPENER = build_opener(
+    ProxyHandler({}), _GuardedRedirect, _GuardedHTTPHandler, _GuardedHTTPSHandler
+)
 
 
 def open_public(req: Request | str, timeout: float = 15):

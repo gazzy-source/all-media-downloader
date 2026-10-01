@@ -133,7 +133,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         q = it.get("quality") or "—"
         lines.append(
             f"{i}. {status} <b>{_esc(title)}</b>\n"
-            f"    {platform} · {mode} · {q}"
+            f"    {_esc(platform)} · {_esc(mode)} · {_esc(q)}"
         )
     await update.effective_message.reply_text(
         "\n".join(lines),
@@ -146,8 +146,17 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message or not update.effective_user:
         return
-    stats = get_stats()
     remaining = rate_limiter.remaining(update.effective_user.id)
+    if update.effective_user.id not in ADMIN_IDS:
+        # Server-wide numbers (user count, traffic, platforms) are the
+        # operator's business; everyone else gets their own quota.
+        await update.effective_message.reply_text(
+            f"⏱ Your remaining quota this hour: <b>{remaining}</b>/{RATE_LIMIT_PER_HOUR}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+    stats = get_stats()
     total = stats.get("total_downloads", 0)
     ok = stats.get("successful", 0)
     fail = stats.get("failed", 0)
@@ -155,7 +164,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     bytes_served = stats.get("bytes_served", 0)
     by_platform = stats.get("by_platform") or {}
     top = sorted(by_platform.items(), key=lambda x: x[1], reverse=True)[:5]
-    top_s = ", ".join(f"{k} ({v})" for k, v in top) if top else "—"
+    top_s = ", ".join(f"{_esc(str(k))} ({v})" for k, v in top) if top else "—"
 
     text = (
         f"📊 <b>Bot statistics</b>\n\n"

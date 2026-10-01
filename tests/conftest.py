@@ -234,3 +234,17 @@ def _clean_global_state():
     rate_limiter._hits.clear()
     sessions._sessions.clear()
     sessions._by_user.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_dns_in_url_guard(monkeypatch):
+    """
+    The private-address guard resolves hostnames. Keep the suite hermetic:
+    handler and downloader tests use made-up URLs and must not need DNS.
+    Tests of the guard itself call bot.utils.safe_fetch directly (or re-patch).
+    """
+    import bot.handlers.download as hd
+    import bot.services.downloader as dl
+
+    monkeypatch.setattr(hd, "check_public_url", lambda url: None)
+    monkeypatch.setattr(dl, "check_public_url", lambda url: None)

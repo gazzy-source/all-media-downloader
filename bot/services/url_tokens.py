@@ -31,9 +31,10 @@ def get_url(token: str, user_id: int | None = None) -> str | None:
         if time.time() > exp:
             del _store[token]
             return None
+        # Pass user_id=None only for admins. Anyone else gets the URL only
+        # for a button that was made for them.
         if user_id is not None and owner != user_id:
-            # Still allow same-chat reuse if needed; soft check only
-            pass
+            return None
         return url
 
 

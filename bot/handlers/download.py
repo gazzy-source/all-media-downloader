@@ -33,12 +33,13 @@ from bot.keyboards.menus import (
     quality_keyboard,
     subtitle_lang_keyboard,
 )
-from bot.services.downloader import download_manager
+from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
 from bot.services.history import record_download
 from bot.services.inflight import add as inflight_add, remove as inflight_remove
 from bot.services.media_detect import detect_mode
 from bot.services.rate_limit import rate_limiter
 from bot.services.session import DownloadSession, sessions
+from bot.utils.safe_fetch import UnsafeURLError, check_public_url
 from bot.utils.helpers import (
     analysing_percent,
     extract_urls,
@@ -223,6 +224,9 @@ async def auto_download_flow(
         except TelegramError:
             pass
         return False
+    # Groups stay quiet: a refusal there is just noise for everyone else.
+    if await _refuse_private_url(msg, url, quiet=chat.type != "private"):
+        return False
 
     quality = AUTO_QUALITY
     q_label = QUALITY_MAP.get(quality, {}).get("label", quality)
@@ -302,7 +306,7 @@ async def auto_download_flow(
         record_download(actor, url, "", platform, mode, quality, False, error=str(e))
         try:
             await status.edit_text(
-                f"❌ Download failed:\n<code>{_esc(str(e)[:280])}</code>",
+                f"❌ Download failed:\n{_esc(download_manager._friendly_error(str(e)))}",
                 parse_mode=ParseMode.HTML,
             )
         except TelegramError:
@@ -445,6 +449,8 @@ async def start_url_flow(
             parse_mode=ParseMode.HTML,
             reply_markup=main_reply_keyboard(),
         )
+        return
+    if await _refuse_private_url(msg, url):
         return
 
     status = await msg.reply_text(
@@ -616,17 +622,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         from bot.services.url_tokens import get_url
 
         token = data[6:].strip()
-        url = get_url(token, user_id)
+        # Only the person the button was made for (or an admin). callback_data
+        # is client-controlled, so the old "raw URL in the token" fallback let
+        # a modified client make the bot fetch and post ANY URL into a group.
+        url = get_url(token, None if user_id in ADMIN_IDS else user_id)
         if not url:
-            # Legacy / expired: maybe raw URL was embedded (old builds)
-            if token.startswith("http"):
-                url = token
-            else:
-                if query.message:
-                    await query.message.reply_text(
-                        "🔗 Link expired. Please paste the URL again."
-                    )
-                return
+            if query.message:
+                await query.message.reply_text(
+                    "🔗 Link expired. Please paste the URL again."
+                )
+            return
         if not query.message:
             return
         await query.message.reply_text(
@@ -682,8 +687,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
+    # Every value below arrives in client-controlled callback_data; accept
+    # only what our own keyboards can produce.
     if action == "mode":
         mode = parts[2] if len(parts) > 2 else "video"
+        if mode not in _MODES:
+            return
         session.mode = mode
         if mode == "audio":
             await query.edit_message_text(
@@ -713,6 +722,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if action == "aformat":
         fmt = parts[2] if len(parts) > 2 else "mp3"
+        if fmt not in _AUDIO_FORMATS:
+            return
         session.audio_format = fmt
         session.mode = "audio"
         # Start straight away. The format choice is the last thing the user had
@@ -730,6 +741,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if action == "quality":
         q = parts[2] if len(parts) > 2 else "720"
+        if q not in QUALITY_MAP:
+            return
         session.quality = q
         if session.mode == "video_subs":
             if session.has_subtitles and session.subtitle_langs:
@@ -751,6 +764,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if action == "sublang":
         lang = parts[2] if len(parts) > 2 else "en"
+        if lang not in ("en", "en.*") and lang not in (session.subtitle_langs or []):
+            return  # e.g. "all" would pull every subtitle track there is
         session.subtitle_lang = lang
         await execute_download(query, context, session)
         return
@@ -758,6 +773,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if action == "go":
         await execute_download(query, context, session)
         return
+
+
+_MODES = frozenset({"video", "video_subs", "audio", "image"})
+_AUDIO_FORMATS = frozenset({"mp3", "m4a", "opus"})
+
+
+async def _refuse_private_url(msg, url: str, *, quiet: bool = False) -> bool:
+    """
+    True (and tells the user, unless quiet) when the URL resolves to a
+    private / local address. yt-dlp fetches whatever it is given, so without
+    this, http://127.0.0.1:9123/health came back to the chat as a file.
+    """
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, check_public_url, url)
+        return False
+    except UnsafeURLError:
+        logger.warning("Refused non-public URL %s", url[:80])
+        if not quiet:
+            try:
+                await msg.reply_text(f"🚫 {PRIVATE_URL_ERROR}")
+            except TelegramError:
+                pass
+        return True
 
 
 def _quality_label(result) -> str:
@@ -794,7 +832,7 @@ def _session_header(session: DownloadSession) -> str:
     title = _esc(session.title[:120] if session.title else "Media")
     return (
         f"🎬 <b>{title}</b>\n"
-        f"📡 {session.platform}"
+        f"📡 {_esc(session.platform or '')}"
     )
 
 
@@ -922,7 +960,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         sessions.remove(session.session_id)
         await context.bot.send_message(
             chat_id,
-            f"❌ Download failed:\n<code>{_esc(str(e)[:300])}</code>",
+            f"❌ Download failed:\n{_esc(download_manager._friendly_error(str(e)))}",
             parse_mode=ParseMode.HTML,
             reply_markup=main_reply_keyboard(),
         )
@@ -1282,7 +1320,7 @@ def _build_caption(session: DownloadSession, result, size: int) -> str:
     mode = result.mode or session.mode or ""
     parts = [
         f"🎬 <b>{_esc((result.title or session.title or 'Media')[:100])}</b>",
-        f"📡 {session.platform} · {_mode_label(mode)}",
+        f"📡 {_esc(session.platform or '')} · {_mode_label(mode)}",
     ]
     if result.quality and mode in ("video", "video_subs"):
         parts.append(f"📐 {_quality_label(result)}")

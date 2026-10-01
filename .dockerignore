@@ -8,6 +8,9 @@ credentials*.json
 
 # Runtime data (mounted as volumes instead)
 data/
+compose-data/
+*.key
+*.pem
 downloads/
 temp/
 *.log

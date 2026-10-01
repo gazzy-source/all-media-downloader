@@ -21,10 +21,13 @@ from bot.config import (
     BASE_DIR,
     COOKIES_FILE,
     DOWNLOAD_ATTEMPT_BUDGET,
+    DOWNLOAD_MAX_BYTES,
+    DOWNLOAD_MAX_SECONDS,
     EXTRACT_TIMEOUT,
     FORMAT_FALLBACK,
     MAX_CONCURRENT_DOWNLOADS,
     MAX_FILE_SIZE_BYTES,
+    MAX_MEDIA_DURATION,
     META_CACHE_TTL,
     METADATA_RETRIES,
     METADATA_SOCKET_TIMEOUT,
@@ -39,6 +42,7 @@ from bot.config import (
     YT_LEAN_METADATA,
 )
 from bot.utils.ffmpeg import ffmpeg_location_dir
+from bot.utils.safe_fetch import UnsafeURLError, check_public_url
 from bot.utils.warp import rotate_warp_ip
 from bot.utils.helpers import (
     IMAGE_EXTS,
@@ -85,7 +89,7 @@ class MediaInfo:
     def summary_html(self) -> str:
         lines = [
             f"🎬 <b>{_esc(self.title)}</b>",
-            f"📡 <b>Platform:</b> {self.platform}",
+            f"📡 <b>Platform:</b> {_esc(self.platform or '')}",
         ]
         if self.uploader:
             lines.append(f"👤 <b>Uploader:</b> {_esc(self.uploader)}")
@@ -109,7 +113,7 @@ class MediaInfo:
         if kinds:
             lines.append(f"📦 <b>Available:</b> {', '.join(kinds)}")
         if self.has_subtitles and self.subtitle_langs:
-            langs = ", ".join(self.subtitle_langs[:8])
+            langs = _esc(", ".join(self.subtitle_langs[:8]))
             extra = f" +{len(self.subtitle_langs) - 8}" if len(self.subtitle_langs) > 8 else ""
             lines.append(f"💬 <b>Subtitles:</b> {langs}{extra}")
         if self.available_heights:
@@ -423,7 +427,9 @@ def _base_opts(
         # file is empty". Verified live: it was the sole cause of every Reddit
         # and VK download failing. It is applied for YouTube only below, where
         # chunking is the documented mitigation for throttled streams.
-        "nocheckcertificate": True,
+        # Certificates ARE verified. Skipping verification let anyone between
+        # the server and a site (or a compromised proxy) read the cookies sent
+        # with every request and swap the media.
         "geo_bypass": True,
         "noplaylist": True,
         # `noplaylist` only covers a video that happens to sit IN a playlist.
@@ -730,6 +736,53 @@ def _parse_formats(info: dict[str, Any]) -> tuple[bool, bool, bool, list[int], l
             uniq_imgs.append(wh)
 
     return has_video, has_audio, has_image, unique_heights, uniq_imgs, size_by_quality
+
+
+_INTERNAL_DETAIL_RE = re.compile(
+    r"\b(?:\d{1,3}\.){3}\d{1,3}\b"  # IPv4 address
+    r"|socks5h?://|https?://(?:127\.|localhost|10\.|192\.168\.)"
+    r"|\bcurl: \(\d+\)"
+    r"|/opt/|/home/|/tmp/|/var/|\b[A-Za-z]:\\",  # filesystem paths
+    re.IGNORECASE,
+)
+
+PRIVATE_URL_ERROR = (
+    "That link points to a private or local network address, which this bot "
+    "doesn't fetch."
+)
+
+
+def _download_match_filter(info: dict[str, Any], *, incomplete: bool = False) -> None:
+    """
+    yt-dlp match_filter for real downloads (never the analysis pass).
+
+    Live streams never end, so they'd fill the disk and hold a download slot
+    forever — the DM wizard already refused them, but group/channel
+    auto-download went straight to download(). An unknown duration passes (direct
+    files often have none); the byte/time guard covers those.
+    """
+    if incomplete:
+        return None
+    if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
+        raise yt_dlp.utils.DownloadError(
+            "Live streams can't be downloaded — send the link again once it has ended."
+        )
+    duration = info.get("duration")
+    if duration and duration > MAX_MEDIA_DURATION:
+        raise yt_dlp.utils.DownloadError(
+            f"This is longer than the {MAX_MEDIA_DURATION // 3600}h this bot "
+            "accepts — it wouldn't fit Telegram's upload size anyway."
+        )
+    # Where yt-dlp will actually fetch from — a public page can point its
+    # media at a private address, which the up-front URL check never sees.
+    for key in ("url", "manifest_url"):
+        target = info.get(key)
+        if isinstance(target, str) and target.startswith("http"):
+            try:
+                check_public_url(target)
+            except UnsafeURLError as e:
+                raise yt_dlp.utils.DownloadError(PRIVATE_URL_ERROR) from e
+    return None
 
 
 def _min_sizes_by_quality(info: dict[str, Any]) -> dict[str, int]:
@@ -1097,8 +1150,12 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 # A bot wall through the proxy: the WARP exit IP is flagged and
                 # every remaining strategy shares it. Rotate once and retry this
                 # strategy on the fresh IP (the marker keeps it to one rotation).
+                # "not a bot" only: "Sign in to confirm your AGE" is a per-video
+                # gate, and matching it let anyone flap WARP for every other
+                # user by resending an age-restricted link.
                 if (
-                    ("not a bot" in err or "sign in to confirm" in err)
+                    "not a bot" in err
+                    and _platform_flags(urlparse(url).netloc.lower())["yt"]
                     and opts.get("proxy")
                     and not any(s.get("_warp_retry") for s in strats)
                     and rotate_warp_ip()
@@ -1424,10 +1481,23 @@ class DownloadManager:
         progress_cb: ProgressCallback | None,
         loop: asyncio.AbstractEventLoop,
     ) -> DownloadResult:
+        # The handlers check this too; repeating it here covers every caller.
+        # yt-dlp would otherwise fetch http://127.0.0.1:9123/... and hand the
+        # body back as a "video" file.
+        try:
+            check_public_url(url)
+        except UnsafeURLError:
+            return DownloadResult(success=False, error=PRIVATE_URL_ERROR, mode=mode)
+
         work_dir = TEMP_DIR / f"dl_{short_id(12)}"
         work_dir.mkdir(parents=True, exist_ok=True)
-        outtmpl = str(work_dir / f"{safe_filename(title_hint)}.%(ext)s")
+        # A title is DATA: escape %, or "%(formats)s" in a title expands into
+        # yt-dlp's whole format table and the filename blows up.
+        outtmpl = str(
+            work_dir / f"{safe_filename(title_hint).replace('%', '%%')}.%(ext)s"
+        )
         job_cookies: list[Path] = []
+        job_started = time.monotonic()
 
         last_pct = {"v": -1.0}
         last_tick = {"t": 0.0}
@@ -1471,6 +1541,19 @@ class DownloadManager:
             elif status == "finished":
                 _emit(100, "⚙️ Finishing…")
 
+        def guard(d: dict[str, Any]) -> None:
+            """Abort mid-transfer: endless streams and huge files stop HERE."""
+            if d.get("status") != "downloading":
+                return
+            if (d.get("downloaded_bytes") or 0) > DOWNLOAD_MAX_BYTES:
+                raise yt_dlp.utils.DownloadError(
+                    "File is larger than max-filesize for Telegram"
+                )
+            if time.monotonic() - job_started > DOWNLOAD_MAX_SECONDS:
+                raise yt_dlp.utils.DownloadError(
+                    f"Download timed out after {DOWNLOAD_MAX_SECONDS // 60} min"
+                )
+
         host = urlparse(url).netloc.lower()
         # Disposable jar for every download so concurrent jobs never corrupt cookies
         cookie_path = _cookie_jar_for_job()
@@ -1479,11 +1562,14 @@ class DownloadManager:
 
         _emit(2, "Resolving…")
         opts = _base_opts(host=host, cookiefile=cookie_path)
-        hooks = [hook] if progress_cb else []
+        hooks = [guard, hook] if progress_cb else [guard]
         opts.update(
             {
                 "outtmpl": outtmpl,
                 "progress_hooks": hooks,
+                # Refused before a single byte moves. Raising — not returning a
+                # reason — makes it an error the user sees, not an empty result.
+                "match_filter": _download_match_filter,
                 "noplaylist": True,
                 "writethumbnail": False,
                 # NOTE: max_filesize is deliberately NOT set here.
@@ -1836,7 +1922,7 @@ class DownloadManager:
                     # flagged, and every later strategy shares it. One fresh IP
                     # beats walking the rest of the ladder into the same wall.
                     if (
-                        bot_check
+                        "not a bot" in err  # not the age gate — see the meta pass
                         and is_yt
                         and not warp_rotated
                         and attempt_opts.get("proxy")
@@ -1941,7 +2027,7 @@ class DownloadManager:
                         file_size=size,
                         is_image=True,
                     )
-                last_err = f"Could not fetch {img_url[:80]}"
+                last_err = "Couldn't download the image from this page."
             return DownloadResult(
                 success=False,
                 error=last_err or "Image download failed.",
@@ -1949,7 +2035,9 @@ class DownloadManager:
             )
         except Exception as e:
             logger.exception("image page download failed")
-            return DownloadResult(success=False, error=str(e)[:300], mode="image")
+            return DownloadResult(
+                success=False, error=self._friendly_error(str(e)), mode="image"
+            )
 
     def _discover_image_urls(
         self, page_url: str, html: str | None = None
@@ -2218,6 +2306,16 @@ class DownloadManager:
                 "This platform's extractor failed on this link — usually the site "
                 "changed and yt-dlp needs an update. Try another link, or update "
                 "yt-dlp on the server."
+            )
+        # Verbatim extractor text is often the clearest answer ("This video
+        # is only available to Music Premium members"), but not when it carries
+        # the server's own plumbing — proxy URLs, internal IPs, curl codes or
+        # file paths tell a stranger how the bot is wired.
+        if _INTERNAL_DETAIL_RE.search(msg):
+            logger.info("Withheld internal error detail from user: %s", msg[:200])
+            return (
+                "The download failed on the server side. Please try again in a "
+                "moment, or send a different link."
             )
         return msg or "Download failed for an unknown reason."
 

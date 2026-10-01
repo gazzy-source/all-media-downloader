@@ -235,14 +235,15 @@ class TestHandleCallback:
         assert len(q.answers) == 1
         assert q.message.replies and "expired" in q.message.replies[0][0].lower()
 
-    async def test_legacy_raw_url_token_still_works(self, fx, monkeypatch, no_rate_limit):
+    async def test_raw_url_in_callback_is_refused(self, fx, monkeypatch, no_rate_limit):
+        """callback_data is client-controlled: a raw URL must never be fetched."""
         called = {}
         async def fake_flow(update, context, url):
             called["url"] = url
         monkeypatch.setattr(hd, "start_url_flow", fake_flow)
         q = FakeCallbackQuery(data="again:https://youtu.be/raw")
         await hd.handle_callback(fx.update(callback_query=q), fx.ctx)
-        assert called["url"] == "https://youtu.be/raw"
+        assert "url" not in called
 
     async def test_valid_token_triggers_flow(self, fx, monkeypatch, no_rate_limit):
         from bot.services.url_tokens import put_url

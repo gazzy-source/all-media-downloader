@@ -59,7 +59,7 @@ class TestExtractUrls:
     def test_expand_short_url_handles_errors(self, monkeypatch):
         def boom(*a, **k):
             raise OSError("network down")
-        monkeypatch.setattr("urllib.request.urlopen", boom)
+        monkeypatch.setattr("bot.utils.safe_fetch.open_public", boom)
         assert bot_helpers._expand_short_url("https://pin.it/xyz") == \
             "https://pin.it/xyz"
 

@@ -93,6 +93,22 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
     except Exception:
         logger.exception("temp cleanup failed")
+    # Per-job cookie copies are deleted when the job ends, but a crash or a
+    # kill -9 mid-job leaves a full copy of the operator's login cookies in
+    # data/. None legitimately lives longer than a download.
+    try:
+        from bot.config import DATA_DIR
+
+        jar_cutoff = time.time() - 3600
+        for jar in DATA_DIR.glob("cookies.job_*.txt"):
+            try:
+                if jar.stat().st_mtime < jar_cutoff:
+                    jar.unlink(missing_ok=True)
+                    removed_files += 1
+            except OSError:
+                pass
+    except Exception:
+        logger.exception("cookie jar sweep failed")
     if removed_sessions or removed_files:
         logger.info("Cleanup: %s sessions, %s temp files", removed_sessions, removed_files)
 

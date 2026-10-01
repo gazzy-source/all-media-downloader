@@ -112,6 +112,18 @@ METADATA_RETRIES: int = int(os.getenv("METADATA_RETRIES", "1"))
 # image-only retry) while holding a concurrency slot and a pool thread.
 DOWNLOAD_ATTEMPT_BUDGET: int = int(os.getenv("DOWNLOAD_ATTEMPT_BUDGET", "420"))
 
+# Hard ceilings for one download, enforced WHILE it runs. The size check after
+# the download protects Telegram, not the server: without these, one link to a
+# 24/7 livestream or a 50 GB file (posted in any group the bot sits in) filled
+# the disk and pinned a download slot forever.
+MAX_MEDIA_DURATION: int = int(os.getenv("MAX_MEDIA_DURATION", str(3 * 3600)))
+# Bytes fetched per file before aborting — a multiple of the upload limit so
+# an over-estimate that would still fit after merging isn't cut short.
+DOWNLOAD_MAX_BYTES: int = int(
+    os.getenv("DOWNLOAD_MAX_BYTES", str(3 * MAX_FILE_SIZE_BYTES))
+)
+DOWNLOAD_MAX_SECONDS: int = int(os.getenv("DOWNLOAD_MAX_SECONDS", "900"))
+
 # Warm the YouTube pipeline in the background right after startup.
 #
 # The first YouTube analysis in a fresh process pays costs no later one does:

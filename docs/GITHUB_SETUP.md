@@ -56,7 +56,7 @@ gh repo create all-media-downloader-bot --public --source=. --remote=origin --de
 Already done for you if maintainers ran setup; otherwise:
 
 ```powershell
-cd C:\Users\gajal\all-media-downloader-bot
+cd C:\path\to\all-media-downloader-bot
 git init
 git branch -M main
 git add .

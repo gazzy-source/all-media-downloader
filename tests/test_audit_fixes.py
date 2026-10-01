@@ -28,7 +28,7 @@ class TestSafeFetch:
     @pytest.mark.parametrize(
         "ip",
         ["127.0.0.1", "169.254.169.254", "10.0.0.5", "172.17.0.1",
-         "192.168.1.104", "100.77.65.98", "::1", "::ffff:127.0.0.1"],
+         "192.168.0.10", "100.64.0.10", "::1", "::ffff:127.0.0.1"],
     )
     def test_refuses_internal_addresses(self, monkeypatch, ip):
         _resolve_to(monkeypatch, ip)

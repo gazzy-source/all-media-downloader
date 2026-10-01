@@ -70,6 +70,7 @@ class TestStartCommands:
         assert "Untitled" in text and "—" in text  # None fallbacks
 
     async def test_cmd_stats_formats_numbers(self, fx, monkeypatch):
+        monkeypatch.setattr(start, "ADMIN_IDS", {fx.user.id})
         monkeypatch.setattr(start, "get_stats", lambda: {
             "total_downloads": 10, "successful": 8, "failed": 2,
             "unique_user_count": 3, "bytes_served": 1536,
@@ -83,6 +84,7 @@ class TestStartCommands:
         assert "1.5 KB" in text or "1536 B" in text
 
     async def test_cmd_stats_empty_platforms(self, fx, monkeypatch):
+        monkeypatch.setattr(start, "ADMIN_IDS", {fx.user.id})
         monkeypatch.setattr(start, "get_stats", lambda: {})
         msg = fx.msg("/stats")
         await start.cmd_stats(fx.update(msg), fx.ctx)
@@ -158,6 +160,7 @@ class TestTextMenuRouter:
     async def test_each_menu_label_handled(self, fx, monkeypatch, label, fragment):
         if label == "🕘 History":
             monkeypatch.setattr(start, "get_user_history", lambda uid, limit=10: [])
+        monkeypatch.setattr(start, "ADMIN_IDS", {fx.user.id})  # full /stats view
         msg = fx.msg(f"  {label}  ")  # whitespace-tolerant
         handled = await start.text_menu_router(fx.update(msg), fx.ctx)
         assert handled is True

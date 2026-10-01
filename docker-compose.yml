@@ -16,6 +16,14 @@ services:
       - ./temp:/app/temp
       # Optional: only needed for private/age-restricted content now
       # - ./cookies.txt:/app/cookies.txt:ro
+    # Hostile input (media, HTML) is parsed here: no privilege escalation, no
+    # capabilities, and a ceiling on what one runaway job can eat.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 1g
+    pids_limit: 256
 
   bgutil-provider:
     image: brainicism/bgutil-ytdlp-pot-provider:latest

@@ -46,8 +46,16 @@ def extract_urls(text: str, *, expand: bool = True) -> list[str]:
     for u in found:
         if u not in seen:
             seen.add(u)
-            out.append(_expand_short_url(u) if expand else u)
+            # Only the first few can ever be downloaded (handlers cap batches at
+            # 5), so never pay — or let a sender make us pay — for expanding
+            # the 150 short links one message can hold.
+            out.append(_expand_short_url(u) if expand and len(out) < MAX_EXPAND else u)
     return out
+
+
+# Links per message worth expanding — matches the 5-link batch cap.
+MAX_EXPAND = 5
+_SHORT_HOSTS = {"pin.it", "t.co", "bit.ly"}
 
 
 def _expand_short_url(url: str) -> str:
@@ -57,32 +65,30 @@ def _expand_short_url(url: str) -> str:
     each attempt is bounded to 2s. yt-dlp follows any remaining redirects
     itself, so a failed expansion is harmless (original URL is returned).
     """
-    low = url.lower()
-    if "pin.it/" not in low and "t.co/" not in low and "bit.ly/" not in low:
-        return url
+    # Match the real host: a substring test let "http://10.0.0.5/x?bit.ly/"
+    # make the bot send a request into the private network.
     try:
-        import urllib.request
+        host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    except ValueError:
+        return url
+    if host not in _SHORT_HOSTS:
+        return url
+    import urllib.request
 
-        req = urllib.request.Request(
-            url,
-            method="HEAD",
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            final = resp.geturl()
-            if final and final.startswith("http"):
-                return final
-    except Exception:
+    from bot.utils.safe_fetch import open_public
+
+    for method in ("HEAD", "GET"):
         try:
-            import urllib.request
-
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=2) as resp:
+            req = urllib.request.Request(
+                url, method=method, headers={"User-Agent": "Mozilla/5.0"}
+            )
+            # Public addresses only, every redirect hop included.
+            with open_public(req, timeout=2) as resp:
                 final = resp.geturl()
                 if final and final.startswith("http"):
                     return final
         except Exception:
-            pass
+            continue
     return url
 
 

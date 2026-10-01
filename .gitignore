@@ -2,9 +2,13 @@
 .env
 .env.*
 !.env.example
-cookies.txt
+cookies*.txt
 *.cookies
 credentials*.json
+*.key
+*.pem
+id_rsa*
+id_ed25519*
 
 # Python
 .venv/
@@ -34,6 +38,8 @@ temp/*
 data/*
 !data/.gitkeep
 data/bot.lock
+# docker-compose's data volume: cookies, history, in-flight jobs
+compose-data/
 *.log
 logs/
 

@@ -122,7 +122,8 @@ def _fetch_title(url: str) -> str:
 
 async def _placeholder_file_id(context: ContextTypes.DEFAULT_TYPE, mode: str) -> str | None:
     """Upload the labelled placeholder photo once; reuse its file_id after."""
-    name = f"placeholder_{mode}"
+    # Versioned: a redesigned image needs a fresh upload, not the old file_id.
+    name = f"placeholder_{mode}_v2"
     cached = inline_cache.get_meta(name)
     if cached:
         return cached

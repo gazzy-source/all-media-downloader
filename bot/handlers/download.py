@@ -1570,6 +1570,8 @@ async def _send_media(
     if len(caption) > 1024:
         caption = caption[:1000] + "…"
 
+    # Errors are kept WITHOUT tracebacks (see _without_frames): their frames
+    # reference the failed attempt's request through the backoff and the retry.
     last_err: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
@@ -1578,12 +1580,12 @@ async def _send_media(
                 silent=silent, thread_id=thread_id,
             )
         except RetryAfter as e:
-            last_err = e
+            last_err = _without_frames(e)
             wait = int(getattr(e, "retry_after", 5)) + 1
             logger.warning("Flood control, waiting %ss (attempt %s)", wait, attempt)
             await _sleep(wait)
         except TimedOut as e:
-            last_err = e
+            last_err = _without_frames(e)
             logger.warning(
                 "Upload timed out (attempt %s/%s, size=%s)",
                 attempt,
@@ -1596,7 +1598,7 @@ async def _send_media(
                 # would bypass the caller's per-type semantics (streaming,
                 # caption handling) and mask the real timeout.
         except NetworkError as e:
-            last_err = e
+            last_err = _without_frames(e)
             logger.warning("Network error on upload (attempt %s): %s", attempt, e)
             if attempt < attempts:
                 await _sleep(2 * attempt)
@@ -1605,6 +1607,24 @@ async def _send_media(
 
     if last_err:
         raise last_err
+
+
+def _without_frames(err: BaseException) -> BaseException:
+    """
+    `err` with its traceback cleared — and those of the errors it was raised
+    from: PTB raises TimedOut *from* httpx's error, and that one's traceback
+    alone kept the failed attempt's request and InputFile alive into the retry
+    (e.with_traceback(None) was not enough; tests/test_upload_streaming.py).
+    """
+    todo, seen = [err], set()
+    while todo:
+        e = todo.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        e.__traceback__ = None
+        todo += [e.__cause__, e.__context__]
+    return err
 
 
 async def _sleep(seconds: float) -> None:
@@ -1637,12 +1657,16 @@ async def _send_media_once(
     if reply_markup is not None:
         cap_kw["reply_markup"] = reply_markup
 
+    # read_file_handle=False: httpx streams the open file in 64 KB chunks. The
+    # default read the whole file into memory, and TLS added two more copies —
+    # ~3x the file per upload (5 x 49 MB measured at 584 MB). Each handle stays
+    # open (the `with` below) until the request is done, as PTB requires.
     if result.is_audio:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
         with path.open("rb") as f:
             return await context.bot.send_audio(
                 chat_id,
-                audio=InputFile(f, filename=filename),
+                audio=InputFile(f, filename=filename, read_file_handle=False),
                 title=result.title[:64] if result.title else None,
                 performer=(result.artist or "")[:64] or None,
                 thumbnail=_cover_file(result),
@@ -1656,7 +1680,7 @@ async def _send_media_once(
             try:
                 return await context.bot.send_photo(
                     chat_id,
-                    photo=InputFile(f, filename=filename),
+                    photo=InputFile(f, filename=filename, read_file_handle=False),
                     **cap_kw,
                     **kw,
                 )
@@ -1671,7 +1695,7 @@ async def _send_media_once(
                 f.seek(0)
                 return await context.bot.send_document(
                     chat_id,
-                    document=InputFile(f, filename=filename),
+                    document=InputFile(f, filename=filename, read_file_handle=False),
                     **cap_kw,
                     **kw,
                 )
@@ -1682,7 +1706,7 @@ async def _send_media_once(
             try:
                 return await context.bot.send_video(
                     chat_id,
-                    video=InputFile(f, filename=filename),
+                    video=InputFile(f, filename=filename, read_file_handle=False),
                     supports_streaming=True,
                     **cap_kw,
                     **kw,
@@ -1698,7 +1722,7 @@ async def _send_media_once(
                 f.seek(0)
                 return await context.bot.send_document(
                     chat_id,
-                    document=InputFile(f, filename=filename),
+                    document=InputFile(f, filename=filename, read_file_handle=False),
                     **cap_kw,
                     **kw,
                 )
@@ -1707,7 +1731,7 @@ async def _send_media_once(
     with path.open("rb") as f:
         return await context.bot.send_document(
             chat_id,
-            document=InputFile(f, filename=filename),
+            document=InputFile(f, filename=filename, read_file_handle=False),
             **cap_kw,
             **kw,
         )

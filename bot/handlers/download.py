@@ -287,7 +287,7 @@ async def auto_download_flow(
         title = _esc((hit.get("title") or "Media")[:100])
         sent = await _send_cached(
             context, chat.id, hit,
-            "" if is_chan else f"🎬 <b>{title}</b>\n⚡ Instant · All-Media Downloader · Gazzy Labs",
+            "" if is_chan else f"🎬 <b>{title}</b>\n⚡ Instant · All-Media Downloader",
             reply_markup=None if is_chan else after_download_keyboard(
                 url, user_id=actor, private=chat.type == "private"),
             url=url, key=repeat, thread_id=_thread_of(msg),
@@ -410,7 +410,7 @@ async def auto_download_flow(
         caption = (
             f"🎬 <b>{title}</b>\n"
             f"{kind} · 💾 {format_size(size)} · ⏱ ready in {view.elapsed():.0f}s\n"
-            f"⚡ All-Media Downloader · Gazzy Labs"
+            f"⚡ All-Media Downloader"
         )
         actions = after_download_keyboard(url, user_id=actor,
                                           private=chat.type == "private")
@@ -1722,7 +1722,7 @@ def _build_caption(session: DownloadSession, result, size: int) -> str:
     if result.quality and mode in ("video", "video_subs"):
         parts.append(f"📐 {_quality_label(result)}")
     parts.append(f"💾 {format_size(size)}")
-    parts.append("⚡ via All-Media Downloader Bot · Gazzy Labs")
+    parts.append("⚡ via All-Media Downloader")
     return "\n".join(parts)
 
 

@@ -214,3 +214,29 @@ def after_download_keyboard(url: str, user_id: int = 0) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("📥 New Link", callback_data="new")],
         ]
     )
+
+
+def settings_keyboard(prefs: dict, *, premium_enabled: bool = True) -> InlineKeyboardMarkup:
+    """
+    Tap-to-set defaults. With a type plus its quality/format chosen, a pasted
+    link downloads straight away — no wizard. "Ask" brings the wizard back.
+    callback_data: "pref:<key>:<value>" (short, allowlisted on receipt).
+    """
+    def row(key: str, options: list[tuple[str, str]]) -> list[InlineKeyboardButton]:
+        return [
+            InlineKeyboardButton(
+                ("✅ " if prefs.get(key) == value else "") + label,
+                callback_data=f"pref:{key}:{value}",
+            )
+            for value, label in options
+        ]
+
+    rows = [
+        row("mode", [("video", "🎥 Video"), ("audio", "🎵 Audio"), ("ask", "❓ Ask")]),
+        row("quality", [("480", "480p"), ("720", "720p"), ("1080", "1080p"),
+                        ("max", "Max"), ("ask", "Ask")]),
+        row("audio", [("mp3", "MP3"), ("m4a", "M4A"), ("opus", "Opus"), ("ask", "Ask")]),
+    ]
+    if premium_enabled:
+        rows.append([InlineKeyboardButton("💎 Premium", callback_data="prem:open")])
+    return InlineKeyboardMarkup(rows)

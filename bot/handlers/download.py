@@ -33,7 +33,8 @@ from bot.keyboards.menus import (
     quality_keyboard,
     subtitle_lang_keyboard,
 )
-from bot.services import inline_cache
+from bot.services import inline_cache, user_prefs
+from bot.services.dl_queue import download_queue
 from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
 from bot.services.history import record_download
 from bot.services.inflight import add as inflight_add, remove as inflight_remove
@@ -322,12 +323,16 @@ async def auto_download_flow(
     inflight_add(chat.id, status.message_id)
     try:
         await context.bot.send_chat_action(chat.id, ChatAction.UPLOAD_DOCUMENT)
-        result = await download_manager.download(
-            url=url,
-            mode=mode,
-            quality=quality,
-            title_hint="media",
-            progress_cb=on_progress,
+        result = await download_queue.run(
+            lambda: download_manager.download(
+                url=url,
+                mode=mode,
+                quality=quality,
+                title_hint="media",
+                progress_cb=on_progress,
+            ),
+            on_position=lambda n: on_progress(0, f"Queued — you're #{n} in line"),
+            priority=user_prefs.is_premium(actor),
         )
     except Exception as e:
         logger.exception("auto download crashed")
@@ -610,6 +615,14 @@ async def start_url_flow(
     )
     sessions.put(session)
 
+    choice = _default_choice(session, user_prefs.get(user.id))
+    if choice is not None:
+        # The user's saved defaults answer every wizard question: go straight
+        # to the download (the status message becomes the progress message).
+        session.mode, session.quality, session.audio_format = choice
+        await execute_download(_StatusQuery(status), context, session)
+        return
+
     body = info.summary_html() + "\n\n<b>Select download type:</b>"
     try:
         await status.edit_text(
@@ -626,9 +639,39 @@ async def start_url_flow(
         )
 
 
+class _StatusQuery:
+    """
+    Lets execute_download (written for a button tap) drive a plain status
+    message, when saved defaults skip the buttons altogether.
+    """
+
+    def __init__(self, message) -> None:
+        self.message = message
+
+    async def edit_message_text(self, text, **kw):
+        return await self.message.edit_text(text, **kw)
+
+
+def _default_choice(session, prefs: dict) -> tuple[str, str | None, str] | None:
+    """(mode, quality, audio_format) from saved defaults, or None to ask."""
+    mode = prefs.get("mode")
+    if mode == "video" and session.has_video and prefs.get("quality") not in (None, "ask"):
+        return "video", prefs["quality"], session.audio_format
+    if mode == "audio" and session.has_audio and prefs.get("audio") not in (None, "ask"):
+        return "audio", None, prefs["audio"]
+    return None
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.data or not update.effective_user:
+        return
+    if query.data.startswith(("pref:", "prem:")):
+        from bot.handlers import premium, start
+
+        handler = start.handle_pref_callback if query.data.startswith("pref:") \
+            else premium.handle_premium_callback
+        await handler(update, context)
         return
     if query.data == "inl:wait":
         # The inline placeholder's own button: nothing to do but reassure.
@@ -1054,14 +1097,21 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
     inflight_add(chat_id, query.message.message_id)
     try:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
-        result = await download_manager.download(
-            url=session.url,
-            mode=mode,
-            quality=quality,
-            subtitle_lang=session.subtitle_lang,
-            audio_format=session.audio_format,
-            title_hint=session.title or "media",
-            progress_cb=on_progress,
+        result = await download_queue.run(
+            lambda: download_manager.download(
+                url=session.url,
+                mode=mode,
+                quality=quality,
+                subtitle_lang=session.subtitle_lang,
+                audio_format=session.audio_format,
+                title_hint=session.title or "media",
+                progress_cb=on_progress,
+            ),
+            on_position=lambda n: on_progress(
+                0, f"Queued — you're #{n} in line"
+                + (" (premium: ahead of free users)" if user_prefs.is_premium(session.user_id) else "")
+            ),
+            priority=user_prefs.is_premium(session.user_id),
         )
     except Exception as e:
         logger.exception("download crashed")
@@ -1377,7 +1427,7 @@ async def _send_media_once(
                 chat_id,
                 audio=InputFile(f, filename=filename),
                 title=result.title[:64] if result.title else None,
-                performer="All-Media Downloader Bot" if cap else None,
+                performer=(result.artist or "")[:64] or None,
                 **cap_kw,
                 **kw,
             )

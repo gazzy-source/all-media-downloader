@@ -146,6 +146,19 @@ class DownloadResult:
     # a fallback client was used (e.g. cookieless YouTube capped at 360p), so
     # captions report this rather than the button the user pressed.
     actual_height: int | None = None
+    # Performer shown by Telegram's music player (audio only).
+    artist: str | None = None
+
+
+def _artist_of(info: dict[str, Any] | None) -> str | None:
+    """Best available artist: tagged artist, else the channel (minus " - Topic")."""
+    if not info:
+        return None
+    name = info.get("artist") or info.get("creator") or info.get("uploader") or info.get("channel")
+    if not name:
+        return None
+    name = str(name).split(",")[0].strip()
+    return name[: -len(" - Topic")] if name.endswith(" - Topic") else name
 
 
 def _esc(text: str) -> str:
@@ -1651,12 +1664,23 @@ class DownloadManager:
                 opts.update(
                     {
                         "format": "bestaudio[ext=m4a]/bestaudio/best",
+                        # Minimal music metadata: title + artist tags and the
+                        # cover art, so the file looks right in any player.
+                        "writethumbnail": True,
                         "postprocessors": [
+                            {
+                                "key": "FFmpegThumbnailsConvertor",
+                                "format": "jpg",
+                                "when": "before_dl",
+                            },
                             {
                                 "key": "FFmpegExtractAudio",
                                 "preferredcodec": audio_format,
                                 "preferredquality": "192",
                             },
+                            {"key": "FFmpegMetadata", "add_metadata": True,
+                             "add_chapters": False},
+                            {"key": "EmbedThumbnail", "already_have_thumbnail": False},
                         ],
                     }
                 )
@@ -1707,7 +1731,13 @@ class DownloadManager:
                 raise JobAborted(tripped["reason"])
 
             files = sorted(
-                [p for p in work_dir.iterdir() if p.is_file() and not p.name.endswith(".part")],
+                [
+                    p for p in work_dir.iterdir()
+                    if p.is_file() and not p.name.endswith(".part")
+                    # A cover image left behind by the audio metadata step must
+                    # never be mistaken for the download itself.
+                    and p.suffix.lower().lstrip(".") not in (*IMAGE_EXTS, "webp")
+                ],
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             )
@@ -1762,6 +1792,7 @@ class DownloadManager:
                 is_video=ext in {"mp4", "mkv", "webm", "mov", "avi", "m4v", "3gp"},
                 subtitle_file=sub_file,
                 actual_height=_delivered_height(info),
+                artist=_artist_of(info),
             )
         except (JobRefused, JobAborted) as e:
             # Deliberate refusals / limits: expected, no traceback needed.

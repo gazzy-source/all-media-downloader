@@ -94,13 +94,13 @@ class TestStartCommands:
         monkeypatch.setattr(start, "ADMIN_IDS", {42})
         msg = fx.msg("/settings")
         await start.cmd_settings(fx.update(msg), fx.ctx)
-        assert "Admin: <b>Yes</b>" in msg.replies[0][0]
+        assert "🛡 Admin" in msg.replies[0][0]
 
     async def test_cmd_settings_non_admin(self, fx, monkeypatch):
         monkeypatch.setattr(start, "ADMIN_IDS", set())
         msg = fx.msg("/settings")
         await start.cmd_settings(fx.update(msg), fx.ctx)
-        assert "Admin: <b>No</b>" in msg.replies[0][0]
+        assert "🛡 Admin" not in msg.replies[0][0]
 
     async def test_cmd_cancel_removes_active_session(self, fx):
         from bot.services.session import DownloadSession, sessions

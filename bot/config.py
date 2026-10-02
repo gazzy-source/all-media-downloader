@@ -52,6 +52,16 @@ def parse_proxy_hosts(raw: str | None) -> tuple[str, ...]:
 PROXY_HOSTS: tuple[str, ...] = parse_proxy_hosts(os.getenv("PROXY_HOSTS"))
 RATE_LIMIT_PER_HOUR: int = int(os.getenv("RATE_LIMIT_PER_HOUR", "30"))
 
+# Premium (paid with Telegram Stars — no payment provider needed). Price in
+# Stars for PREMIUM_DAYS days; premium users get PREMIUM_RATE_MULT x the
+# hourly download limit and go ahead of free users in the download queue.
+PREMIUM_ENABLED: bool = os.getenv("PREMIUM_ENABLED", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+PREMIUM_STARS: int = max(1, int(os.getenv("PREMIUM_STARS", "100")))
+PREMIUM_DAYS: int = max(1, int(os.getenv("PREMIUM_DAYS", "30")))
+PREMIUM_RATE_MULT: int = max(1, int(os.getenv("PREMIUM_RATE_MULT", "5")))
+
 AUTO_DOWNLOAD_GROUPS: bool = os.getenv("AUTO_DOWNLOAD_GROUPS", "1").strip() not in (
     "0",
     "false",

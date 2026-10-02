@@ -16,6 +16,7 @@ from telegram.ext import (
     ContextTypes,
     InlineQueryHandler,
     MessageHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 
@@ -32,6 +33,7 @@ from bot.config import (
     WARMUP_ON_START,
     WARMUP_URL,
 )
+from bot.handlers import premium
 from bot.handlers.download import handle_callback, handle_message
 from bot.handlers.inline import (
     handle_chosen_inline_result,
@@ -300,8 +302,10 @@ async def post_init(app: Application) -> None:
             BotCommand("platforms", "Supported platforms"),
             BotCommand("history", "Your recent downloads"),
             BotCommand("stats", "Usage statistics"),
-            BotCommand("settings", "Preferences & limits"),
+            BotCommand("settings", "Default quality & format (skip the menu)"),
+            BotCommand("premium", "Premium: more downloads + priority"),
             BotCommand("cancel", "Cancel current download"),
+            BotCommand("paysupport", "Help with a payment"),
         ]
     )
 
@@ -326,6 +330,12 @@ async def post_init(app: Application) -> None:
 
 
 def build_app() -> Application:
+    # Premium users get a higher hourly limit; the limiter asks per user.
+    from bot.services import user_prefs
+    from bot.services.rate_limit import rate_limiter
+
+    rate_limiter.limit_for = user_prefs.hourly_limit
+
     if not BOT_TOKEN:
         logger.error(
             "BOT_TOKEN is missing. Copy .env.example to .env and set your token from @BotFather."
@@ -371,6 +381,12 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    # Premium (Telegram Stars)
+    app.add_handler(CommandHandler("premium", premium.cmd_premium))
+    app.add_handler(CommandHandler("paysupport", premium.cmd_paysupport))
+    app.add_handler(CommandHandler("refund", premium.cmd_refund))
+    app.add_handler(PreCheckoutQueryHandler(premium.handle_precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, premium.handle_successful_payment))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
     # Inline mode: @bot <link> in any chat

@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 from bot import __bot_bio__, __bot_name__, __version__
-from bot.config import ADMIN_IDS, RATE_LIMIT_PER_HOUR, SUPPORTED_PLATFORMS
-from bot.keyboards.menus import main_reply_keyboard
+from bot.config import ADMIN_IDS, PREMIUM_ENABLED, RATE_LIMIT_PER_HOUR, SUPPORTED_PLATFORMS
+from bot.keyboards.menus import main_reply_keyboard, settings_keyboard
+from bot.services import user_prefs
 from bot.services.history import get_stats, get_user_history
 from bot.services.rate_limit import rate_limiter
 from bot.utils.helpers import format_size
@@ -197,26 +200,63 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _settings_text(uid: int) -> str:
+    prefs = user_prefs.get(uid)
+    premium = user_prefs.premium_until(uid)
+    labels = {"ask": "ask each time", "video": "🎥 Video", "audio": "🎵 Audio",
+              "max": "Max", "mp3": "MP3", "m4a": "M4A", "opus": "Opus"}
+    q = prefs["quality"]
+    lines = [
+        "⚙️ <b>Settings</b>\n",
+        f"Default type: <b>{labels.get(prefs['mode'], prefs['mode'])}</b>",
+        f"Video quality: <b>{labels.get(q, q + 'p' if q.isdigit() else q)}</b>",
+        f"Audio format: <b>{labels.get(prefs['audio'], prefs['audio'])}</b>",
+        "",
+        f"Downloads this hour: <b>{rate_limiter.remaining(uid)}</b> left "
+        f"of {user_prefs.hourly_limit(uid)}",
+    ]
+    if premium > time.time():
+        lines.append(f"💎 Premium until <b>{time.strftime('%d %b %Y', time.gmtime(premium))}</b>")
+    if uid in ADMIN_IDS:
+        lines.append("🛡 Admin")
+    ready = (prefs["mode"] == "video" and q != "ask") or (
+        prefs["mode"] == "audio" and prefs["audio"] != "ask")
+    lines.append("")
+    lines.append(
+        "⚡ <i>Links you send download straight away with these defaults.</i>" if ready else
+        "<i>Pick a type and its quality/format to skip the menu on every link.</i>"
+    )
+    return "\n".join(lines)
+
+
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message or not update.effective_user:
         return
     uid = update.effective_user.id
-    remaining = rate_limiter.remaining(uid)
-    is_admin = uid in ADMIN_IDS
-    text = (
-        f"⚙️ <b>Settings</b>\n\n"
-        f"• Rate limit: <b>{RATE_LIMIT_PER_HOUR}</b> downloads / hour\n"
-        f"• Remaining this hour: <b>{remaining}</b>\n"
-        f"• Default video quality preference: <b>720p</b> (choose per download)\n"
-        f"• Admin: <b>{'Yes' if is_admin else 'No'}</b>\n\n"
-        f"<i>More preferences (default quality, audio format) can be chosen "
-        f"interactively on every download for maximum control.</i>"
-    )
     await update.effective_message.reply_text(
-        text,
+        _settings_text(uid),
         parse_mode=ParseMode.HTML,
-        reply_markup=main_reply_keyboard(),
+        reply_markup=settings_keyboard(user_prefs.get(uid), premium_enabled=PREMIUM_ENABLED),
     )
+
+
+async def handle_pref_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """pref:<key>:<value> from the settings keyboard (allowlisted in user_prefs)."""
+    query = update.callback_query
+    parts = (query.data or "").split(":")
+    if len(parts) != 3 or not update.effective_user:
+        return
+    uid = update.effective_user.id
+    if not user_prefs.set_pref(uid, parts[1], parts[2]):
+        return
+    try:
+        await query.edit_message_text(
+            _settings_text(uid),
+            parse_mode=ParseMode.HTML,
+            reply_markup=settings_keyboard(user_prefs.get(uid), premium_enabled=PREMIUM_ENABLED),
+        )
+    except TelegramError:
+        pass  # unchanged ("message is not modified") or too old to edit
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

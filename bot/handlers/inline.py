@@ -62,7 +62,8 @@ from bot.config import (
     STORAGE_CHAT_ID,
 )
 from bot.handlers import download as download_handlers
-from bot.services import inline_cache, yt_search
+from bot.services import inline_cache, user_prefs, yt_search
+from bot.services.dl_queue import download_queue
 from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
 from bot.services.history import record_download
 from bot.services.rate_limit import RateLimiter, rate_limiter
@@ -532,11 +533,16 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
     result = None
     platform = platform_from_url(url)
     try:
-        result = await download_manager.download(
-            # m4a: YouTube's own AAC stream, remuxed — no minute-long MP3
-            # re-encode on a small VPS. Telegram plays it as audio natively.
-            url=url, mode=mode, quality=INLINE_QUALITY, audio_format="m4a",
-            title_hint="media", progress_cb=on_progress,
+        result = await download_queue.run(
+            lambda: download_manager.download(
+                # m4a: YouTube's own AAC stream, remuxed — no minute-long MP3
+                # re-encode on a small VPS. Telegram plays it as audio natively.
+                url=url, mode=mode, quality=INLINE_QUALITY, audio_format="m4a",
+                title_hint="media", progress_cb=on_progress,
+            ),
+            on_position=lambda n: caption(
+                f"⏳ <b>Queued</b> — you're #{n} in line", force=True, progress=True),
+            priority=user_prefs.is_premium(user_id),
         )
         if not result.success or not result.primary:
             record_download(user_id, url, "", platform, mode, INLINE_QUALITY, False, error=result.error)

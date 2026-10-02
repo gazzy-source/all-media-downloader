@@ -63,23 +63,27 @@ def fake_ydl(monkeypatch):
 
 
 class TestExtractInfoSync:
-    def test_default_strategy_first_no_clients_forced(self, fake_ydl):
+    def test_visionos_first_then_default_rotation(self, fake_ydl):
         info = dl._extract_info_sync("https://www.youtube.com/watch?v=abc")
         assert info["title"] == "ok"
+        assert fake_ydl.opts_client() == "visionos", "the fast client leads"
+        fake_ydl.fail_on = {"visionos"}
+        dl._META_CACHE.clear()
+        dl._extract_info_sync("https://www.youtube.com/watch?v=abd")
         ea = (fake_ydl.last_opts.get("extractor_args") or {}).get("youtube") or {}
-        assert "player_client" not in ea, "default rotation must stay intact"
+        assert "player_client" not in ea, "fallback: default rotation intact"
         # POT provider arg present for youtube
         assert "youtubepot-bgutilhttp" in (fake_ydl.last_opts.get("extractor_args") or {})
 
     def test_falls_back_to_android(self, fake_ydl, monkeypatch):
-        fake_ydl.fail_on = {"default"}
+        fake_ydl.fail_on = {"visionos", "default"}
         info = dl._extract_info_sync("https://www.youtube.com/watch?v=abc")
         assert info["title"] == "ok"
         assert fake_ydl.opts_client() == "android"
 
     def test_client_pin_keeps_pot_provider_arg(self, fake_ydl):
         """A strategy's extractor_args must merge, not replace the POT block."""
-        fake_ydl.fail_on = {"default"}
+        fake_ydl.fail_on = {"visionos", "default"}
         dl._extract_info_sync("https://www.youtube.com/watch?v=abc")
         ea = fake_ydl.last_opts.get("extractor_args") or {}
         assert ea.get("youtube", {}).get("player_client") == ["android"]
@@ -88,22 +92,22 @@ class TestExtractInfoSync:
     def test_sticky_winner_records_correct_base_index(self, fake_ydl):
         """Regression: reordered strategy lists must remember the base index."""
         dl._remember_yt_strategy(0, download=False)
-        # force the first (default) strategy to fail; android (base idx 1) wins
-        fake_ydl.fail_on = {"default"}
+        # visionos (0) and default (1) fail; android (base idx 2) wins
+        fake_ydl.fail_on = {"visionos", "default"}
         dl._extract_info_sync("https://www.youtube.com/watch?v=abc")
-        assert dl._YT_WINNER_META == 1, (
-            f"expected base index 1 (android), got {dl._YT_WINNER_META}"
+        assert dl._YT_WINNER_META == 2, (
+            f"expected base index 2 (android), got {dl._YT_WINNER_META}"
         )
 
     def test_meta_winner_does_not_pin_download_path(self, fake_ydl):
         """A metadata win must not move the download path's sticky winner."""
-        fake_ydl.fail_on = {"default"}
+        fake_ydl.fail_on = {"visionos", "default"}
         dl._extract_info_sync("https://www.youtube.com/watch?v=abc")
-        assert dl._YT_WINNER_META == 1
+        assert dl._YT_WINNER_META == 2
         assert dl._YT_WINNER_DL == 0
 
     def test_bot_wall_errors_retry_then_raise(self, fake_ydl, monkeypatch):
-        fake_ydl.fail_on = {"default", "android", "android_vr"}
+        fake_ydl.fail_on = {"visionos", "default", "android", "android_vr"}
         with pytest.raises(dl.yt_dlp.utils.DownloadError):
             dl._extract_info_sync("https://www.youtube.com/watch?v=abc")
 
@@ -164,7 +168,7 @@ class TestDownloadStrategyFallback:
 
         def boom(self, url, download=False):
             client = FakeYDL.opts_client()
-            if client == "default":
+            if client in ("visionos", "default"):
                 raise dl.yt_dlp.utils.DownloadError(
                     "unable to download video data: HTTP Error 403: Forbidden"
                 )
@@ -176,7 +180,7 @@ class TestDownloadStrategyFallback:
         )
         assert info["title"] == "ok"
         assert fake_ydl.opts_client() == "android"
-        assert dl._YT_WINNER_DL == 1, "android must become the sticky download winner"
+        assert dl._YT_WINNER_DL == 2, "android (base idx 2) must become the sticky download winner"
 
     def test_generic_host_retries_without_impersonation(self, fake_ydl, monkeypatch):
         """A curl_cffi TLS failure must not be fatal on a one-strategy host."""

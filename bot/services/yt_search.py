@@ -95,6 +95,105 @@ def _hit(entry: dict[str, Any]) -> SearchHit | None:
     )
 
 
+_INNERTUBE_URL = "https://www.youtube.com/youtubei/v1/search?prettyPrint=false"
+_INNERTUBE_CLIENT = {"clientName": "WEB", "clientVersion": "2.20250925.01.00", "hl": "en"}
+_VIDEOS_ONLY = "EgIQAQ%3D%3D"  # YouTube's own "Type: Video" search filter
+
+
+def _walk_video_renderers(node: Any):
+    if isinstance(node, dict):
+        vr = node.get("videoRenderer")
+        if isinstance(vr, dict):
+            yield vr
+        for v in node.values():
+            yield from _walk_video_renderers(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _walk_video_renderers(v)
+
+
+def _text(obj: Any) -> str:
+    if not isinstance(obj, dict):
+        return ""
+    if "simpleText" in obj:
+        return str(obj["simpleText"])
+    return "".join(str(r.get("text", "")) for r in obj.get("runs") or [] if isinstance(r, dict))
+
+
+def _seconds(clock: str) -> int | None:
+    try:
+        parts = [int(p) for p in clock.strip().split(":")]
+    except ValueError:
+        return None
+    total = 0
+    for p in parts:
+        total = total * 60 + p
+    return total or None
+
+
+def _innertube_search(query: str) -> list[SearchHit]:
+    """
+    One POST to the API YouTube's own search box uses: ~0.9s on the server vs
+    ~2.7s through yt-dlp (which pages 20 at a time through WARP). Search pages
+    are not bot-walled on the server's own IP, so this goes direct.
+    """
+    import json
+    import urllib.request
+
+    def post(payload: dict) -> dict:
+        req = urllib.request.Request(
+            _INNERTUBE_URL,
+            data=json.dumps({"context": {"client": _INNERTUBE_CLIENT}, **payload}).encode(),
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read(3_000_000))
+
+    hits: list[SearchHit] = []
+    seen: set[str] = set()
+    data = post({"query": query, "params": _VIDEOS_ONLY})
+    # Up to 2 more pages when the filters (live, >1h) leave too few: "lofi
+    # beats" is almost all 24/7 streams and hour-long mixes on page one.
+    for _page in range(3):
+        _collect(data, hits, seen)
+        token = _continuation(data)
+        if len(hits) >= min(INLINE_SEARCH_MAX, 10) or not token:
+            break
+        data = post({"continuation": token})
+    return hits[:INLINE_SEARCH_MAX]
+
+
+def _continuation(data: Any) -> str | None:
+    stack = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            cmd = node.get("continuationCommand")
+            if isinstance(cmd, dict) and cmd.get("token"):
+                return str(cmd["token"])
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return None
+
+
+def _collect(data: Any, hits: list[SearchHit], seen: set[str]) -> None:
+    for vr in _walk_video_renderers(data):
+        entry = {
+            "id": vr.get("videoId"),
+            "ie_key": "Youtube",
+            "title": _text(vr.get("title")),
+            "channel": _text(vr.get("ownerText")) or _text(vr.get("longBylineText")),
+            # Live streams and premieres carry no length: _hit drops them.
+            "duration": _seconds(_text(vr.get("lengthText"))) if vr.get("lengthText") else None,
+            "view_count": int("".join(c for c in _text(vr.get("viewCountText")) if c.isdigit()) or 0)
+            or None,
+        }
+        h = _hit(entry)
+        if h and h.id not in seen:
+            seen.add(h.id)
+            hits.append(h)
+
+
 def search(query: str) -> list[SearchHit]:
     """Up to INLINE_SEARCH_MAX hits for `query`. Blocking — call from a thread."""
     key = normalize_query(query).lower()
@@ -117,17 +216,27 @@ def search(query: str) -> list[SearchHit]:
         raise RuntimeError("the same search failed a moment ago")
     try:
         started = time.monotonic()
-        with yt_dlp.YoutubeDL(_opts()) as ydl:
-            info = ydl.extract_info(f"ytsearch{INLINE_SEARCH_MAX}:{key}", download=False)
+        source = "api"
+        try:
+            found = _innertube_search(key)
+            api_ok = True
+        except Exception as e:  # changed API / blocked: the yt-dlp path still works
+            logger.info("search API unavailable (%r) — using yt-dlp", e)
+            found, api_ok = [], False
+        if not api_ok:
+            source = "yt-dlp"
+            with yt_dlp.YoutubeDL(_opts()) as ydl:
+                info = ydl.extract_info(f"ytsearch{INLINE_SEARCH_MAX}:{key}", download=False)
+            found = [_hit(e) for e in (info or {}).get("entries") or []]
         hits, seen = [], set()
-        for h in (_hit(e) for e in (info or {}).get("entries") or []):
+        for h in found:
             # yt-dlp does not dedupe across result pages, and one duplicate id
             # makes Telegram reject the whole answer (RESULT_ID_DUPLICATE).
             if h and h.id not in seen:
                 seen.add(h.id)
                 hits.append(h)
-        logger.info("inline search %r: %s hits in %.1fs", key[:40], len(hits),
-                    time.monotonic() - started)
+        logger.info("inline search %r: %s hits in %.1fs (%s)", key[:40], len(hits),
+                    time.monotonic() - started, source)
         with _CACHE_LOCK:
             if len(_CACHE) >= _CACHE_MAX:
                 for k, _ in sorted(_CACHE.items(), key=lambda kv: kv[1][0])[: _CACHE_MAX // 4]:

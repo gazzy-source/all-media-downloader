@@ -24,7 +24,9 @@ class TestYtStrategies:
 
     def test_cookieless_first_strategy(self):
         strats = _yt_strategies(has_cookies=False)
-        assert strats[0] == {"use_cookies": False}
+        assert strats[0]["use_cookies"] is False
+        assert strats[0]["extractor_args"]["youtube"]["player_client"] == ["visionos"]
+        assert strats[1] == {"use_cookies": False}  # then the default rotation
 
     def test_no_dead_clients_anywhere(self):
         # tv_embedded was removed from yt-dlp >= 2026.x and must never return
@@ -34,12 +36,13 @@ class TestYtStrategies:
 
     def test_cookie_strategy_keeps_cookies_before_fallbacks(self):
         strats = _yt_strategies(has_cookies=True)
-        assert strats[0]["use_cookies"] is False   # cookieless default first
-        assert strats[1]["use_cookies"] is True    # cookies for age-restricted
-        assert sum(1 for s in strats if "extractor_args" in s) == 2
+        assert strats[0]["use_cookies"] is False   # visionos, cookieless
+        assert strats[1]["use_cookies"] is False   # default rotation, cookieless
+        assert strats[2]["use_cookies"] is True    # cookies for age-restricted
+        assert sum(1 for s in strats if "extractor_args" in s) == 3
 
     def test_fallbacks_drop_impersonate(self):
-        for s in _yt_strategies(has_cookies=False)[1:]:
+        for s in _yt_strategies(has_cookies=False)[2:]:  # android fallbacks
             assert s.get("drop_impersonate") is True
 
 
@@ -301,10 +304,12 @@ class TestYtStrategyLadder:
             android = strats[clients.index("android")]
             assert android["use_cookies"] is False
 
-    def test_default_rotation_leads(self):
-        """Quality-first: the full format ladder is attempted before the 360p floor."""
+    def test_full_ladder_clients_lead(self):
+        """Quality-first: full-ladder clients (visionos, then the default rotation)
+        are attempted before the 360p android floor."""
         strats = dl._yt_strategies(has_cookies=False)
-        assert not strats[0].get("extractor_args"), "default rotation must lead"
+        assert strats[0]["extractor_args"]["youtube"]["player_client"] == ["visionos"]
+        assert not strats[1].get("extractor_args"), "default rotation second"
 
     def test_cookie_strategy_only_when_cookies_exist(self):
         assert not any(

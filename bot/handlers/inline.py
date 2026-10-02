@@ -69,6 +69,7 @@ from bot.services.history import record_download
 from bot.services.rate_limit import RateLimiter, rate_limiter
 from bot.services.url_tokens import put_url
 from bot.utils.helpers import extract_urls, format_size, platform_from_url
+from bot.utils.progress_view import ProgressView
 from bot.utils.safe_fetch import (
     UnresolvableURLError,
     UnsafeURLError,
@@ -347,7 +348,7 @@ _AUDIO_PREFIXES = ("audio ", "mp3 ", "music ", "song ", "🎵")
 _LATEST: dict[int, str] = {}
 # Measured in production: people pause 0.5-1.7s between words, so 0.4s still
 # searched "meet me on the l", "…la", "…lab" separately.
-_DEBOUNCE = 0.65
+_DEBOUNCE = 0.5  # searches cost ~0.9s now (one API call), so react sooner
 _SEARCH_SLOTS = asyncio.Semaphore(3)
 
 
@@ -569,12 +570,22 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
             return
         inline_cache.forget(url, _key(mode))  # Telegram refused it: fetch afresh below
 
-    async def on_progress(pct: float, msg: str) -> None:
-        # Short, single status on the button. The finishing steps (converting,
-        # cover art) always show — throttled away, the card looked stuck.
-        label = f"⬇ {pct:.0f}%" if msg.startswith("⬇") else msg.strip()
-        await status(label, force=pct >= 99)
+    view = ProgressView()
 
+    async def on_progress(pct: float, msg: str) -> None:
+        # One short line on the button ("⬇ 45% · ~2s left"); a step change
+        # always shows — throttled away, the card looked stuck.
+        changed = view.update(pct, msg)
+        await status(view.short(), force=changed)
+
+    async def tick() -> None:
+        # Keep the clock moving through steps that report nothing.
+        while not state["done"]:
+            await asyncio.sleep(3)
+            if view.stage != "download":
+                await status(view.short())
+
+    ticker = asyncio.create_task(tick())
     _STATUS[imid] = "⏳ Starting…"
     inline_cache.add_pending(imid)
     result = None
@@ -587,7 +598,7 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
                 url=url, mode=mode, quality=INLINE_QUALITY, audio_format="m4a",
                 title_hint="media", progress_cb=on_progress,
             ),
-            on_position=lambda n: status(f"⏳ Queued — #{n} in line", force=True),
+            on_position=lambda n: on_progress(0, f"Queued — you're #{n} in line"),
             priority=user_prefs.is_premium(user_id),
         )
         if not result.success or not result.primary:
@@ -609,7 +620,8 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         if chat is None:
             await finish("❌ Inline mode isn't set up on this server yet.")
             return
-        await status("📤 Sending…", force=True)
+        view.sending()
+        await status(view.short(), force=True)
         state["done"] = True  # from here the card only changes into the file
         sent = await download_handlers._send_media(
             context, chat, result.primary, result, caption="", silent=True
@@ -640,6 +652,7 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         state["done"] = False
         await finish("❌ Something went wrong. Please try again.")
     finally:
+        ticker.cancel()
         _STATUS.pop(imid, None)
         inline_cache.drop_pending(imid)
         if result is not None:

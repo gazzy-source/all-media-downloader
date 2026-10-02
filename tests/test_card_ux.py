@@ -69,7 +69,8 @@ class TestCard:
                                  inline_message_id="IM", from_user=SimpleNamespace(id=1))
         await _search(env, "audio song")  # so the card's title is known
         await inl.handle_chosen_inline_result(SimpleNamespace(chosen_inline_result=chosen), env.ctx)
-        assert env.ctx.bot.statuses == ["⬇ 10%", "🎵 Converting audio…"]  # no repeats
+        st = env.ctx.bot.statuses  # no repeats; elapsed time is appended
+        assert len(st) == 2 and st[0].startswith("⬇ 10%") and st[1].startswith("🎵 Converting audio…")
         assert env.ctx.bot.captions[-1].startswith("<b>Song 1</b>")  # failure keeps the name
         assert "nope" in env.ctx.bot.captions[-1]
 

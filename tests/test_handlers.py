@@ -146,11 +146,11 @@ class TestAutoDownloadFlow:
 
         assert recorded["args"][6] is True  # 7th positional arg = success flag
         assert msg.replies, "status message must be posted"
-        assert any("Downloading" in r[0] for r in msg.replies)
+        assert any("Finding source" in r[0] for r in msg.replies)
         assert fx.ctx.bot.chat_actions, "chat action must be sent"
         # status child message: edited to upload notice, then cleaned up
         status = msg.children[0]
-        assert any("Uploading" in e[0] for e in status.edits)
+        assert any("Sending" in e[0] for e in status.edits)
         assert status.deleted, "status message must be deleted after send"
 
     async def test_failure_edits_error_and_records(self, fx, monkeypatch, tmp_path, no_rate_limit):

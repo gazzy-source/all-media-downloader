@@ -253,3 +253,14 @@ def _no_dns_in_url_guard(monkeypatch):
 
     monkeypatch.setattr(hd, "check_public_url", lambda url: None)
     monkeypatch.setattr(dl, "check_public_url", lambda url: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_youtube_search_api(monkeypatch):
+    """Inline search tries YouTube's API first; tests must never reach it."""
+    import bot.services.yt_search as yt_search
+
+    def offline(query):
+        raise RuntimeError("search API disabled in tests")
+
+    monkeypatch.setattr(yt_search, "_innertube_search", offline)

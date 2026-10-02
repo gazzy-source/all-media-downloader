@@ -35,6 +35,7 @@ from bot.keyboards.menus import (
 )
 from bot.services import inline_cache, user_prefs
 from bot.services.dl_queue import download_queue
+from bot.utils.progress_view import ProgressView
 from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
 from bot.services.history import record_download
 from bot.services.inflight import add as inflight_add, remove as inflight_remove
@@ -293,32 +294,10 @@ async def auto_download_flow(
             record_download(actor, url, hit.get("title") or "", platform, mode, quality, True)
             return True
 
-    status = await msg.reply_text(
-        f"⚡ <b>Downloading</b> · {kind}",
-        parse_mode=ParseMode.HTML,
-    )
-
-    last_edit = {"t": 0.0}
-
-    async def on_progress(pct: float, text: str) -> None:
-        now = time.time()
-        is_status = pct < 8 or any(
-            k in text for k in ("Queued", "Starting", "Resolving", "Fetching")
-        )
-        # Light UI updates — avoid Telegram flood while still feeling live
-        if not is_status and now - last_edit["t"] < 2.5 and pct < 95:
-            return
-        last_edit["t"] = now
-        try:
-            label = "Queued" if "Queued" in text else "Downloading"
-            await status.edit_text(
-                f"⚡ <b>{label}</b> · {kind}\n"
-                f"{progress_bar(pct)}\n"
-                f"<code>{_esc(text)}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-        except TelegramError:
-            pass
+    view = ProgressView()
+    head = f"⚡ <b>{kind}</b> · {_esc(platform)}"
+    status = await msg.reply_text(view.render(head), parse_mode=ParseMode.HTML)
+    on_progress, ticker = _progress_driver(view, lambda: head, status.edit_text)
 
     inflight_add(chat.id, status.message_id)
     try:
@@ -335,6 +314,7 @@ async def auto_download_flow(
             priority=user_prefs.is_premium(actor),
         )
     except Exception as e:
+        ticker.cancel()
         logger.exception("auto download crashed")
         record_download(actor, url, "", platform, mode, quality, False, error=str(e))
         try:
@@ -347,6 +327,7 @@ async def auto_download_flow(
         inflight_remove(chat.id, status.message_id)
         return False
 
+    ticker.cancel()  # every outcome below writes its own final text
     if not result.success or not result.primary:
         record_download(
             actor,
@@ -372,11 +353,10 @@ async def auto_download_flow(
     path = result.primary
     size = result.file_size or path.stat().st_size
     delivered = False
+    ticker.cancel()
+    view.sending(format_size(size))
     try:
-        await status.edit_text(
-            f"📤 Uploading… ({format_size(size)})",
-            parse_mode=ParseMode.HTML,
-        )
+        await status.edit_text(view.render(head), parse_mode=ParseMode.HTML)
     except TelegramError:
         pass
 
@@ -390,7 +370,7 @@ async def auto_download_flow(
         kind = "🖼 Image" if result.is_image else f"📐 {_quality_label(result)}"
         caption = (
             f"🎬 <b>{title}</b>\n"
-            f"{kind} · 💾 {format_size(size)}\n"
+            f"{kind} · 💾 {format_size(size)} · ⏱ ready in {view.elapsed():.0f}s\n"
             f"⚡ All-Media Downloader · Gazzy Labs"
         )
         actions = after_download_keyboard(url, user_id=actor)
@@ -637,6 +617,75 @@ async def start_url_flow(
             parse_mode=ParseMode.HTML,
             reply_markup=mode_keyboard(session),
         )
+
+
+class _Ticker:
+    """Re-renders every few seconds so the clock moves in steps with no events."""
+
+    def __init__(self, fn) -> None:
+        self._fn = fn
+        self._task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(3)
+                await self._fn()
+        except asyncio.CancelledError:
+            pass
+
+    def cancel(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+
+
+def _progress_driver(view: "ProgressView", header, edit, *, start: bool = True):
+    """
+    (on_progress, ticker) for a chat status message. Edits on every step
+    change, otherwise at most every 2.5s; the ticker keeps the clock moving
+    through steps that report nothing (finding the source, converting).
+    """
+    last = {"t": 0.0, "text": ""}
+    lock = asyncio.Lock()
+
+    async def render(force: bool = False) -> None:
+        async with lock:
+            now = time.monotonic()
+            if not force and now - last["t"] < 2.5:
+                return
+            text = view.render(header())
+            if text == last["text"]:
+                return  # Telegram refuses identical edits
+            last.update(t=now, text=text)
+            try:
+                await edit(text, parse_mode=ParseMode.HTML)
+            except TelegramError:
+                pass
+
+    async def on_progress(pct: float, msg: str) -> None:
+        changed = view.update(pct, msg)
+        await render(force=changed)
+
+    async def tick() -> None:
+        if view.stage != "download":  # downloads tick on their own events
+            await render()
+
+    ticker = _Ticker(tick)
+    if start:
+        ticker.start()
+    return on_progress, ticker
+
+
+def _dm_header(session, mode: str, quality: str) -> str:
+    what = {"audio": f"🎵 Audio {session.audio_format.upper()}",
+            "video_subs": "🎞 Video + subtitles",
+            "image": "🖼 Image"}.get(
+        mode, f"🎬 Video {QUALITY_MAP.get(quality, {}).get('label', quality)}")
+    return f"{_session_header(session)} · {what}"
 
 
 class _StatusQuery:
@@ -1028,29 +1077,14 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
     except TelegramError:
         pass
 
-    last_edit = {"t": 0.0}
+    view = ProgressView()
+    dm_head = _dm_header(session, mode, quality)
 
-    async def on_progress(pct: float, msg: str) -> None:
-        now = time.time()
-        # Always show queue / start messages; throttle mid-download %
-        is_status = pct < 5 or "Queued" in msg or "Starting" in msg or "Connecting" in msg
-        if not is_status and now - last_edit["t"] < 2.0 and pct < 99:
-            return
-        last_edit["t"] = now
-        text = (
-            f"{_session_header(session)}\n\n"
-            f"{progress_bar(pct)}\n"
-            f"<code>{_esc(msg)}</code>"
-        )
-        try:
-            await context.bot.edit_message_text(
-                text,
-                chat_id=chat_id,
-                message_id=query.message.message_id,
-                parse_mode=ParseMode.HTML,
-            )
-        except TelegramError:
-            pass
+    async def _edit_dm(text: str, **kw) -> None:
+        await context.bot.edit_message_text(
+            text, chat_id=chat_id, message_id=query.message.message_id, **kw)
+
+    on_progress, ticker = _progress_driver(view, lambda: dm_head, _edit_dm, start=False)
 
     # Refuse a doomed download BEFORE spending it, not after. The analysis pass
     # already measured every quality, so when the estimate is over Telegram's
@@ -1113,6 +1147,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
             return
 
     inflight_add(chat_id, query.message.message_id)
+    ticker.start()
     try:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
         result = await download_queue.run(
@@ -1132,6 +1167,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
             priority=user_prefs.is_premium(session.user_id),
         )
     except Exception as e:
+        ticker.cancel()
         logger.exception("download crashed")
         record_download(
             session.user_id,
@@ -1153,6 +1189,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         )
         return
 
+    ticker.cancel()  # every outcome below writes its own final text
     if not result.success or not result.primary:
         record_download(
             session.user_id,
@@ -1187,17 +1224,14 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
     path = result.primary
     size = result.file_size or path.stat().st_size
 
+    ticker.cancel()
+    view.sending(format_size(size))
     try:
-        await query.edit_message_text(
-            f"{_session_header(session)}\n\n"
-            f"{progress_bar(100)}\n"
-            f"📤 Uploading to Telegram… ({format_size(size)})",
-            parse_mode=ParseMode.HTML,
-        )
+        await query.edit_message_text(view.render(dm_head), parse_mode=ParseMode.HTML)
     except TelegramError:
         pass
 
-    caption = _build_caption(session, result, size)
+    caption = _build_caption(session, result, size) + f"\n⏱ Ready in {view.elapsed():.0f}s"
     # Short token only — full URLs exceed Telegram's 64-byte callback_data limit
     actions = after_download_keyboard(session.url, user_id=session.user_id)
 

@@ -337,26 +337,30 @@ SUPPORTED_PLATFORMS = [
 # bv*+ba (requires ffmpeg, which the bot ships/requires) — verified to prefer
 # real video over storyboards in every format-list shape.
 SB_GUARD = "[vcodec!^=mjpeg][ext!=mhtml]"
+# YouTube selectors lead with the video+audio merge. A progressive "b" first
+# matched YouTube's only progressive format, itag 18 — 360p — whenever it was
+# listed, so 480/720/1080 and even "Max" came back as 360p (measured on the
+# server: a 720p request for dQw4w9WgXcQ picked format 18).
 QUALITY_MAP = {
     "480": {
         "label": "480p",
         "height": 480,
-        "format": f"b[height<=480]{SB_GUARD}/bv*[height<=480]{SB_GUARD}+ba/bv*+ba/b",
+        "format": f"bv*[height<=480]{SB_GUARD}+ba/b[height<=480]{SB_GUARD}/bv*+ba/b",
     },
     "720": {
         "label": "720p",
         "height": 720,
-        "format": f"b[height<=720]{SB_GUARD}/bv*[height<=720]{SB_GUARD}+ba/bv*+ba/b",
+        "format": f"bv*[height<=720]{SB_GUARD}+ba/b[height<=720]{SB_GUARD}/bv*+ba/b",
     },
     "1080": {
         "label": "1080p",
         "height": 1080,
-        "format": f"b[height<=1080]{SB_GUARD}/bv*[height<=1080]{SB_GUARD}+ba/bv*+ba/b",
+        "format": f"bv*[height<=1080]{SB_GUARD}+ba/b[height<=1080]{SB_GUARD}/bv*+ba/b",
     },
     "max": {
         "label": "Max Quality",
         "height": 9999,
-        "format": "b/bv*+ba/b",
+        "format": "bv*+ba/b",
     },
 }
 

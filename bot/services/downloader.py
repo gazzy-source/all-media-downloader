@@ -1001,8 +1001,14 @@ def _yt_strategies(*, has_cookies: bool) -> list[dict[str, Any]]:
         "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
         "drop_impersonate": True,
     }
-    # Default rotation, cookieless — public videos, full format ladder
-    ladder: list[dict[str, Any]] = [{"use_cookies": False}]
+    # VISIONOS alone first: measured on the server it lists the same formats
+    # and qualities as the default client rotation but extracts ~2.5x faster
+    # (median 2.6s vs 6.5s, worst 3.0s vs 29.3s) — the rotation also queries
+    # WEB clients whose player JS challenge is the slow part on this CPU.
+    visionos = {"use_cookies": False,
+                "extractor_args": {"youtube": {"player_client": ["visionos"]}}}
+    # Then the default rotation, cookieless — public videos, full format ladder
+    ladder: list[dict[str, Any]] = [visionos, {"use_cookies": False}]
     if has_cookies:
         # Default rotation + cookies (age-restricted / members-only)
         ladder.append({"use_cookies": True})
@@ -1671,8 +1677,14 @@ class DownloadManager:
                 if last_pct["v"] >= 0 and pct - last_pct["v"] < 8 and pct < 95:
                     return
                 last_pct["v"] = pct
-                label = "⬇ Audio" if part == "audio" else "⬇"
-                _emit(pct, f"{label} {pct:.0f}% · {speed_s}")
+                bits = [f"{pct:.0f}%"]
+                if part == "single":  # a part's size isn't the job's size
+                    bits.append(f"{format_size(done)} of {format_size(total)}")
+                bits.append(speed_s)
+                eta = d.get("eta")
+                if eta and part != "audio":
+                    bits.append(f"~{int(eta)}s left")
+                _emit(pct, "⬇ " + " · ".join(bits))
             elif status == "finished" and part != "video":
                 # A video part finishing is only half the job: its audio follows.
                 last_pct["v"] = max(last_pct["v"], 99.0)

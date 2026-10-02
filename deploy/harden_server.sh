@@ -104,8 +104,16 @@ CapabilityBoundingSet=
 EOF
 systemctl daemon-reload
 systemctl restart "$HEALTH"
-sleep 3
-if curl -s -m 10 -o /dev/null -w '%{http_code}' "$KUMA_HEALTH_URL" | grep -qE '^(200|503)$'; then
+# Give it time to bind: one check 3s after a restart raced the start-up and
+# rolled back a working change.
+answered=0
+for _ in $(seq 1 10); do
+    sleep 2
+    if curl -s -m 5 -o /dev/null -w '%{http_code}' "$KUMA_HEALTH_URL" | grep -qE '^(200|503)$'; then
+        answered=1; break
+    fi
+done
+if [ "$answered" = 1 ]; then
     echo "health endpoint answers at $KUMA_HEALTH_URL:"
     curl -s -m 10 "$KUMA_HEALTH_URL"; echo
 else
@@ -115,5 +123,6 @@ else
     systemctl restart "$HEALTH"
 fi
 
+sleep 2
 say "Done. Listening sockets for the health endpoint:"
 ss -tlnp | grep 9123 || true

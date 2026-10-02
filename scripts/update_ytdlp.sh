@@ -37,7 +37,25 @@ else
     check="'$PY' -c 'import yt_dlp, bot.main, bot.services.downloader'"
 fi
 
+# Restart only when nobody is downloading (up to 30 min), so the weekly
+# update never cuts a user's transfer. The bot's heartbeat says how busy it is.
+wait_idle() {
+    for _ in $(seq 1 60); do
+        busy=$("$PY" - "$APP/data/heartbeat.json" <<'EOF' 2>/dev/null || echo 0
+import json, sys, time
+d = json.load(open(sys.argv[1]))
+fresh = time.time() - d.get("ts", 0) < 120
+print((d.get("queue_running", 0) + d.get("queue_waiting", 0)) if fresh else 0)
+EOF
+)
+        [ "${busy:-0}" = "0" ] && return 0
+        sleep 30
+    done
+    logger -t ytdlp-update "bot still busy after 30 min - restarting anyway"
+}
+
 if as_owner bash -c "cd '$APP' && $check >/tmp/ytdlp-update-tests.log 2>&1"; then
+    wait_idle
     systemctl restart "$SVC"
     logger -t ytdlp-update "yt-dlp updated $before -> $after; tests passed; $SVC restarted"
 else

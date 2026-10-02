@@ -33,14 +33,27 @@ class Job:
 
 
 _JOBS: dict[str, Job] = {}
-_BY_OWNER: dict[int, str] = {}
+# Set when the process is stopping: a job stopped by shutdown is NOT a user's
+# cancel — its message stays registered so the next start says "Interrupted".
+SHUTTING_DOWN = False
 
 
-def start(key: str, owner: int, *, by_owner: bool = False) -> Job:
+def shutdown_all() -> int:
+    """Stop every running download and withdraw queued ones (process exit)."""
+    global SHUTTING_DOWN
+    SHUTTING_DOWN = True
+    n = 0
+    for job in list(_JOBS.values()):
+        job.event.set()
+        if job.task is not None and not job.started:
+            job.task.cancel()
+        n += 1
+    return n
+
+
+def start(key: str, owner: int) -> Job:
     job = Job(key, owner)
     _JOBS[key] = job
-    if by_owner:  # /cancel finds the user's DM job through this
-        _BY_OWNER[owner] = key
     return job
 
 
@@ -51,12 +64,12 @@ def get(key: str) -> Job | None:
 def drop(job: Job) -> None:
     if _JOBS.get(job.key) is job:
         del _JOBS[job.key]
-    if _BY_OWNER.get(job.owner) == job.key:
-        del _BY_OWNER[job.owner]
 
 
-def key_for_owner(owner: int) -> str | None:
-    return _BY_OWNER.get(owner)
+def keys_for(owner: int, chat_id: int) -> list[str]:
+    """The owner's jobs in one chat (/cancel never reaches into other chats)."""
+    prefix = f"dm:{chat_id}:"
+    return [k for k, j in list(_JOBS.items()) if j.owner == owner and k.startswith(prefix)]
 
 
 async def cancel(key: str | None, user_id: int) -> str:
@@ -86,10 +99,14 @@ async def run_queued(job: Job, queue, factory: Callable[[], Awaitable[Any]], **k
     queue.run(...) in a task the Cancel button can withdraw while it waits.
     Raises asyncio.CancelledError when cancelled before getting a slot.
     """
+    if job.cancelled:
+        raise asyncio.CancelledError  # cancelled before it even queued
+
     async def go():
         job.started = True
         return await factory()
 
+    kw.setdefault("owner", job.owner)  # fair share per person
     job.task = asyncio.ensure_future(queue.run(go, **kw))
     return await job.task
 

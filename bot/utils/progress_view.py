@@ -99,6 +99,16 @@ class ProgressView:
     def elapsed(self) -> float:
         return time.monotonic() - self.t0
 
+    def phases(self) -> str:
+        """'find=2.1s download=6.0s process=0.4s send=1.2s' — for the log."""
+        now = time.monotonic()
+        out = []
+        for key, _ in STEPS:
+            if key in self.started:
+                end = self.ended.get(key, now)
+                out.append(f"{key}={max(0.0, end - self.started[key]):.1f}s")
+        return " ".join(out)
+
     # ---------------------------------------------------------- rendering
     def render(self, header: str) -> str:
         """Full text for a chat message (HTML)."""

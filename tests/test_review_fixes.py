@@ -315,4 +315,4 @@ class TestDownloaderReviewFixes:
     def test_warmup_never_rotates_warp(self):
         from pathlib import Path
         src = Path(dl.__file__).read_text(encoding="utf-8")
-        assert "url != WARMUP_URL" in src
+        assert "_bot_idle() if url == WARMUP_URL" in src

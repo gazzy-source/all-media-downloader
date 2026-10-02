@@ -27,7 +27,6 @@ from bot.config import (
 from bot.keyboards.menus import (
     after_download_keyboard,
     audio_format_keyboard,
-    image_size_keyboard,
     main_reply_keyboard,
     mode_keyboard,
     quality_keyboard,
@@ -35,6 +34,7 @@ from bot.keyboards.menus import (
 )
 from bot.services import activity, inline_cache, jobs, user_prefs
 from bot.services.dl_queue import download_queue
+from bot.utils import redact
 from bot.utils.texts import rate_limit_text, too_big_text, upload_failed_text
 from bot.utils.progress_view import ProgressView
 from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
@@ -91,6 +91,9 @@ def _should_auto_download(update: Update) -> bool:
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     activity.touch()
+    m = update.effective_message
+    if m is not None and _is_auto_chat(update) and _stale(m):
+        return  # replayed after downtime: the group has moved on
     if not update.effective_message:
         return
     # PTB's message filters also match edits. Fixing a typo in a link message
@@ -287,7 +290,7 @@ async def auto_download_flow(
             "" if is_chan else f"🎬 <b>{title}</b>\n⚡ Instant · All-Media Downloader · Gazzy Labs",
             reply_markup=None if is_chan else after_download_keyboard(
                 url, user_id=actor, private=chat.type == "private"),
-            url=url, key=repeat,
+            url=url, key=repeat, thread_id=_thread_of(msg),
         )
         if sent is not None:
             if (is_chan and CHANNEL_REPLACE_LINK and replace_source
@@ -298,24 +301,48 @@ async def auto_download_flow(
 
     view = ProgressView()
     head = f"⚡ <b>{kind}</b> · {_esc(platform)}"
-    status = await msg.reply_text(view.render(head), parse_mode=ParseMode.HTML)
-    on_progress, ticker = _progress_driver(view, lambda: head, status.edit_text)
+    can_cancel = chat.type != "channel"  # a channel post has no person to own it
+    status = await msg.reply_text(view.render(head), parse_mode=ParseMode.HTML,
+                                  reply_markup=_CANCEL_KB if can_cancel else None)
+    job = jobs.start(f"dm:{chat.id}:{status.message_id}", actor)
+    if not can_cancel:
+        job.cancellable = False
+    on_progress, ticker = _progress_driver(
+        view, lambda: head, status.edit_text,
+        markup=(lambda: _CANCEL_KB if job.cancellable and not job.cancelled else None)
+        if can_cancel else None)
+
+    async def _cancelled() -> None:
+        await ticker.close(None)
+        await _quiet_delete_msg(context, chat.id, status.message_id)
+
+    job.on_cancel = _cancelled
 
     inflight_add(chat.id, status.message_id)
     try:
         await context.bot.send_chat_action(chat.id, ChatAction.UPLOAD_DOCUMENT)
-        result = await download_queue.run(
+        result = await jobs.run_queued(
+            job, download_queue,
             lambda: download_manager.download(
                 url=url,
                 mode=mode,
                 quality=quality,
                 title_hint="media",
                 progress_cb=on_progress,
+                cancel=job.event,
             ),
             on_position=lambda n: on_progress(0, f"Queued — you're #{n} in line"),
             priority=user_prefs.is_premium(actor),
         )
+    except asyncio.CancelledError:
+        jobs.drop(job)
+        if not job.cancelled:
+            raise
+        if not jobs.SHUTTING_DOWN:  # on shutdown: keep it for the restart notice
+            inflight_remove(chat.id, status.message_id)
+        return False
     except Exception as e:
+        jobs.drop(job)
         ticker.cancel()
         logger.exception("auto download crashed")
         record_download(actor, url, "", platform, mode, quality, False, error=str(e))
@@ -329,7 +356,17 @@ async def auto_download_flow(
         inflight_remove(chat.id, status.message_id)
         return False
 
-    ticker.cancel()  # every outcome below writes its own final text
+    # close, not cancel: also waits out a progress edit already in flight,
+    # which could otherwise land after (and overwrite) the final text below.
+    await ticker.close(None)
+    if not job.cancelled:
+        job.cancellable = False
+    jobs.drop(job)
+    if job.cancelled:  # its message is already gone (or we are shutting down)
+        if not jobs.SHUTTING_DOWN:
+            inflight_remove(chat.id, status.message_id)
+        download_manager.cleanup_result_files(result)
+        return False
     if not result.success or not result.primary:
         record_download(
             actor,
@@ -412,7 +449,8 @@ async def auto_download_flow(
             logger.info("Channel post handling: %s", outcome)
         else:
             sent = await _send_media(
-                context, chat.id, path, result, caption, reply_markup=actions
+                context, chat.id, path, result, caption, reply_markup=actions,
+                thread_id=_thread_of(msg),
             )
             _remember_upload(url, repeat, sent, result.title or "", result, mode, quality)
         record_download(
@@ -516,9 +554,11 @@ async def start_url_flow(
             await msg.reply_text(
                 body, parse_mode=ParseMode.HTML, reply_markup=main_reply_keyboard()
             )
+        rate_limiter.refund(user.id)
         return
     except Exception as e:
         logger.exception("extract_info failed")
+        rate_limiter.refund(user.id)
         from bot.services.downloader import DownloadManager
 
         friendly = DownloadManager._friendly_error(str(e))
@@ -702,6 +742,47 @@ def _dm_header(session, mode: str, quality: str) -> str:
     return f"{_session_header(session)} · {what}"
 
 
+_LAST_AGAIN: dict[tuple[int, str], float] = {}
+_STALE_GROUP_POST = 600  # seconds
+
+
+def _stale(msg) -> bool:
+    """A group/channel post older than 10 min (kept updates replayed at start)."""
+    from datetime import datetime, timezone
+
+    date = getattr(msg, "date", None)
+    if not isinstance(date, datetime):
+        return False
+    if date.tzinfo is None:
+        date = date.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - date).total_seconds() > _STALE_GROUP_POST
+
+
+async def _answer(query, text: str, *, alert: bool = False) -> None:
+    try:
+        await query.answer(text, show_alert=alert)
+    except TelegramError:
+        pass
+
+
+async def _safe_edit(query, text: str, **kw) -> None:
+    """A wizard edit that a double tap or an old message can't turn into an error."""
+    try:
+        await query.edit_message_text(text, **kw)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.info("wizard edit refused: %s", e)
+    except TelegramError as e:
+        logger.info("wizard edit failed: %s", e)
+
+
+def _thread_of(msg) -> int | None:
+    """The forum topic a message was posted in (files must land there too)."""
+    if msg is not None and getattr(msg, "is_topic_message", False):
+        return getattr(msg, "message_thread_id", None)
+    return None
+
+
 def _own_message_id(msg, user) -> int | None:
     """
     The user's own link message (deleted if they cancel). Not after Download
@@ -709,6 +790,10 @@ def _own_message_id(msg, user) -> int | None:
     """
     sender = getattr(msg, "from_user", None)
     if sender is None or user is None or sender.id != user.id:
+        return None
+    # Only a message that is nothing but this one link: a photo with a link
+    # caption, or a message with several links, is the user's own content.
+    if not _is_link_only_post(msg) or len(extract_urls(msg.text, expand=False)) != 1:
         return None
     return getattr(msg, "message_id", None)
 
@@ -811,6 +896,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data.startswith("again:"):
         from bot.services.url_tokens import get_url
 
+        now = time.monotonic()
+        tap = (user_id, data)
+        if now - _LAST_AGAIN.get(tap, 0.0) < 3:
+            return  # a double tap: the first one is already reading the link
+        _LAST_AGAIN[tap] = now
+        if len(_LAST_AGAIN) > 5000:
+            _LAST_AGAIN.pop(next(iter(_LAST_AGAIN)))
+
         token = data[6:].strip()
         # Only the person the button was made for (or an admin). callback_data
         # is client-controlled, so the old "raw URL in the token" fallback let
@@ -839,26 +932,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     sid = parts[1]
     session = sessions.get(sid)
+    private = bool(query.message and query.message.chat.type == "private")
     if not session:
+        if action == "cancel":
+            return  # a second tap on ❌ Cancel: it is already cancelled
+        if not private:
+            # Not ours to rewrite in a group: someone else's stale menu.
+            await _answer(query, "This menu has expired — send the link again.", alert=True)
+            return
         # Sessions live in memory, so they also vanish on a bot restart — not
         # only on timeout. Say what to do rather than just what went wrong.
-        await query.edit_message_text(
-            "⌛ <b>This session is no longer active</b>\n\n"
-            "Wizard sessions expire after a while, and reset when the bot "
-            "restarts.\n\nJust send the link again — it only takes a moment.",
+        await _safe_edit(
+            query,
+            "⌛ <b>This menu has expired</b>\n\n"
+            "Menus reset after a while and when the bot restarts. Just send "
+            "the link again — it only takes a moment.",
             parse_mode=ParseMode.HTML,
         )
         return
     if session.user_id != user_id and user_id not in ADMIN_IDS:
-        if query.message:
-            await query.message.reply_text(
-                "⛔ This isn't your download session."
-            )
+        # A private pop-up, not a public reply that pings the whole group.
+        await _answer(query, "⛔ This isn't your download.", alert=True)
         return
 
     if action == "cancel":
         sessions.remove(sid)
-        await query.edit_message_text("❌ Download cancelled.")
+        rate_limiter.refund(session.user_id)  # nothing was downloaded
+        await _safe_edit(query, "❌ Cancelled.")
         return
 
     if action == "back_mode":
@@ -895,12 +995,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
         if mode == "image":
-            await query.edit_message_text(
-                _session_header(session)
-                + "\n\n🖼 <b>Image resolution:</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=image_size_keyboard(session),
-            )
+            # Straight to the best image: the old size picker's choice never
+            # reached the downloader, so every button fetched the same file.
+            await execute_download(query, context, session)
             return
         # video / video_subs → quality
         await query.edit_message_text(
@@ -991,7 +1088,8 @@ _DELIVERED_UNCONFIRMED = object()
 
 
 async def _send_cached(context, chat_id: int, hit: dict, caption: str, reply_markup=None,
-                       *, url: str = "", key: str | None = None):
+                       *, url: str = "", key: str | None = None,
+                       thread_id: int | None = None):
     """
     Re-send a file Telegram already has. Returns the Message (or, after a
     timeout, a marker: it probably arrived — never send it twice), or None to
@@ -1001,6 +1099,8 @@ async def _send_cached(context, chat_id: int, hit: dict, caption: str, reply_mar
     field = hit.get("kind") if hit.get("kind") in ("video", "audio", "animation", "photo") else "document"
     send = getattr(context.bot, f"send_{field}")
     kw: dict = {field: hit["file_id"], "reply_markup": reply_markup}
+    if thread_id:
+        kw["message_thread_id"] = thread_id
     if caption:
         kw.update(caption=caption[:1024], parse_mode=ParseMode.HTML)
     try:
@@ -1190,8 +1290,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
 
     inflight_add(chat_id, query.message.message_id)
     # Registered only now: every return above would otherwise leak the job.
-    job = jobs.start(f"dm:{chat_id}:{query.message.message_id}", session.user_id,
-                     by_owner=True)
+    job = jobs.start(f"dm:{chat_id}:{query.message.message_id}", session.user_id)
     job.on_cancel = _cancelled
     ticker.start()
     try:  # ✖ Cancel straight away, not only after the first progress event
@@ -1244,11 +1343,17 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         )
         return
 
-    ticker.cancel()  # every outcome below writes its own final text
+    # close, not cancel: also waits out a progress edit already in flight,
+    # which could otherwise land after (and overwrite) the final text below.
+    await ticker.close(None)
+    if not job.cancelled:
+        job.cancellable = False  # before drop: a tap now hears "being sent"
     jobs.drop(job)
     if job.cancelled:
-        # The message already says "Cancelled" (and offers Download Again).
-        inflight_remove(chat_id, query.message.message_id)
+        # The message is already gone — or the bot is stopping, in which case
+        # it stays registered and the restart tells the user "Interrupted".
+        if not jobs.SHUTTING_DOWN:
+            inflight_remove(chat_id, query.message.message_id)
         sessions.remove(session.session_id)
         if result is not None:
             download_manager.cleanup_result_files(result)
@@ -1296,6 +1401,8 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         pass
 
     caption = _build_caption(session, result, size) + f"\n⏱ Ready in {view.elapsed():.0f}s"
+    logger.info("dm %s ready in %.1fs (%s) [%s]: %s", mode, view.elapsed(),
+                format_size(size), view.phases(), redact.url(session.url))
     # Short token only — full URLs exceed Telegram's 64-byte callback_data limit
     actions = after_download_keyboard(session.url, user_id=session.user_id)
 
@@ -1450,6 +1557,7 @@ async def _send_media(
     attempts: int = 3,
     *,
     silent: bool = False,
+    thread_id: int | None = None,
 ):
     """
     Upload media with long timeouts and retries on TimedOut.
@@ -1467,7 +1575,7 @@ async def _send_media(
         try:
             return await _send_media_once(
                 context, chat_id, path, result, caption, filename, reply_markup,
-                silent=silent,
+                silent=silent, thread_id=thread_id,
             )
         except RetryAfter as e:
             last_err = e
@@ -1513,10 +1621,13 @@ async def _send_media_once(
     reply_markup=None,
     *,
     silent: bool = False,
+    thread_id: int | None = None,
 ):
     kw = dict(_UPLOAD_KW)
     if silent:
         kw["disable_notification"] = True
+    if thread_id:
+        kw["message_thread_id"] = thread_id
     # Empty caption → omit (clean channel posts)
     cap = (caption or "").strip()
     cap_kw: dict = {}

@@ -115,7 +115,7 @@ class TestQueuedCancel:
 async def test_cmd_cancel_stops_a_running_dm_download(fx):
     from bot.handlers.start import cmd_cancel
 
-    job = jobs.start("dm:1:5", fx.user.id, by_owner=True)
+    job = jobs.start(f"dm:{fx.chat.id}:5", fx.user.id)
     notes = []
 
     async def on_cancel():
@@ -132,6 +132,35 @@ async def test_cmd_cancel_stops_a_running_dm_download(fx):
 
 def test_only_the_users_own_link_is_deleted_on_cancel():
     me = SimpleNamespace(id=42)
-    assert hd._own_message_id(SimpleNamespace(from_user=me, message_id=9), me) == 9
-    bot_msg = SimpleNamespace(from_user=SimpleNamespace(id=777), message_id=10)
+    link = "https://youtu.be/abc"
+    assert hd._own_message_id(SimpleNamespace(from_user=me, message_id=9, text=link), me) == 9
+    # Two links, or a link with commentary: the user's own content stays.
+    for text in (f"{link} https://youtu.be/def", f"look at this {link}"):
+        assert hd._own_message_id(SimpleNamespace(from_user=me, message_id=9, text=text), me) is None
+    bot_msg = SimpleNamespace(from_user=SimpleNamespace(id=777), message_id=10, text=link)
     assert hd._own_message_id(bot_msg, me) is None  # "Download Again": the bot's file
+
+
+class TestFairQueue:
+    async def test_one_user_cannot_take_every_slot(self):
+        from bot.services.dl_queue import DownloadQueue
+
+        q = DownloadQueue(slots=3, per_user=2)
+        gate = asyncio.Event()
+        order = []
+
+        def job(tag):
+            async def run():
+                order.append(tag)
+                await gate.wait()
+            return run
+
+        hog = [asyncio.create_task(q.run(job(f"A{i}"), owner="A")) for i in range(4)]
+        await asyncio.sleep(0.01)
+        other = asyncio.create_task(q.run(job("B0"), owner="B"))
+        await asyncio.sleep(0.05)
+        # A gets two slots; B's job (queued after all of A's) takes the third.
+        assert order == ["A0", "A1", "B0"]
+        gate.set()
+        await asyncio.gather(*hog, other)
+        assert q.running == 0 and q.waiting == 0

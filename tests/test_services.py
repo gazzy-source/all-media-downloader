@@ -172,3 +172,78 @@ class TestMediaDetect:
         )
         assert _VIDEO_RE.search('https://v.pinimg.com/videos/mc/720p/x.mp4')
         assert not _VIDEO_RE.search("<html><body>plain text</body></html>")
+
+
+class TestHistoryMigration:
+    def test_old_json_is_imported_once(self, tmp_path, monkeypatch):
+        import json
+
+        import bot.services.history as hist
+
+        h, s = tmp_path / "h.json", tmp_path / "s.json"
+        h.write_text(json.dumps({"7": [
+            {"ts": 2, "url": "u2", "title": "new", "platform": "YouTube", "mode": "audio",
+             "quality": None, "success": True, "file_size": 5, "error": None},
+            {"ts": 1, "url": "u1", "title": "old", "platform": "YouTube", "mode": "video",
+             "quality": "720", "success": False, "file_size": None, "error": "x"},
+        ]}))
+        s.write_text(json.dumps({"total_downloads": 2, "successful": 1, "failed": 1,
+                                 "bytes_served": 5, "by_platform": {"YouTube": 2},
+                                 "by_mode": {"audio": 1, "video": 1},
+                                 "unique_users": [7], "unique_user_total": 3}))
+        monkeypatch.setattr(hist, "_HISTORY_FILE", h)
+        monkeypatch.setattr(hist, "_STATS_FILE", s)
+        items = hist.get_user_history(7)
+        assert [i["title"] for i in items] == ["new", "old"]
+        assert items[1]["success"] is False
+        st = hist.get_stats()
+        assert st["total_downloads"] == 2 and st["by_platform"] == {"YouTube": 2}
+        assert st["unique_user_count"] == 3
+        assert not h.exists() and (tmp_path / "h.json.migrated").exists()
+        hist._record_download_sync(7, "u3", "newest", "X", "video", "720", True, 1)
+        assert hist.get_user_history(7)[0]["title"] == "newest"
+        assert hist.get_stats()["total_downloads"] == 3
+
+
+class TestPrefsNeverLosePremium:
+    def test_corrupt_file_is_kept_aside(self, tmp_path):
+        from bot.services import user_prefs
+
+        p = tmp_path / "p.json"
+        p.write_text("{not json")
+        user_prefs._reset_for_tests(p)
+        assert user_prefs.premium_until(1) == 0
+        user_prefs.set_pref(1, "mode", "audio")
+        assert list(tmp_path.glob("p.json.corrupt-*")), "the bad file must be kept"
+
+    def test_unreadable_file_is_never_overwritten(self, tmp_path, monkeypatch):
+        from bot.services import user_prefs
+
+        p = tmp_path / "p.json"
+        p.write_text('{"1": {"premium_until": 9999999999}}')
+        user_prefs._reset_for_tests(p)
+        real = type(p).read_text
+
+        def flaky(self, *a, **k):
+            if self == p:
+                raise PermissionError("EACCES")
+            return real(self, *a, **k)
+
+        monkeypatch.setattr(type(p), "read_text", flaky)
+        user_prefs.set_pref(2, "mode", "audio")  # must not save {"2": …} over it
+        monkeypatch.setattr(type(p), "read_text", real)
+        assert "9999999999" in p.read_text()
+        user_prefs._reset_for_tests(p)
+        assert user_prefs.is_premium(1)
+
+
+class TestUrlTokensSurviveRestart:
+    def test_tokens_persist_and_stay_owner_bound(self, tmp_path):
+        from bot.services import url_tokens
+
+        url_tokens._reset_for_tests(tmp_path / "t.json")
+        tok = url_tokens.put_url("https://youtu.be/x", 5)
+        url_tokens.flush()  # the heartbeat job / shutdown does this
+        url_tokens._reset_for_tests(tmp_path / "t.json")  # a restart
+        assert url_tokens.get_url(tok, 5) == "https://youtu.be/x"
+        assert url_tokens.get_url(tok, 6) is None

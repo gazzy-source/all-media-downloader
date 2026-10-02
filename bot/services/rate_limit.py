@@ -41,6 +41,12 @@ class RateLimiter:
         self._evict_idle(now)
         return True, 0
 
+    def refund(self, user_id: int) -> None:
+        """Give back the last download: the request cost the user nothing."""
+        q = self._hits.get(user_id)
+        if q:
+            q.pop()
+
     def remaining(self, user_id: int) -> int:
         now = time.time()
         # Plain .get(): a read must not create an entry for an unknown user,

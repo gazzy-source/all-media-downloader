@@ -58,6 +58,8 @@ logging.basicConfig(
     level=logging.INFO,
     handlers=[logging.StreamHandler(sys.stdout)],
 )
+from bot.services import heartbeat  # noqa: E402
+
 logger = logging.getLogger("all-media-bot")
 
 # Quieter libraries
@@ -66,15 +68,51 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
 
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from telegram.error import NetworkError
+def _who(update: object) -> str:
+    """update id + hashed user, for following one failure through the log."""
+    from bot.utils import redact
 
-    if isinstance(context.error, NetworkError) and update is None:
-        # Telegram's own hiccups (502 Bad Gateway, timeouts) while polling:
-        # PTB retries by itself. Not a bug, not worth a traceback.
-        logger.warning("Telegram network hiccup (retrying): %s", context.error)
+    uid = getattr(getattr(update, "effective_user", None), "id", None)
+    return (f"update={getattr(update, 'update_id', '?')} "
+            f"user={redact.uid(uid) if uid is not None else '-'}")
+
+
+_BENIGN = (
+    "message is not modified",
+    "query is too old",
+    "query id is invalid",
+    "message to edit not found",
+    "message to delete not found",
+    "message can't be edited",
+)
+
+
+def _benign(err: object) -> bool:
+    from telegram.error import BadRequest
+
+    return isinstance(err, BadRequest) and any(b in str(err).lower() for b in _BENIGN)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from telegram.error import BadRequest, NetworkError
+
+    if isinstance(context.error, NetworkError) and not isinstance(context.error, BadRequest):
+        # Telegram's own hiccups (502 Bad Gateway, timeouts): PTB retries
+        # polling by itself, and a reply that hit one is not "our" bug — the
+        # user was told "Something went wrong" for a Telegram 502 before.
+        logger.warning("Telegram network hiccup%s: %s",
+                       "" if update is None else f" ({_who(update)})", context.error)
         return
-    logger.exception("Unhandled error: %s", context.error)
+    if _benign(context.error):
+        # A double tap re-sends an identical edit ("message is not modified"),
+        # a stale button's query has expired, a message was deleted meanwhile:
+        # nothing failed from the user's point of view.
+        logger.info("Ignored benign Telegram refusal: %s", context.error)
+        return
+    # exc_info from the error itself: logger.exception outside an except
+    # block printed "NoneType: None" instead of the traceback.
+    logger.error("Unhandled error (%s): %s", _who(update), context.error,
+                 exc_info=context.error)
     # Duck-typed access: works for Update and any object carrying effective_message
     msg = getattr(update, "effective_message", None)
     if msg is not None:
@@ -86,6 +124,17 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text("⚠️ Something went wrong. Please try again.")
         except Exception:
             pass
+
+
+async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if msg is None:
+        return
+    is_cmd = bool(msg.text and msg.text.startswith("/"))
+    await msg.reply_text(
+        ("🤔 I don't know that command — see /help.\n\n" if is_cmd else "")
+        + "📥 Send me a link (YouTube, Instagram, TikTok, X…) and I'll download it.",
+    )
 
 
 async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -133,6 +182,38 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("cookie jar sweep failed")
     if removed_sessions or removed_files:
         logger.info("Cleanup: %s sessions, %s temp files", removed_sessions, removed_files)
+
+
+async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """data/heartbeat.json for the health check (stale = event loop stuck)."""
+    from bot.services.dl_queue import download_queue
+
+    from bot.services import url_tokens
+
+    updater = getattr(context.application, "updater", None)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None, heartbeat.write, bool(updater and updater.running),
+        download_queue.running, download_queue.waiting)
+    await loop.run_in_executor(None, url_tokens.flush)
+
+
+class BotApplication(Application):
+    async def stop(self) -> None:
+        """
+        Stop downloads FIRST. Application.stop() waits for every running
+        handler — i.e. every download, and every queued one that would still
+        start a fresh transfer — so a post_stop hook ran only once they had all
+        finished (or systemd killed us). Their users are told "Interrupted"
+        on the next start (their messages stay registered).
+        """
+        from bot.services import jobs, url_tokens
+
+        stopped = jobs.shutdown_all()
+        if stopped:
+            logger.info("Shutdown: stopping %s running/queued download(s)", stopped)
+        url_tokens.flush()
+        await super().stop()
 
 
 async def warmup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -190,16 +271,19 @@ async def _warm_youtube_pipeline() -> None:
     started = time.time()
     try:
         await asyncio.wait_for(
-            download_manager.extract_info(WARMUP_URL), timeout=120
+            download_manager.extract_info(WARMUP_URL, limit=120), timeout=120
         )
         logger.info("Warmed the YouTube pipeline in %.1fs", time.time() - started)
+        heartbeat.warmup_result(True)
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        logger.debug(
-            "Warmup did not complete after %.1fs (harmless): %s",
-            time.time() - started,
-            e,
+        heartbeat.warmup_result(False, f"{type(e).__name__}: {e}")
+        # The canary for YouTube: users hit the same wall until it recovers.
+        logger.warning(
+            "YouTube warm-up failed after %.1fs (%s in a row): %s",
+            time.time() - started, heartbeat.state["warmup_fail_streak"],
+            str(e).split("\n")[-1][:160],
         )
 
 
@@ -223,7 +307,11 @@ async def _recheck_pot() -> None:
 
 
 async def post_init(app: Application) -> None:
+    from bot.handlers.inline import ignore_backlog
     from bot.utils.ffmpeg import find_ffmpeg
+
+    # Updates are kept across restarts now; inline queries among them expired.
+    ignore_backlog(15)
 
     me = await app.bot.get_me()
     ff = find_ffmpeg()
@@ -348,6 +436,7 @@ def build_app() -> Application:
     builder = (
         Application.builder()
         .token(BOT_TOKEN)
+        .application_class(BotApplication)
         .post_init(post_init)
         .concurrent_updates(True)
         .connect_timeout(30.0)
@@ -376,17 +465,22 @@ def build_app() -> Application:
 
     app = builder.build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("platforms", cmd_platforms))
-    app.add_handler(CommandHandler("history", cmd_history))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    # New messages only: CommandHandler also matches EDITED messages, so
+    # editing "/paysupport …" or "/start dl_…" ran the command a second time.
+    def command(name, fn):
+        app.add_handler(CommandHandler(name, fn, filters=filters.UpdateType.MESSAGE))
+
+    command("start", cmd_start)
+    command("help", cmd_help)
+    command("platforms", cmd_platforms)
+    command("history", cmd_history)
+    command("stats", cmd_stats)
+    command("settings", cmd_settings)
+    command("cancel", cmd_cancel)
     # Premium (Telegram Stars)
-    app.add_handler(CommandHandler("premium", premium.cmd_premium))
-    app.add_handler(CommandHandler("paysupport", premium.cmd_paysupport))
-    app.add_handler(CommandHandler("refund", premium.cmd_refund))
+    command("premium", premium.cmd_premium)
+    command("paysupport", premium.cmd_paysupport)
+    command("refund", premium.cmd_refund)
     app.add_handler(PreCheckoutQueryHandler(premium.handle_precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, premium.handle_successful_payment))
 
@@ -416,11 +510,24 @@ def build_app() -> Application:
         )
     )
 
+    # Private chat, anything else (an unknown /command, a sticker, a voice
+    # note, a photo with no caption): say what the bot does instead of silence.
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE
+            & (filters.COMMAND
+               | ((filters.ATTACHMENT | filters.Sticker.ALL | filters.LOCATION
+                   | filters.CONTACT) & ~filters.CAPTION & ~filters.SUCCESSFUL_PAYMENT)),
+            handle_unknown,
+        )
+    )
+
     app.add_error_handler(on_error)
 
     if app.job_queue:
         # More frequent temp cleanup on small VPS
         app.job_queue.run_repeating(cleanup_job, interval=600, first=30)
+        app.job_queue.run_repeating(heartbeat_job, interval=30, first=5)
         # Re-warm well inside the PO token's ~6h life. Without this the token
         # lapses mid-day and the next user waits out a 12s re-mint.
         if WARMUP_ON_START and WARMUP_INTERVAL_MIN > 0:
@@ -441,7 +548,10 @@ def main() -> None:
     logger.info("Starting polling…")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
+        # Keep what arrived during a restart/deploy: a successful_payment
+        # dropped here is a user charged with no Premium and no record; a link
+        # sent mid-deploy would get no answer. Handlers are safe to replay.
+        drop_pending_updates=False,
     )
 
 

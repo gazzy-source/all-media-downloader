@@ -235,7 +235,7 @@ def search(query: str) -> list[SearchHit]:
             if h and h.id not in seen:
                 seen.add(h.id)
                 hits.append(h)
-        logger.info("inline search %r: %s hits in %.1fs (%s)", key[:40], len(hits),
+        logger.info("inline search (%s chars): %s hits in %.1fs (%s)", len(key), len(hits),
                     time.monotonic() - started, source)
         with _CACHE_LOCK:
             if len(_CACHE) >= _CACHE_MAX:

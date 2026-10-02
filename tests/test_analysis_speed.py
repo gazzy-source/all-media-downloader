@@ -59,7 +59,7 @@ class TestStartupWarmup:
     async def test_warmup_runs_the_configured_url(self, _main, monkeypatch):
         seen = []
 
-        async def _fake(url):
+        async def _fake(url, limit=None):
             seen.append(url)
 
         monkeypatch.setattr(_main, "WARMUP_ON_START", True)
@@ -73,7 +73,7 @@ class TestStartupWarmup:
     async def test_warmup_failure_is_swallowed(self, _main, monkeypatch):
         """A dead warmup link must not stop the bot from starting."""
 
-        async def _boom(url):
+        async def _boom(url, limit=None):
             raise RuntimeError("video unavailable")
 
         monkeypatch.setattr(_main, "WARMUP_ON_START", True)
@@ -83,7 +83,7 @@ class TestStartupWarmup:
         await _main._warm_youtube_pipeline()  # must not raise
 
     async def test_warmup_timeout_is_swallowed(self, _main, monkeypatch):
-        async def _hang(url):
+        async def _hang(url, limit=None):
             await asyncio.sleep(3600)
 
         monkeypatch.setattr(_main, "WARMUP_ON_START", True)
@@ -112,7 +112,7 @@ class TestStartupWarmup:
     async def test_cancellation_propagates(self, _main, monkeypatch):
         """Shutdown must be able to cancel it, not have it swallow the cancel."""
 
-        async def _hang(url):
+        async def _hang(url, limit=None):
             await asyncio.sleep(3600)
 
         monkeypatch.setattr(_main, "WARMUP_ON_START", True)

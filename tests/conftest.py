@@ -1,7 +1,9 @@
 """Pytest shared fixtures and environment setup."""
 from __future__ import annotations
 
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -18,6 +20,8 @@ if str(ROOT) not in sys.path:
 # bot.config reads env at import time — set BEFORE any bot.* import.
 # os.environ wins over .env (load_dotenv does not override existing vars).
 _SANDBOX = Path(tempfile.mkdtemp(prefix="amb_test_"))
+# Removed at exit: 34 of these piled up in /tmp on the production host.
+atexit.register(shutil.rmtree, _SANDBOX, ignore_errors=True)
 os.environ["TEMP_DIR"] = str(_SANDBOX / "temp")
 os.environ["DOWNLOAD_DIR"] = str(_SANDBOX / "downloads")
 # Never the deployment's data/: running the suite on the server used to append

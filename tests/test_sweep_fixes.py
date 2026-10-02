@@ -124,9 +124,7 @@ def test_history_is_bounded_and_counts_users_in_order(monkeypatch, tmp_path):
     monkeypatch.setattr(history, "_MAX_HISTORY_USERS", 3)
     for uid in (1, 2, 3, 4, 2):
         history._record_download_sync(uid, "u", "t", "YouTube", "video", "720", True, 1, None)
-    import json
-    hist = json.loads((tmp_path / "h.json").read_text())
-    assert list(hist) == ["3", "4", "2"]  # 1 (least recent) evicted, 2 refreshed
+    assert history.history_users() == [3, 4, 2]  # 1 (least recent) evicted, 2 refreshed
     stats = history.get_stats()
     assert stats["unique_user_count"] == 4
 
@@ -209,6 +207,6 @@ def test_health_without_a_configured_provider_is_ok(monkeypatch):
         "health2", Path(__file__).resolve().parents[1] / "scripts" / "bot_health_server.py")
     health = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(health)
-    monkeypatch.setattr(health, "_configured_pot_url", lambda: None)
+    monkeypatch.setattr(health, "_env", lambda name: None)
     assert health.pot_provider_up() is True
 

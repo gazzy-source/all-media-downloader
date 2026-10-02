@@ -31,7 +31,7 @@ You should receive an acknowledgement within a few days when possible.
 |--------------|-----|
 | `.env` | Contains `BOT_TOKEN` |
 | `cookies.txt` | Session hijacking risk |
-| `data/history.json` | User privacy |
+| `data/history.sqlite3` | User privacy |
 | Real tokens in issues/PRs | Instant bot takeover |
 
 If a token leaks:

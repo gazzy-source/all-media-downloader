@@ -9,6 +9,7 @@ import time
 from urllib.request import Request
 
 from bot.utils.helpers import IMAGE_EXTS
+from bot.utils.deadline import deadline
 from bot.utils.safe_fetch import open_public as urlopen
 
 logger = logging.getLogger(__name__)
@@ -211,7 +212,7 @@ def _fetch_html(url: str) -> str:
                 "Accept": "text/html,application/xhtml+xml",
             },
         )
-        with urlopen(req, timeout=15) as resp:
+        with deadline(20), urlopen(req, timeout=15) as resp:  # total, not per read
             data = resp.read(1_500_000)
         return data.decode("utf-8", "replace")
     except Exception as e:

@@ -161,8 +161,24 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
     if sp.currency != CURRENCY or parsed is None or parsed[0] != user.id:
         logger.error("unexpected payment from %s: %s %s", user.id, sp.currency, sp.invoice_payload)
         return
-    until = user_prefs.grant_premium(
-        user.id, parsed[1], charge_id=sp.telegram_payment_charge_id, stars=sp.total_amount)
+    try:
+        until = user_prefs.grant_premium(
+            user.id, parsed[1], charge_id=sp.telegram_payment_charge_id, stars=sp.total_amount)
+    except user_prefs.GrantNotSaved:
+        # The charge id is the refund trail: it must reach the log.
+        logger.error("PREMIUM NOT SAVED for %s: charge %s, %s Stars, %s days",
+                     user.id, sp.telegram_payment_charge_id, sp.total_amount, parsed[1])
+        for admin in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    admin, f"⚠️ Premium payment from {user.id} could not be saved. "
+                           f"Charge: {sp.telegram_payment_charge_id} — grant or /refund {user.id}.")
+            except TelegramError:
+                pass
+        await msg.reply_text(
+            "⚠️ Your payment went through, but I couldn't activate Premium just "
+            "now. The owner has been told and will fix it — or use /paysupport.")
+        return
     logger.info("premium bought by %s: %s Stars, until %s", user.id, sp.total_amount, _date(until))
     await msg.reply_text(
         f"💎 <b>Premium is active</b> until <b>{_date(until)}</b>.\n\n"
@@ -174,6 +190,8 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
 
 _SUPPORT_COOLDOWN = 600  # one forwarded request per user per 10 min
 _last_support: dict[int, float] = {}
+_all_support: list[float] = []
+_SUPPORT_PER_MINUTE = 5
 
 
 async def cmd_paysupport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -201,27 +219,40 @@ async def cmd_paysupport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await msg.reply_text("✅ Your earlier request was received — the owner "
                              "will get back to you here.")
         return
+    # All accounts together: at most a few forwards a minute to the owner.
+    recent = [t for t in _all_support if now - t < 60]
+    if len(recent) >= _SUPPORT_PER_MINUTE:
+        await msg.reply_text("⏳ Support is busy right now — please try again in a minute.")
+        return
+    # Claimed BEFORE the awaits below: with concurrent updates, a burst of
+    # /paysupport all passed the check and all reached the owner.
+    _last_support[user.id] = now
+    _all_support[:] = recent + [now]
+    if len(_last_support) > 5000:
+        for k in [k for k, t in _last_support.items() if now - t > _SUPPORT_COOLDOWN]:
+            del _last_support[k]
     who = f"@{user.username}" if getattr(user, "username", None) else "no username"
     until = user_prefs.premium_until(user.id)
     note = (
         f"💬 <b>Payment support</b> from <code>{user.id}</code> ({_html(who)})\n"
         f"Premium: {'active' if until > time.time() else 'not active'}\n\n"
-        f"{_html(text[:1500])}\n\nRefund: <code>/refund {user.id}</code>"
+        f"<blockquote>{_html(text[:1500])}</blockquote>\nRefund: <code>/refund {user.id}</code>"
     )
     delivered = False
     for admin in ADMIN_IDS:
         try:
-            await context.bot.send_message(admin, note, parse_mode=ParseMode.HTML)
+            await context.bot.send_message(admin, note, parse_mode=ParseMode.HTML,
+                                           disable_web_page_preview=True)
             delivered = True
         except TelegramError as e:
             logger.warning("paysupport forward to %s failed: %s", admin, e)
     if not delivered:
-        logger.error("paysupport from %s not delivered (no reachable admin): %s",
-                     user.id, text[:300])
+        logger.error("paysupport from %s not delivered (no reachable admin)",
+                     user.id)
+        _last_support.pop(user.id, None)  # let them try again
         await msg.reply_text("⚠️ Couldn't reach the owner right now — please try "
                              "again in a little while.")
         return
-    _last_support[user.id] = now
     await msg.reply_text("✅ Sent to the bot owner. You'll get an answer in this "
                          "chat.")
 

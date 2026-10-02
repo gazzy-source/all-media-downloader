@@ -34,24 +34,50 @@ _data: dict[str, dict[str, Any]] | None = None
 
 
 def _load() -> dict[str, dict[str, Any]]:
+    """
+    This file holds paid Premium and refund records. A read that fails must
+    never turn into an empty file on the next save: a corrupt file is moved
+    aside, and an unreadable one (permissions, too many open files) is not
+    cached, so the next call tries again and nothing is overwritten meanwhile.
+    """
     global _data
     if _data is None:
         try:
             raw = json.loads(_PATH.read_text(encoding="utf-8"))
             _data = raw if isinstance(raw, dict) else {}
-        except (OSError, ValueError):
+        except FileNotFoundError:
             _data = {}
+        except ValueError:
+            aside = _PATH.with_name(f"{_PATH.name}.corrupt-{int(time.time())}")
+            logger.error("user_prefs.json is corrupt; moved to %s, starting empty", aside.name)
+            try:
+                os.replace(_PATH, aside)
+            except OSError:
+                logger.exception("could not move the corrupt prefs file aside")
+                return {}  # not cached: _save refuses while it is still there
+            _data = {}
+        except OSError:
+            logger.exception("could not read user preferences; not caching")
+            return {}
     return _data
 
 
-def _save(data: dict[str, dict[str, Any]]) -> None:
+def _save(data: dict[str, dict[str, Any]]) -> bool:
+    if data is not _data:
+        logger.error("not saving user preferences: the file could not be read")
+        return False
     tmp = _PATH.with_suffix(".tmp")
     try:
         _PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())  # Premium records: survive a power cut
         os.replace(tmp, _PATH)
+        return True
     except OSError:
         logger.exception("could not persist user preferences")
+        return False
 
 
 def get(user_id: int) -> dict[str, Any]:
@@ -98,6 +124,10 @@ def is_premium(user_id: int) -> bool:
     return premium_until(user_id) > time.time()
 
 
+class GrantNotSaved(RuntimeError):
+    """The payment went through but the Premium record could not be written."""
+
+
 def grant_premium(user_id: int, days: int, *, charge_id: str, stars: int) -> float:
     """
     Extend premium by `days` from whichever is later: now or the current end.
@@ -110,10 +140,14 @@ def grant_premium(user_id: int, days: int, *, charge_id: str, stars: int) -> flo
         if any(c.get("id") == charge_id for c in charges):
             return _premium_until_unlocked(row)
         start = max(time.time(), _premium_until_unlocked(row))
+        before = (row.get("premium_until"), list(charges))
         row["premium_until"] = start + days * 86400
         charges.append({"id": charge_id, "stars": stars, "days": days, "t": time.time()})
         row["charges"] = charges[-20:]
-        _save(data)
+        if not _save(data):
+            # Never tell a paying user "active" when nothing was recorded.
+            row["premium_until"], row["charges"] = before
+            raise GrantNotSaved(charge_id)
         return row["premium_until"]
 
 

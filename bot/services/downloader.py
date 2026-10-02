@@ -49,6 +49,8 @@ from bot.config import (
 )
 from bot.utils.ffmpeg import ffmpeg_location_dir
 from bot.utils.safe_fetch import UnresolvableURLError, UnsafeURLError, check_public_url
+from bot.utils import redact
+from bot.utils.deadline import DeadlineExceeded, deadline
 from bot.utils.warp import rotate_warp_ip
 from bot.utils.helpers import (
     IMAGE_EXTS,
@@ -211,6 +213,18 @@ def _overall_pct(part: str, file_pct: float) -> float:
     if part == "audio":
         return 90 + file_pct * 0.1
     return file_pct
+
+
+_META_INFLIGHT = 0  # analyses running right now (the yt-meta pool)
+_META_INFLIGHT_LOCK = threading.Lock()
+
+
+def _rotation_harmless(own_downloads: int) -> bool:
+    """True when a WARP rotation would cut no one else's connection."""
+    from bot.services.dl_queue import download_queue
+
+    own_meta = 0 if own_downloads else 1
+    return download_queue.running <= own_downloads and _META_INFLIGHT <= own_meta
 
 
 def _bot_idle() -> bool:
@@ -882,6 +896,10 @@ def _download_match_filter(info: dict[str, Any], *, incomplete: bool = False) ->
         raise JobRefused(
             "Live streams can't be downloaded — send the link again once it has ended."
         )
+    # The server's cookies belong to the operator: they must not turn into a
+    # way for anyone to fetch what only that account may see.
+    if info.get("availability") in ("private", "premium_only", "subscriber_only"):
+        raise JobRefused("This one is private or members-only, so the bot can't share it.")
     duration = info.get("duration")
     if duration and duration > MAX_MEDIA_DURATION:
         raise JobRefused(
@@ -1100,6 +1118,19 @@ def _meta_cache_get(url: str, max_age: float | None = None) -> dict[str, Any] | 
         return info
 
 
+_HEAVY_KEYS = ("heatmap", "comments")
+
+
+def _slim(info: dict[str, Any]) -> dict[str, Any]:
+    """
+    Up to 64 full YouTube info dicts sit in RAM for 30 min on a 950 MB box.
+    Drop what nothing reads back (thumbnails/captions are used: cover, subs).
+    """
+    if not isinstance(info, dict):
+        return info
+    return {k: v for k, v in info.items() if k not in _HEAVY_KEYS}
+
+
 def _meta_cache_put(url: str, info: dict[str, Any]) -> None:
     key = url.strip()
     with _META_CACHE_LOCK:
@@ -1108,7 +1139,7 @@ def _meta_cache_put(url: str, info: dict[str, Any]) -> None:
             items = sorted(_META_CACHE.items(), key=lambda kv: kv[1][0])
             for k, _ in items[: max(1, _META_CACHE_MAX // 4)]:
                 _META_CACHE.pop(k, None)
-        _META_CACHE[key] = (time.time(), info)
+        _META_CACHE[key] = (time.time(), _slim(info))
 
 
 def _extract_info_sync(url: str) -> dict[str, Any]:
@@ -1301,7 +1332,7 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                     # idle — no user action for 90s and nothing queued or
                     # downloading — so a walled IP is replaced BEFORE the next
                     # user pays for it, without cutting anyone's transfer.
-                    and (url != WARMUP_URL or _bot_idle())
+                    and (_bot_idle() if url == WARMUP_URL else _rotation_harmless(0))
                     and _platform_flags(urlparse(url).netloc.lower())["yt"]
                     and opts.get("proxy")
                     and not any(s.get("_warp_retry") for s in strats)
@@ -1495,7 +1526,7 @@ class DownloadManager:
     def free_slots(self) -> int:
         return max(0, self.max_concurrent - self.active)
 
-    async def extract_info(self, url: str) -> MediaInfo:
+    async def extract_info(self, url: str, limit: float | None = None) -> MediaInfo:
         loop = asyncio.get_running_loop()
         # Timed in three parts so a slow "Analyzing…" can be attributed rather
         # than guessed at: queue = waiting for a pool worker (starvation),
@@ -1505,7 +1536,17 @@ class DownloadManager:
 
         def _run(u: str):
             started["t"] = time.monotonic()
-            return _extract_info_sync(u)
+            global _META_INFLIGHT
+            with _META_INFLIGHT_LOCK:
+                _META_INFLIGHT += 1
+            try:
+                # The handler stops waiting at EXTRACT_TIMEOUT; this stops the
+                # THREAD soon after, so a dripping server can't keep a worker.
+                with deadline(limit or EXTRACT_TIMEOUT + 10):
+                    return _extract_info_sync(u)
+            finally:
+                with _META_INFLIGHT_LOCK:
+                    _META_INFLIGHT -= 1
 
         info = await loop.run_in_executor(self._meta_executor, _run, url)
         done = time.monotonic()
@@ -1553,7 +1594,7 @@ class DownloadManager:
             started = time.monotonic()
             result = await loop.run_in_executor(
                 self._executor,
-                lambda: self._download_sync(
+                lambda: self._bounded_download(
                     url=url,
                     mode=mode,
                     quality=quality,
@@ -1581,7 +1622,7 @@ class DownloadManager:
                 await _emit_progress(progress_cb, 5, "Retrying as image…")
                 result = await loop.run_in_executor(
                     self._executor,
-                    lambda: self._download_sync(
+                    lambda: self._bounded_download(
                         url=url,
                         mode="image",
                         quality=quality,
@@ -1597,6 +1638,34 @@ class DownloadManager:
         finally:
             self.active -= 1
             self._sem.release()
+
+    def _bounded_download(self, *, cancel=None, **kw) -> DownloadResult:
+        """
+        _download_sync under a wall clock: the transfer guard only runs on
+        progress events, so extraction, image fetches and a dripping server
+        had no total limit at all. A cancel also lands mid-read now.
+        """
+        limit = DOWNLOAD_MAX_SECONDS + 60
+        started = time.monotonic()
+        try:
+            with deadline(limit, cancel=cancel):
+                result = self._download_sync(cancel=cancel, **kw)
+        except DeadlineExceeded as e:  # raised outside yt-dlp's own handlers
+            cancelled = cancel is not None and cancel.is_set()
+            return DownloadResult(
+                success=False, mode=kw.get("mode", ""),
+                error=CANCELLED if cancelled else self._friendly_error(f"timed out: {e}"))
+        # yt-dlp can swallow a timed-out read (a skipped fragment) and still
+        # report success with a file cut short: never hand that over.
+        if result.success and (
+            (cancel is not None and cancel.is_set()) or time.monotonic() - started > limit
+        ):
+            self.cleanup_result_files(result)
+            cancelled = cancel is not None and cancel.is_set()
+            return DownloadResult(
+                success=False, mode=result.mode,
+                error=CANCELLED if cancelled else self._friendly_error("timed out"))
+        return result
 
     @staticmethod
     def _looks_like_image_only_error(err: str) -> bool:
@@ -1941,7 +2010,12 @@ class DownloadManager:
             self._cleanup_dir(work_dir)
             return DownloadResult(success=False, error=self._friendly_error(msg), mode=mode, quality=quality)
         except Exception as e:
-            logger.exception("Unexpected download failure for %s", url)
+            if cancel is not None and cancel.is_set():
+                # A user's ✖ Cancel surfaces as a failed read here: not a crash.
+                logger.info("Download cancelled: %s", redact.url(url))
+                self._cleanup_dir(work_dir)
+                return DownloadResult(success=False, error=CANCELLED, mode=mode, quality=quality)
+            logger.exception("Unexpected download failure for %s", redact.url(url))
             self._cleanup_dir(work_dir)
             raw = str(e).strip() or f"{type(e).__name__}: {e!r}"
             return DownloadResult(
@@ -2162,6 +2236,9 @@ class DownloadManager:
                         and is_yt
                         and not warp_rotated
                         and attempt_opts.get("proxy")
+                        # Rotating drops every proxied socket: never while
+                        # someone else's download or analysis is running.
+                        and _rotation_harmless(1)
                         and rotate_warp_ip()
                     ):
                         warp_rotated = True

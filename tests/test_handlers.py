@@ -276,8 +276,9 @@ class TestHandleCallback:
         sessions.put(s)
         q = FakeCallbackQuery(data="mode:sX:video")  # from user 42
         await hd.handle_callback(fx.update(callback_query=q), fx.ctx)
-        assert len(q.answers) == 1
-        assert q.message.replies and "isn't your" in q.message.replies[0][0]
+        # A private pop-up for the presser, never a public reply in the chat.
+        assert any("isn't your" in (t or "") and kw.get("show_alert") for t, kw in q.answers)
+        assert not q.message.replies
 
     async def test_admin_can_touch_foreign_session(self, fx, monkeypatch):
         monkeypatch.setattr(hd, "ADMIN_IDS", {42})

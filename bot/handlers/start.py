@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
@@ -116,6 +116,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if url:
             await start_url_flow(update, context, url)
             return
+        await update.effective_message.reply_text(
+            "🔗 That link has expired — paste it here again and I'll download it.",
+            reply_markup=_kb(update),
+        )
+        return
+    if args and args[0] == "settings":
+        await cmd_settings(update, context)
+        return
     await update.effective_message.reply_text(
         welcome_text(getattr(context.bot, "username", "") or ""),
         parse_mode=ParseMode.HTML,
@@ -258,6 +266,17 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.effective_message or not update.effective_user:
         return
     uid = update.effective_user.id
+    chat = update.effective_chat
+    if chat is not None and chat.type != "private":
+        # In a group anyone could press these buttons, and the text shows the
+        # presser's quota and Premium status to everyone.
+        me = getattr(context.bot, "username", "") or ""
+        await update.effective_message.reply_text(
+            "⚙️ Settings are personal — open them in a private chat with me.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "⚙️ Open settings", url=f"https://t.me/{me}?start=settings")]]) if me else None,
+        )
+        return
     await update.effective_message.reply_text(
         _settings_text(uid),
         parse_mode=ParseMode.HTML,
@@ -292,13 +311,15 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     from bot.services import jobs
 
     uid = update.effective_user.id
+    chat = update.effective_chat
     s = sessions.get_for_user(uid)
-    running = jobs.key_for_owner(uid)
+    running = jobs.keys_for(uid, chat.id) if chat else []
     if running:
-        outcome = await jobs.cancel(running, uid)
+        outcomes = [await jobs.cancel(k, uid) for k in running]
+        stopped = outcomes.count("ok")
         await update.effective_message.reply_text(
-            "✖ Cancelled." if outcome in ("ok", "gone")
-            else "⏳ It's already being sent — too late to cancel.",
+            (f"✖ Cancelled {stopped} downloads." if stopped > 1 else "✖ Cancelled.")
+            if stopped else "⏳ It's already being sent — too late to cancel.",
             reply_markup=_kb(update),
         )
     elif s and s.started:

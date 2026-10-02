@@ -67,6 +67,7 @@ from bot.services.dl_queue import download_queue
 from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
 from bot.services.history import record_download
 from bot.services.rate_limit import RateLimiter, rate_limiter
+from bot.utils import redact
 from bot.utils.texts import rate_limit_text, too_big_text, upload_failed_text
 from bot.services.url_tokens import put_url
 from bot.utils.helpers import extract_urls, format_size, platform_from_url
@@ -257,10 +258,26 @@ async def _is_public(url: str) -> bool:
         return False
 
 
+_IGNORE_UNTIL = 0.0  # set at startup: queries replayed from before it are dead
+
+
+def ignore_backlog(seconds: float = 15) -> None:
+    global _IGNORE_UNTIL
+    _IGNORE_UNTIL = time.monotonic() + seconds
+
+
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     activity.touch()
     q = update.inline_query
     if not q or not INLINE_ENABLED:
+        return
+    if time.monotonic() < _IGNORE_UNTIL:
+        # Kept across the restart, these queries expired long ago (Telegram
+        # waits ~10s for an answer); searching for them is wasted work.
+        try:
+            await q.answer([], cache_time=0)
+        except TelegramError:
+            pass
         return
     hint = InlineQueryResultsButton(
         text="🎵 Type a song — “video …” for videos, or paste a link",
@@ -418,11 +435,14 @@ async def _search(q, text: str) -> None:
                 # 20s: the first search after a restart also pays yt-dlp's cold
                 # start (two timed out at 12s in production). The thread keeps
                 # running past a timeout and still fills the cache for the retry.
+                # 8s: Telegram drops an inline answer after ~10s ("query is
+                # too old"); 15-21s searches were answered into the void. The
+                # thread keeps running and fills the cache for the retry.
                 hits = await asyncio.wait_for(
                     asyncio.get_running_loop().run_in_executor(
-                        yt_search.EXECUTOR, yt_search.search, terms), 20)
+                        yt_search.EXECUTOR, yt_search.search, terms), 8)
         except Exception as e:
-            logger.warning("inline search failed for %r: %r", terms[:40], e)
+            logger.warning("inline search failed (%s chars): %r", len(terms), e)
             await _answer(q, [], button=InlineQueryResultsButton(
                 text="⚠️ Search is unavailable right now — paste a link instead",
                 start_parameter="inline"), cache_time=5)
@@ -548,7 +568,7 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
     edits = asyncio.Lock()
     state = {"done": False}
     started = time.monotonic()
-    logger.info("inline %s chosen by %s: %s", mode, user_id, url[:80])
+    logger.info("inline %s chosen by %s: %s", mode, redact.uid(user_id), redact.url(url))
 
     title = _known_title(url, code, ref)
     job = jobs.start(f"i:{imid}", user_id)
@@ -593,6 +613,12 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
                     parse_mode=ParseMode.HTML, reply_markup=markup or _preparing_markup())
             except TelegramError as e:
                 logger.info("inline status edit failed: %s", e)
+                if "message_id_invalid" in str(e).lower():
+                    # The card no longer exists: nobody is waiting for it.
+                    logger.info("inline card gone — stopping its download")
+                    job.event.set()
+                    if job.task is not None and not job.started:
+                        job.task.cancel()
 
     async def finish(text: str) -> None:
         """Terminal state: the reason in the card, and the way out (Open bot)."""
@@ -624,6 +650,8 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
         await finish(f"🚫 {_esc(PRIVATE_URL_ERROR)}")
         return
 
+    if job.cancelled:
+        return
     hit = inline_cache.get(url, _key(mode))
     if hit:  # fetched by someone else while this user was choosing
         if await _swap_in(context, imid, hit["kind"], hit["file_id"], hit.get("title", "")):
@@ -673,6 +701,9 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
         if job.cancelled:
             return  # the card already says "Cancelled"
         if not result.success or not result.primary:
+            logger.info("inline %s failed after %.1fs [%s]: %s — %s", mode,
+                        time.monotonic() - started, view.phases(), redact.url(url),
+                        (result.error or "")[:120])
             record_download(user_id, url, "", platform, mode, INLINE_QUALITY, False, error=result.error)
             error = (result.error or "Unknown error")[:700]
             await finish(f"❌ {_esc(error)}")
@@ -716,10 +747,11 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
         if STORAGE_CHAT_ID is None:
             await _quiet_delete(context, chat, sent.message_id)
         record_download(user_id, url, title, platform, mode, INLINE_QUALITY, True, file_size=size)
-        logger.info("inline %s delivered in %.1fs (%s): %s", mode,
-                    time.monotonic() - started, format_size(size), url[:80])
+        logger.info("inline %s delivered in %.1fs (%s) [%s]: %s", mode,
+                    time.monotonic() - started, format_size(size), view.phases(),
+                    redact.url(url))
     except Exception:
-        logger.exception("inline download failed for %s", url[:80])
+        logger.exception("inline download failed for %s", redact.url(url))
         if job.cancelled:
             return
         state["done"] = False
@@ -727,7 +759,8 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
     finally:
         ticker.cancel()
         _STATUS.pop(imid, None)
-        inline_cache.drop_pending(imid)
+        if not jobs.SHUTTING_DOWN:  # on shutdown the restart rescues the card
+            inline_cache.drop_pending(imid)
         if result is not None:
             download_manager.cleanup_result_files(result)
 

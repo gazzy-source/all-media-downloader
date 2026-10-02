@@ -130,7 +130,7 @@ def test_warmup_rotates_only_when_the_bot_is_idle(monkeypatch):
     from bot.services.dl_queue import download_queue
 
     src = Path(dl.__file__).read_text(encoding="utf-8")
-    assert "url != WARMUP_URL or _bot_idle()" in src
+    assert "_bot_idle() if url == WARMUP_URL else _rotation_harmless(0)" in src
     activity.touch()
     assert not dl._bot_idle(), "a user just did something"
     monkeypatch.setattr(activity, "_last", activity.time.monotonic() - 120)
@@ -157,8 +157,12 @@ def test_health_endpoint_flags_a_dead_po_token_provider(monkeypatch):
         "health", Path(__file__).resolve().parents[1] / "scripts" / "bot_health_server.py")
     health = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(health)
+    import time as _t
+
     monkeypatch.setattr(health, "service_active", lambda: True)
     monkeypatch.setattr(health, "pot_provider_up", lambda: False)
+    monkeypatch.setattr(health, "proxy_up", lambda: True)
+    monkeypatch.setattr(health, "heartbeat", lambda: {"ts": _t.time(), "polling": True})
 
     class Req:
         path = "/health"
@@ -178,3 +182,41 @@ def test_health_endpoint_flags_a_dead_po_token_provider(monkeypatch):
     r.wfile = SimpleNamespace(write=lambda b: setattr(r, "body", b))
     health.Handler.do_GET(r)
     assert r.code == 503 and b"degraded" in r.body
+
+
+def test_user_bot_wall_never_rotates_under_someone_elses_transfer(monkeypatch):
+    import bot.services.downloader as dl
+    from bot.services.dl_queue import download_queue
+
+    monkeypatch.setattr(download_queue, "running", 0)
+    monkeypatch.setattr(dl, "_META_INFLIGHT", 1)
+    assert dl._rotation_harmless(0), "only this analysis is running"
+    monkeypatch.setattr(dl, "_META_INFLIGHT", 2)
+    assert not dl._rotation_harmless(0), "another user's analysis is mid-read"
+    monkeypatch.setattr(dl, "_META_INFLIGHT", 0)
+    monkeypatch.setattr(download_queue, "running", 1)
+    assert dl._rotation_harmless(1), "only this download is running"
+    monkeypatch.setattr(download_queue, "running", 2)
+    assert not dl._rotation_harmless(1), "someone else is downloading"
+
+
+
+def test_health_says_down_when_the_bot_stops_beating(monkeypatch):
+    """A hung event loop: systemd still says "active"; the heartbeat goes stale."""
+    import importlib.util
+    import time as _t
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "health3", Path(__file__).resolve().parents[1] / "scripts" / "bot_health_server.py")
+    health = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(health)
+    monkeypatch.setattr(health, "service_active", lambda: True)
+    monkeypatch.setattr(health, "pot_provider_up", lambda: True)
+    monkeypatch.setattr(health, "proxy_up", lambda: True)
+    monkeypatch.setattr(health, "heartbeat", lambda: {"ts": _t.time() - 600, "polling": True})
+    code, body = health.check()
+    assert code == 503 and body["status"] == "down"
+    monkeypatch.setattr(health, "heartbeat", lambda: {"ts": _t.time(), "polling": True})
+    code, body = health.check()
+    assert code == 200 and body["status"] == "ok"

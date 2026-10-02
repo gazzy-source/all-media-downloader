@@ -213,6 +213,14 @@ def _overall_pct(part: str, file_pct: float) -> float:
     return file_pct
 
 
+def _bot_idle() -> bool:
+    from bot.services import activity
+    from bot.services.dl_queue import download_queue
+
+    return (activity.idle_for() > 90 and download_queue.running == 0
+            and download_queue.waiting == 0)
+
+
 def _artist_of(info: dict[str, Any] | None) -> str | None:
     """Best available artist: tagged artist, else the channel (minus " - Topic")."""
     if not info:
@@ -1281,11 +1289,11 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 # user by resending an age-restricted link.
                 if (
                     "not a bot" in err
-                    # Never from the background warmup: "no downloads" is not
-                    # "idle" (analyses, inline searches and prefetches share
-                    # the proxy), and it would burn the cooldown a real user
-                    # may need a minute later. A user's request rotates at once.
-                    and url != WARMUP_URL
+                    # From the background warmup only when the bot is truly
+                    # idle — no user action for 90s and nothing queued or
+                    # downloading — so a walled IP is replaced BEFORE the next
+                    # user pays for it, without cutting anyone's transfer.
+                    and (url != WARMUP_URL or _bot_idle())
                     and _platform_flags(urlparse(url).netloc.lower())["yt"]
                     and opts.get("proxy")
                     and not any(s.get("_warp_retry") for s in strats)

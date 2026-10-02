@@ -55,7 +55,7 @@ class TestCard:
         q = await _search(env, "audio song")
         card = q.answers[0][0][0]
         assert card.caption == "<b>Song 0</b>"
-        assert card.reply_markup.inline_keyboard[0][0].text == "⏳ Starting…"
+        assert card.reply_markup.inline_keyboard[0][0].text == "⏳ Working…"
 
     async def test_progress_is_one_status_on_the_button(self, env, monkeypatch):
         async def fake_download(**kw):
@@ -69,8 +69,11 @@ class TestCard:
                                  inline_message_id="IM", from_user=SimpleNamespace(id=1))
         await _search(env, "audio song")  # so the card's title is known
         await inl.handle_chosen_inline_result(SimpleNamespace(chosen_inline_result=chosen), env.ctx)
-        st = env.ctx.bot.statuses  # no repeats; elapsed time is appended
-        assert len(st) == 2 and st[0].startswith("⬇ 10%") and st[1].startswith("🎵 Converting audio…")
+        # Status = one line under the name in the caption; no repeats.
+        lines = [c.split(chr(10), 1)[1] for c in env.ctx.bot.captions[:-1] if chr(10) in c]
+        assert len(lines) == 2 and lines[0].startswith("⬇ 10%")
+        assert lines[1].startswith("🎵 Converting audio…")
+        assert all(c.startswith("<b>Song 1</b>") for c in env.ctx.bot.captions)
         assert env.ctx.bot.captions[-1].startswith("<b>Song 1</b>")  # failure keeps the name
         assert "nope" in env.ctx.bot.captions[-1]
 

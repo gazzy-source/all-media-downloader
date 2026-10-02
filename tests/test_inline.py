@@ -297,7 +297,7 @@ class TestNoDuplicateDownloads:
         monkeypatch.setattr(inl.download_manager, "download", fake_download)
         monkeypatch.setattr(inl.download_manager, "cleanup_result_files", lambda r: None)
         await inl.handle_chosen_inline_result(_update(chosen_inline_result=_chosen("vp:x")), ctx)
-        assert any("Finishing" in s for s in ctx.bot.statuses)
+        assert any("Finishing" in (c or "") for c in ctx.bot.captions)
 
     async def test_inline_audio_skips_the_mp3_reencode(self, ctx, monkeypatch):
         seen = {}

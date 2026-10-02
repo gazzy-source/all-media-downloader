@@ -10,8 +10,14 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
-from bot import __bot_bio__, __bot_name__, __version__
-from bot.config import ADMIN_IDS, PREMIUM_ENABLED, RATE_LIMIT_PER_HOUR, SUPPORTED_PLATFORMS
+from bot import __bot_bio__, __bot_name__
+from bot.config import (
+    ADMIN_IDS,
+    PREMIUM_ENABLED,
+    PREMIUM_RATE_MULT,
+    RATE_LIMIT_PER_HOUR,
+    SUPPORTED_PLATFORMS,
+)
 from bot.keyboards.menus import main_reply_keyboard, settings_keyboard
 from bot.services import user_prefs
 from bot.services.history import get_stats, get_user_history
@@ -19,60 +25,64 @@ from bot.services.rate_limit import rate_limiter
 from bot.utils.helpers import format_size
 
 
-WELCOME = f"""
+def welcome_text(bot_username: str) -> str:
+    me = f"@{bot_username}" if bot_username else "@bot"
+    return f"""
 🚀 <b>{__bot_name__}</b>
-<code>v{__version__}</code>
 
 {__bot_bio__}
 
-<b>How to use</b>
-• <b>Private chat:</b> paste a link → pick type &amp; quality (buttons)
-• <b>Groups / channels:</b> paste a link → auto-download (up to 1080p)
+<b>📥 Download</b>
+• <b>Here:</b> paste a link → pick Video / Audio and quality
+• <b>Any chat:</b> type <code>{me} &lt;link&gt;</code> → pick 🎬 or 🎵
+• <b>Groups / channels:</b> links download automatically
 
-<b>Pro tips</b>
-• YouTube / IG / TikTok / X / Facebook / Pinterest &amp; 1000+ sites
-• Audio · subtitles · images via the private-chat buttons
-• Groups: @BotFather → /setprivacy → Disable
-• Channels: add bot as <b>admin</b> with <b>Post messages</b>
+<b>🔎 Search inline</b>
+• <code>{me} kya hua tera wada</code> → videos
+• <code>{me} audio arijit singh</code> → songs, with cover art
 
+<b>⚡ Make it yours</b>
+• /settings — save a default (e.g. 🎵 M4A) and skip the menu
+• /premium — {RATE_LIMIT_PER_HOUR * PREMIUM_RATE_MULT} downloads/hour + priority queue ⭐
+
+YouTube · Instagram · TikTok · X · Facebook · Pinterest &amp; 1000+ sites.
 Just paste a link 👇
 """.strip()
 
 
-HELP_TEXT = f"""
+def help_text(bot_username: str) -> str:
+    me = f"@{bot_username}" if bot_username else "@bot"
+    return f"""
 ❓ <b>Help — {__bot_name__}</b>
 
 <b>Commands</b>
-/start — Welcome &amp; main menu
-/help — This guide
-/platforms — Supported sites
-/history — Your recent downloads
-/stats — Usage statistics
-/settings — Preferences &amp; limits
-/cancel — Cancel current operation
+/settings — default type, quality &amp; audio format
+/premium — more downloads per hour + priority
+/history — your recent downloads
+/platforms — supported sites
+/cancel — cancel what you started
+/paysupport — help with a payment
 
-<b>Download modes</b>
-🎥 <b>Video</b> — Best merged video+audio at your quality
-🎞 <b>Video + Subtitles</b> — Same, with soft/hard subtitles
-🎵 <b>Audio</b> — Extract soundtrack (MP3/M4A/Opus)
-🖼 <b>Image</b> — Photos, pins, thumbnails at best size
+<b>Inline (works in any chat)</b>
+• <code>{me} &lt;link&gt;</code> — pick 🎬 Video or 🎵 Audio
+• <code>{me} song name</code> — search YouTube
+• <code>{me} audio song name</code> — search songs
+The card shows the name and live status, then turns into the file.
 
-<b>Quality options</b>
-• 480p — small &amp; fast
-• 720p — balanced (default)
-• 1080p — Full HD
-• Max — highest available (up to 4K+)
+<b>Progress</b>
+Every download shows its steps — Finding source → Downloading (% and
+time left) → Finishing → Sending — and the file says how long it took.
+Busy? You'll see your place in the queue.
+
+<b>Formats &amp; quality</b>
+🎥 Video 480p · 720p · 1080p · Max
+🎵 Audio M4A (original, fastest) · MP3 · Opus — with title, artist &amp; cover
+🎞 Video + subtitles · 🖼 Images
 
 <b>Limits</b>
-• Telegram bots can send up to ~50 MB per file
-• Rate limit: {RATE_LIMIT_PER_HOUR} downloads / hour / user
-• Very large files are sent as documents when possible
-
-<b>Troubleshooting</b>
-• Public posts work with no login or cookies at all
-• Only private / age-restricted posts need a cookies.txt on the server
-• Install FFmpeg for audio conversion &amp; merging
-• YouTube may cap at 360p unless the server runs a PO-token provider
+• Telegram bots can send files up to ~50 MB — pick a lower quality for long videos
+• {RATE_LIMIT_PER_HOUR} downloads/hour ({RATE_LIMIT_PER_HOUR * PREMIUM_RATE_MULT} with /premium)
+• Search shows videos up to 1 hour long
 
 Built with ❤️ by <b>Gazzy Labs</b>
 """.strip()
@@ -93,7 +103,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await start_url_flow(update, context, url)
             return
     await update.effective_message.reply_text(
-        WELCOME,
+        welcome_text(getattr(context.bot, "username", "") or ""),
         parse_mode=ParseMode.HTML,
         reply_markup=main_reply_keyboard(),
         disable_web_page_preview=True,
@@ -104,7 +114,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message:
         return
     await update.effective_message.reply_text(
-        HELP_TEXT,
+        help_text(getattr(context.bot, "username", "") or ""),
         parse_mode=ParseMode.HTML,
         reply_markup=main_reply_keyboard(),
         disable_web_page_preview=True,

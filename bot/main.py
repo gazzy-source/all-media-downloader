@@ -297,13 +297,12 @@ async def post_init(app: Application) -> None:
 
     await app.bot.set_my_commands(
         [
-            BotCommand("start", "Start the bot"),
-            BotCommand("help", "How to use"),
-            BotCommand("platforms", "Supported platforms"),
+            BotCommand("start", "Start & how to use"),
+            BotCommand("settings", "Save default quality/format — skip the menu"),
+            BotCommand("premium", "More downloads + priority queue"),
             BotCommand("history", "Your recent downloads"),
-            BotCommand("stats", "Usage statistics"),
-            BotCommand("settings", "Default quality & format (skip the menu)"),
-            BotCommand("premium", "Premium: more downloads + priority"),
+            BotCommand("help", "All features & limits"),
+            BotCommand("platforms", "Supported sites"),
             BotCommand("cancel", "Cancel current download"),
             BotCommand("paysupport", "Help with a payment"),
         ]

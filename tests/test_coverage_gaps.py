@@ -26,7 +26,7 @@ class TestStartCommands:
     async def test_cmd_start_replies_welcome(self, fx):
         msg = fx.msg("/start")
         await start.cmd_start(fx.update(msg), fx.ctx)
-        assert msg.replies and "How to use" in msg.replies[0][0]
+        assert msg.replies and "Search inline" in msg.replies[0][0]
         assert msg.replies[0][1]["parse_mode"] is not None
 
     async def test_cmd_start_no_message_noop(self, fx):
@@ -38,8 +38,8 @@ class TestStartCommands:
         msg = fx.msg("/help")
         await start.cmd_help(fx.update(msg), fx.ctx)
         text = msg.replies[0][0]
-        assert "Troubleshooting" in text
-        assert "downloads / hour" in text
+        assert "Limits" in text
+        assert "downloads/hour" in text
 
     async def test_cmd_platforms_lists_supported(self, fx):
         msg = fx.msg("/platforms")
@@ -151,7 +151,7 @@ class TestTextMenuRouter:
 
     @pytest.mark.parametrize("label,fragment", [
         ("📥 New Download", "Send a media link"),
-        ("❓ Help", "Troubleshooting"),
+        ("❓ Help", "Limits"),
         ("🌐 Platforms", "Supported platforms"),
         ("🕘 History", "No downloads yet"),
         ("📊 Stats", "Bot statistics"),

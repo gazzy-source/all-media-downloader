@@ -33,7 +33,7 @@ from bot.keyboards.menus import (
     quality_keyboard,
     subtitle_lang_keyboard,
 )
-from bot.services import inline_cache, user_prefs
+from bot.services import activity, inline_cache, user_prefs
 from bot.services.dl_queue import download_queue
 from bot.utils.progress_view import ProgressView
 from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
@@ -90,6 +90,7 @@ def _should_auto_download(update: Update) -> bool:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    activity.touch()
     if not update.effective_message:
         return
     # PTB's message filters also match edits. Fixing a typo in a link message
@@ -712,6 +713,7 @@ def _default_choice(session, prefs: dict) -> tuple[str, str | None, str] | None:
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    activity.touch()
     query = update.callback_query
     if not query or not query.data or not update.effective_user:
         return

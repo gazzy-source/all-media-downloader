@@ -62,7 +62,7 @@ from bot.config import (
     STORAGE_CHAT_ID,
 )
 from bot.handlers import download as download_handlers
-from bot.services import inline_cache, user_prefs, yt_search
+from bot.services import activity, inline_cache, user_prefs, yt_search
 from bot.services.dl_queue import download_queue
 from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
 from bot.services.history import record_download
@@ -220,7 +220,7 @@ def _status_markup(label: str) -> InlineKeyboardMarkup:
 
 
 def _preparing_markup() -> InlineKeyboardMarkup:
-    return _status_markup("⏳ Starting…")
+    return _status_markup("⏳ Working…")
 
 
 def current_status(inline_message_id: str | None) -> str | None:
@@ -247,6 +247,7 @@ async def _is_public(url: str) -> bool:
 
 
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    activity.touch()
     q = update.inline_query
     if not q or not INLINE_ENABLED:
         return
@@ -355,8 +356,11 @@ _SEARCH_SLOTS = asyncio.Semaphore(3)
 def _split_mode(text: str) -> tuple[str, str]:
     """'audio lofi beats' -> ('audio', 'lofi beats'); anything else is video."""
     low = text.lower()
-    if low.strip() in ("audio", "mp3", "music", "song"):
-        return "audio", ""  # the mode word alone — nothing to search for yet
+    word = low.strip()
+    if any(m.startswith(word) for m in ("audio", "music")) or word in ("mp3", "song"):
+        # The mode word alone, or still being typed ("au", "aud"…): nothing
+        # to search for yet.
+        return "audio", ""
     for p in _AUDIO_PREFIXES:
         if low.startswith(p):
             return "audio", text[len(p):].strip()
@@ -493,6 +497,7 @@ def _file_of(msg) -> tuple[str, str] | None:
 
 
 async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    activity.touch()
     ch = update.chosen_inline_result
     if not ch or not ch.inline_message_id or not INLINE_ENABLED:
         return
@@ -525,7 +530,11 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
     title = _known_title(url, code, ref)
 
     async def status(label: str, *, force: bool = False) -> None:
-        """Progress lives on the button only: the card keeps showing the name."""
+        """
+        One status line under the name; the button stays "⏳ Working…" (tap it
+        for the same status). Button-only edits never showed up in Telegram's
+        apps — the card sat on its first status until the file arrived.
+        """
         async with edits:
             if state["done"] or label == state.get("label"):
                 return  # identical edits are refused ("message is not modified")
@@ -537,11 +546,13 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
             _STATUS[imid] = label
             if len(_STATUS) > 2000:
                 _STATUS.pop(next(iter(_STATUS)))
+            head = f"<b>{_esc(title)}</b>\n" if title else ""
             try:
-                await context.bot.edit_message_reply_markup(
-                    inline_message_id=imid, reply_markup=_status_markup(label))
+                await context.bot.edit_message_caption(
+                    inline_message_id=imid, caption=f"{head}{_esc(label)}"[:1024],
+                    parse_mode=ParseMode.HTML, reply_markup=_preparing_markup())
             except TelegramError as e:
-                logger.debug("inline status edit failed: %s", e)
+                logger.info("inline status edit failed: %s", e)
 
     async def finish(text: str) -> None:
         """Terminal state: the reason in the card, and the way out (Open bot)."""

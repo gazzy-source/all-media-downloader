@@ -122,13 +122,21 @@ class TestInstantRepeats:
         assert msg.replies == []  # no "Downloading" status for an instant send
 
 
-def test_warmup_never_rotates_warp():
+def test_warmup_rotates_only_when_the_bot_is_idle(monkeypatch):
     from pathlib import Path
 
     import bot.services.downloader as dl
+    from bot.services import activity
+    from bot.services.dl_queue import download_queue
 
     src = Path(dl.__file__).read_text(encoding="utf-8")
-    assert "and url != WARMUP_URL" in src
+    assert "url != WARMUP_URL or _bot_idle()" in src
+    activity.touch()
+    assert not dl._bot_idle(), "a user just did something"
+    monkeypatch.setattr(activity, "_last", activity.time.monotonic() - 120)
+    assert dl._bot_idle()
+    monkeypatch.setattr(download_queue, "running", 1)
+    assert not dl._bot_idle(), "a download is running"
 
 
 async def test_telegram_polling_hiccup_is_not_an_unhandled_error(caplog):

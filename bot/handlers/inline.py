@@ -557,10 +557,12 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         async with edits:
             state["done"] = True
             _STATUS.pop(imid, None)
-            head = f"<b>{_esc(title)}</b>\n" if title else ""
+            # Telegram lets no bot delete a message sent via inline mode (it
+            # is the user's own); the closest is an empty card: no name, no
+            # buttons, one word.
             try:
                 await context.bot.edit_message_caption(
-                    inline_message_id=imid, caption=f"{head}✖ Cancelled"[:1024],
+                    inline_message_id=imid, caption="✖ Cancelled",
                     parse_mode=ParseMode.HTML, reply_markup=None)
             except TelegramError as e:
                 logger.info("inline cancel edit failed: %s", e)

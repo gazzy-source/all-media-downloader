@@ -585,6 +585,7 @@ async def start_url_flow(
         raw_info={},  # keep memory light
         status_message_id=status.message_id,
         prompt_message_id=status.message_id,
+        link_message_id=_own_message_id(msg, user),
     )
     sessions.put(session)
 
@@ -676,10 +677,12 @@ def _progress_driver(view: "ProgressView", header, edit, *, start: bool = True,
 
     ticker = _Ticker(tick)
 
-    async def close(text: str, **kw) -> None:
+    async def close(text: str | None, **kw) -> None:
         async with lock:
             last["closed"] = True
             ticker.cancel()
+            if text is None:
+                return  # just stop editing (the message is about to go)
             try:
                 await edit(text, parse_mode=ParseMode.HTML, **kw)
             except TelegramError:
@@ -697,6 +700,24 @@ def _dm_header(session, mode: str, quality: str) -> str:
             "image": "🖼 Image"}.get(
         mode, f"🎬 Video {QUALITY_MAP.get(quality, {}).get('label', quality)}")
     return f"{_session_header(session)} · {what}"
+
+
+def _own_message_id(msg, user) -> int | None:
+    """
+    The user's own link message (deleted if they cancel). Not after Download
+    Again: there the message is the bot's — the file the user already has.
+    """
+    sender = getattr(msg, "from_user", None)
+    if sender is None or user is None or sender.id != user.id:
+        return None
+    return getattr(msg, "message_id", None)
+
+
+async def _quiet_delete_msg(context, chat_id: int, message_id: int) -> None:
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except TelegramError:
+        pass  # already gone, or too old to delete
 
 
 _CANCEL_KB = InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel", callback_data="dlx")]])
@@ -1100,9 +1121,12 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
                                            markup=_cancel_row)
 
     async def _cancelled() -> None:
-        await ticker.close(
-            f"{dm_head}\n\n✖ <b>Cancelled</b> — nothing was downloaded.",
-            reply_markup=after_download_keyboard(session.url, user_id=session.user_id))
+        # Cancelled = gone: the progress message and the link that started it
+        # are removed (the tap's "✖ Cancelled" toast confirms it).
+        await ticker.close(None)
+        for mid in (query.message.message_id, session.link_message_id):
+            if mid:
+                await _quiet_delete_msg(context, chat_id, mid)
 
 
     # Refuse a doomed download BEFORE spending it, not after. The analysis pass

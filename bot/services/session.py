@@ -58,6 +58,7 @@ class DownloadSession:
 
     # UI message tracking
     prompt_message_id: int | None = None
+    link_message_id: int | None = None  # the user's own message with the link
     status_message_id: int | None = None
 
     def expired(self, ttl: int = SESSION_TTL) -> bool:

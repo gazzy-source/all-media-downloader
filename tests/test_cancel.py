@@ -64,7 +64,7 @@ class TestInlineCancel:
         assert await _tap(fx, "inl:x") == "✖ Cancelled"
         await asyncio.wait_for(task, 2)
         assert stopped.is_set()
-        assert env.ctx.bot.captions[-1].endswith("✖ Cancelled")
+        assert env.ctx.bot.captions[-1] == "✖ Cancelled"  # no name left either
         assert env.ctx.bot.markups[-1] is None  # no buttons left on a cancelled card
         assert jobs.get("i:IMC") is None
 
@@ -128,3 +128,10 @@ async def test_cmd_cancel_stops_a_running_dm_download(fx):
     assert job.cancelled and notes == ["card"]
     assert msg.replies[0][0].startswith("✖ Cancelled")
     jobs.drop(job)
+
+
+def test_only_the_users_own_link_is_deleted_on_cancel():
+    me = SimpleNamespace(id=42)
+    assert hd._own_message_id(SimpleNamespace(from_user=me, message_id=9), me) == 9
+    bot_msg = SimpleNamespace(from_user=SimpleNamespace(id=777), message_id=10)
+    assert hd._own_message_id(bot_msg, me) is None  # "Download Again": the bot's file

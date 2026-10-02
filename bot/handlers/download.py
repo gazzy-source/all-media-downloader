@@ -34,6 +34,7 @@ from bot.keyboards.menus import (
 )
 from bot.services import activity, inline_cache, jobs, user_prefs
 from bot.services.dl_queue import download_queue
+from bot.services.upload_gate import UploadCancelled, upload_gate
 from bot.utils import redact
 from bot.utils.texts import rate_limit_text, too_big_text, upload_failed_text
 from bot.utils.progress_view import ProgressView
@@ -359,9 +360,8 @@ async def auto_download_flow(
     # close, not cancel: also waits out a progress edit already in flight,
     # which could otherwise land after (and overwrite) the final text below.
     await ticker.close(None)
-    if not job.cancelled:
-        job.cancellable = False
-    jobs.drop(job)
+    if job.cancelled or not (result.success and result.primary):
+        jobs.drop(job)  # nothing will be sent; otherwise kept cancellable until sending
     if job.cancelled:  # its message is already gone (or we are shutting down)
         if not jobs.SHUTTING_DOWN:
             inflight_remove(chat.id, status.message_id)
@@ -395,7 +395,10 @@ async def auto_download_flow(
     ticker.cancel()
     view.sending(format_size(size))
     try:
-        await status.edit_text(view.render(head), parse_mode=ParseMode.HTML)
+        # ✖ Cancel stays while it waits for upload capacity (a tap once the
+        # bytes are flowing answers "being sent").
+        await status.edit_text(view.render(head), parse_mode=ParseMode.HTML,
+                               reply_markup=_CANCEL_KB if can_cancel else None)
     except TelegramError:
         pass
 
@@ -451,6 +454,7 @@ async def auto_download_flow(
             sent = await _send_media(
                 context, chat.id, path, result, caption, reply_markup=actions,
                 thread_id=_thread_of(msg),
+                cancel=job.event, on_reserved=lambda: setattr(job, "cancellable", False),
             )
             _remember_upload(url, repeat, sent, result.title or "", result, mode, quality)
         record_download(
@@ -466,6 +470,8 @@ async def auto_download_flow(
                     await status.edit_text(f"✅ Sent · {format_size(size)}")
                 except TelegramError:
                     pass
+    except UploadCancelled:
+        pass  # cancelled while waiting to send: its message is already gone
     except TelegramError as e:
         logger.exception("auto upload failed")
         record_download(
@@ -477,7 +483,9 @@ async def auto_download_flow(
         except TelegramError:
             pass
     finally:
-        inflight_remove(chat.id, status.message_id)
+        jobs.drop(job)
+        if not (job.cancelled and jobs.SHUTTING_DOWN):  # shutdown: restart says "Interrupted"
+            inflight_remove(chat.id, status.message_id)
         download_manager.cleanup_result_files(result)
     return delivered
 
@@ -1346,9 +1354,8 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
     # close, not cancel: also waits out a progress edit already in flight,
     # which could otherwise land after (and overwrite) the final text below.
     await ticker.close(None)
-    if not job.cancelled:
-        job.cancellable = False  # before drop: a tap now hears "being sent"
-    jobs.drop(job)
+    if job.cancelled or not (result.success and result.primary):
+        jobs.drop(job)  # nothing will be sent; otherwise kept cancellable until sending
     if job.cancelled:
         # The message is already gone — or the bot is stopping, in which case
         # it stays registered and the restart tells the user "Interrupted".
@@ -1358,7 +1365,6 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         if result is not None:
             download_manager.cleanup_result_files(result)
         return
-    job.cancellable = False
     if not result.success or not result.primary:
         record_download(
             session.user_id,
@@ -1396,7 +1402,9 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
     ticker.cancel()
     view.sending(format_size(size))
     try:
-        await query.edit_message_text(view.render(dm_head), parse_mode=ParseMode.HTML)
+        # ✖ Cancel stays while it waits for upload capacity.
+        await query.edit_message_text(view.render(dm_head), parse_mode=ParseMode.HTML,
+                                      reply_markup=_CANCEL_KB)
     except TelegramError:
         pass
 
@@ -1435,7 +1443,8 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         else:
             # One output only: media with caption + action buttons
             sent = await _send_media(
-                context, chat_id, path, result, caption, reply_markup=actions
+                context, chat_id, path, result, caption, reply_markup=actions,
+                cancel=job.event, on_reserved=lambda: setattr(job, "cancellable", False),
             )
             _remember_upload(session.url, repeat, sent, result.title or session.title,
                              result, mode, quality)
@@ -1473,6 +1482,8 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
                     )
                 except TelegramError:
                     pass
+    except UploadCancelled:
+        pass  # cancelled while waiting to send: its messages are already gone
     except TelegramError as e:
         logger.exception("send media failed")
         record_download(
@@ -1497,7 +1508,9 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
                 reply_markup=main_reply_keyboard(),
             )
     finally:
-        inflight_remove(chat_id, query.message.message_id)
+        jobs.drop(job)
+        if not (job.cancelled and jobs.SHUTTING_DOWN):  # shutdown: restart says "Interrupted"
+            inflight_remove(chat_id, query.message.message_id)
         download_manager.cleanup_result_files(result)
         sessions.remove(session.session_id)
 
@@ -1558,11 +1571,17 @@ async def _send_media(
     *,
     silent: bool = False,
     thread_id: int | None = None,
+    cancel=None,
+    on_reserved=None,
 ):
     """
     Upload media with long timeouts and retries on TimedOut.
 
     Returns the sent Message (its file_id is what inline mode re-sends).
+
+    Waits for upload capacity first (upload_gate) and holds it across every
+    attempt. `cancel` (the job's event) ends the wait with UploadCancelled;
+    `on_reserved()` runs once capacity is granted, right before sending.
     """
     filename = path.name
     if path.stem == "media" and result is not None and getattr(result, "title", None):
@@ -1570,6 +1589,18 @@ async def _send_media(
     if len(caption) > 1024:
         caption = caption[:1000] + "…"
 
+    async with upload_gate.reserve(path.stat().st_size, cancel):
+        if on_reserved is not None:
+            on_reserved()
+        return await _send_media_attempts(
+            context, chat_id, path, result, caption, filename, reply_markup,
+            attempts, silent=silent, thread_id=thread_id,
+        )
+
+
+async def _send_media_attempts(context, chat_id, path, result, caption, filename,
+                               reply_markup, attempts, *, silent, thread_id):
+    """The retry loop, unchanged — run while holding the upload reservation."""
     # Errors are kept WITHOUT tracebacks (see _without_frames): their frames
     # reference the failed attempt's request through the backoff and the retry.
     last_err: Exception | None = None

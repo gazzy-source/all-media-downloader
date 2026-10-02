@@ -64,6 +64,7 @@ from bot.config import (
 from bot.handlers import download as download_handlers
 from bot.services import activity, inline_cache, jobs, user_prefs, yt_search
 from bot.services.dl_queue import download_queue
+from bot.services.upload_gate import UploadCancelled
 from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
 from bot.services.history import record_download
 from bot.services.rate_limit import RateLimiter, rate_limiter
@@ -228,11 +229,6 @@ def _preparing_markup() -> InlineKeyboardMarkup:
         InlineKeyboardButton("⏳ Working…", callback_data=WAIT_CALLBACK),
         InlineKeyboardButton("✖ Cancel", callback_data=CANCEL_CALLBACK),
     ]])
-
-
-def _sending_markup() -> InlineKeyboardMarkup:
-    # Too late to cancel once the file is on its way to Telegram.
-    return _status_markup("⏳ Working…")
 
 
 def current_status(inline_message_id: str | None) -> str | None:
@@ -719,15 +715,20 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
         if chat is None:
             await finish("❌ Inline mode isn't set up on this server yet.")
             return
-        job.cancellable = False
         if job.cancelled:
             return
         view.sending()
-        await status(view.short(), force=True, markup=_sending_markup())
+        # ✖ Cancel stays while it waits for upload capacity; once the bytes
+        # are flowing a tap answers "being sent".
+        await status(view.short(), force=True)
         state["done"] = True  # from here the card only changes into the file
-        sent = await download_handlers._send_media(
-            context, chat, result.primary, result, caption="", silent=True
-        )
+        try:
+            sent = await download_handlers._send_media(
+                context, chat, result.primary, result, caption="", silent=True,
+                cancel=job.event, on_reserved=lambda: setattr(job, "cancellable", False),
+            )
+        except UploadCancelled:
+            return  # the card already says "Cancelled"
         found = _file_of(sent)
         if not found:
             state["done"] = False

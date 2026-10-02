@@ -23,6 +23,9 @@ ADMIN_IDS: set[int] = {
 MAX_CONCURRENT_DOWNLOADS: int = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "5"))
 MAX_FILE_SIZE_MB: float = float(os.getenv("MAX_FILE_SIZE_MB", "49"))
 MAX_FILE_SIZE_BYTES: int = int(MAX_FILE_SIZE_MB * 1024 * 1024)
+# Uploads to Telegram at once, and MB of files in flight (see upload_gate.py).
+UPLOAD_MAX_CONCURRENT: int = max(1, int(os.getenv("UPLOAD_MAX_CONCURRENT", "2")))
+UPLOAD_BUDGET_BYTES: int = int(float(os.getenv("UPLOAD_BUDGET_MB", "100")) * 1024 * 1024)
 
 DOWNLOAD_DIR: Path = Path(os.getenv("DOWNLOAD_DIR", str(BASE_DIR / "downloads")))
 TEMP_DIR: Path = Path(os.getenv("TEMP_DIR", str(BASE_DIR / "temp")))

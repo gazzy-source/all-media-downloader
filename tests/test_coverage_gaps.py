@@ -26,7 +26,7 @@ class TestStartCommands:
     async def test_cmd_start_replies_welcome(self, fx):
         msg = fx.msg("/start")
         await start.cmd_start(fx.update(msg), fx.ctx)
-        assert msg.replies and "Search inline" in msg.replies[0][0]
+        assert msg.replies and "Songs in any chat" in msg.replies[0][0]
         assert msg.replies[0][1]["parse_mode"] is not None
 
     async def test_cmd_start_no_message_noop(self, fx):

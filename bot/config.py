@@ -282,10 +282,34 @@ POT_PROVIDER_URL: str | None = (os.getenv("POT_PROVIDER_URL") or "").strip() or 
 
 # Profile overrides
 BOT_NAME_OVERRIDE: str | None = os.getenv("BOT_NAME", "").strip() or None
-BOT_DESCRIPTION: str | None = os.getenv("BOT_DESCRIPTION", "").strip() or None
-BOT_SHORT_DESCRIPTION: str | None = (
-    os.getenv("BOT_SHORT_DESCRIPTION", "").strip() or None
+# Defaults are applied on startup ({me} = the bot's @username); set
+# BOT_DESCRIPTION=- (or the short one)
+# in .env to leave what BotFather has untouched.
+_DEFAULT_DESCRIPTION = (
+    "🎵 Songs, 🎬 videos and 🖼 images from YouTube, Instagram, TikTok, X, "
+    "Facebook, Pinterest and 1000+ sites — fast, in good quality.\n\n"
+    "• Paste a link here and pick Video or Audio\n"
+    "• In any chat type {me} and a song name — it arrives "
+    "right there (add “video” for videos)\n"
+    "• Add me to a group: links download automatically\n\n"
+    "Live progress, ✖ Cancel any time. Built by Gazzy Labs."
 )
+_DEFAULT_SHORT_DESCRIPTION = (
+    "Songs & videos from YouTube, Instagram, TikTok & 1000+ sites — "
+    "paste a link or search in any chat."
+)
+
+
+def _profile_text(name: str, default: str) -> str | None:
+    raw = os.getenv(name, "").strip()
+    if raw == "-":
+        return None
+    return raw or default
+
+
+BOT_DESCRIPTION: str | None = _profile_text("BOT_DESCRIPTION", _DEFAULT_DESCRIPTION)
+BOT_SHORT_DESCRIPTION: str | None = _profile_text(
+    "BOT_SHORT_DESCRIPTION", _DEFAULT_SHORT_DESCRIPTION)
 
 TELEGRAM_VIDEO_CAPTION_LIMIT = 1024
 TELEGRAM_MESSAGE_LIMIT = 4096

@@ -7,7 +7,7 @@ import logging
 import time
 from pathlib import Path
 
-from telegram import InputFile, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import ContextTypes
@@ -33,7 +33,7 @@ from bot.keyboards.menus import (
     quality_keyboard,
     subtitle_lang_keyboard,
 )
-from bot.services import activity, inline_cache, user_prefs
+from bot.services import activity, inline_cache, jobs, user_prefs
 from bot.services.dl_queue import download_queue
 from bot.utils.texts import rate_limit_text, too_big_text, upload_failed_text
 from bot.utils.progress_view import ProgressView
@@ -636,17 +636,23 @@ class _Ticker:
             self._task.cancel()
 
 
-def _progress_driver(view: "ProgressView", header, edit, *, start: bool = True):
+def _progress_driver(view: "ProgressView", header, edit, *, start: bool = True,
+                     markup=None):
     """
     (on_progress, ticker) for a chat status message. Edits on every step
     change, otherwise at most every 2.5s; the ticker keeps the clock moving
     through steps that report nothing (finding the source, converting).
+    `markup()` gives the buttons under it (✖ Cancel), if any.
+    ticker.close(text, **kw) makes a final edit that no late progress edit
+    can overwrite.
     """
-    last = {"t": 0.0, "text": ""}
+    last = {"t": 0.0, "text": "", "closed": False}
     lock = asyncio.Lock()
 
     async def render(force: bool = False) -> None:
         async with lock:
+            if last["closed"]:
+                return
             now = time.monotonic()
             if not force and now - last["t"] < 2.5:
                 return
@@ -655,7 +661,8 @@ def _progress_driver(view: "ProgressView", header, edit, *, start: bool = True):
                 return  # Telegram refuses identical edits
             last.update(t=now, text=text)
             try:
-                await edit(text, parse_mode=ParseMode.HTML)
+                kw = {"reply_markup": markup()} if markup is not None else {}
+                await edit(text, parse_mode=ParseMode.HTML, **kw)
             except TelegramError:
                 pass
 
@@ -668,6 +675,17 @@ def _progress_driver(view: "ProgressView", header, edit, *, start: bool = True):
             await render()
 
     ticker = _Ticker(tick)
+
+    async def close(text: str, **kw) -> None:
+        async with lock:
+            last["closed"] = True
+            ticker.cancel()
+            try:
+                await edit(text, parse_mode=ParseMode.HTML, **kw)
+            except TelegramError:
+                pass
+
+    ticker.close = close
     if start:
         ticker.start()
     return on_progress, ticker
@@ -679,6 +697,9 @@ def _dm_header(session, mode: str, quality: str) -> str:
             "image": "🖼 Image"}.get(
         mode, f"🎬 Video {QUALITY_MAP.get(quality, {}).get('label', quality)}")
     return f"{_session_header(session)} · {what}"
+
+
+_CANCEL_KB = InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel", callback_data="dlx")]])
 
 
 class _StatusQuery:
@@ -708,6 +729,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     activity.touch()
     query = update.callback_query
     if not query or not query.data or not update.effective_user:
+        return
+    if query.data in ("inl:x", "dlx"):
+        # ✖ Cancel under an inline card / a DM progress message.
+        imid = getattr(query, "inline_message_id", None)
+        if query.data == "inl:x":
+            key = f"i:{imid}"
+        else:
+            m = query.message
+            key = f"dm:{m.chat.id}:{m.message_id}" if m else None
+        outcome = await jobs.cancel(key, update.effective_user.id)
+        try:
+            await query.answer(jobs.CANCEL_ANSWERS[outcome])
+        except TelegramError:
+            pass
         return
     if query.data == "inl:wait":
         # The inline card's status button: answer with that same status.
@@ -1048,6 +1083,10 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
 
     view = ProgressView()
     dm_head = _dm_header(session, mode, quality)
+
+    def _cancel_row():
+        return _CANCEL_KB if job.cancellable and not job.cancelled else None
+
     try:
         await query.edit_message_text(view.render(dm_head), parse_mode=ParseMode.HTML)
     except TelegramError:
@@ -1057,7 +1096,14 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         await context.bot.edit_message_text(
             text, chat_id=chat_id, message_id=query.message.message_id, **kw)
 
-    on_progress, ticker = _progress_driver(view, lambda: dm_head, _edit_dm, start=False)
+    on_progress, ticker = _progress_driver(view, lambda: dm_head, _edit_dm, start=False,
+                                           markup=_cancel_row)
+
+    async def _cancelled() -> None:
+        await ticker.close(
+            f"{dm_head}\n\n✖ <b>Cancelled</b> — nothing was downloaded.",
+            reply_markup=after_download_keyboard(session.url, user_id=session.user_id))
+
 
     # Refuse a doomed download BEFORE spending it, not after. The analysis pass
     # already measured every quality, so when the estimate is over Telegram's
@@ -1119,10 +1165,20 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
             return
 
     inflight_add(chat_id, query.message.message_id)
+    # Registered only now: every return above would otherwise leak the job.
+    job = jobs.start(f"dm:{chat_id}:{query.message.message_id}", session.user_id,
+                     by_owner=True)
+    job.on_cancel = _cancelled
     ticker.start()
+    try:  # ✖ Cancel straight away, not only after the first progress event
+        await _edit_dm(view.render(dm_head), parse_mode=ParseMode.HTML,
+                       reply_markup=_CANCEL_KB)
+    except TelegramError:
+        pass
     try:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
-        result = await download_queue.run(
+        result = await jobs.run_queued(
+            job, download_queue,
             lambda: download_manager.download(
                 url=session.url,
                 mode=mode,
@@ -1131,14 +1187,17 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
                 audio_format=session.audio_format,
                 title_hint=session.title or "media",
                 progress_cb=on_progress,
+                cancel=job.event,
             ),
-            on_position=lambda n: on_progress(
-                0, f"Queued — you're #{n} in line"
-                + (" (premium: ahead of free users)" if user_prefs.is_premium(session.user_id) else "")
-            ),
+            on_position=lambda n: on_progress(0, f"Queued — you're #{n} in line"),
             priority=user_prefs.is_premium(session.user_id),
         )
+    except asyncio.CancelledError:
+        if not job.cancelled:
+            raise
+        result = None
     except Exception as e:
+        jobs.drop(job)
         ticker.cancel()
         logger.exception("download crashed")
         record_download(
@@ -1162,6 +1221,15 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         return
 
     ticker.cancel()  # every outcome below writes its own final text
+    jobs.drop(job)
+    if job.cancelled:
+        # The message already says "Cancelled" (and offers Download Again).
+        inflight_remove(chat_id, query.message.message_id)
+        sessions.remove(session.session_id)
+        if result is not None:
+            download_manager.cleanup_result_files(result)
+        return
+    job.cancellable = False
     if not result.success or not result.primary:
         record_download(
             session.user_id,

@@ -62,7 +62,7 @@ from bot.config import (
     STORAGE_CHAT_ID,
 )
 from bot.handlers import download as download_handlers
-from bot.services import activity, inline_cache, user_prefs, yt_search
+from bot.services import activity, inline_cache, jobs, user_prefs, yt_search
 from bot.services.dl_queue import download_queue
 from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
 from bot.services.history import record_download
@@ -204,6 +204,7 @@ async def _quiet_delete(context, chat_id: int, message_id: int) -> None:
 
 
 WAIT_CALLBACK = "inl:wait"
+CANCEL_CALLBACK = "inl:x"
 
 
 # Live status per inline message (what its button says), so tapping the
@@ -221,6 +222,15 @@ def _status_markup(label: str) -> InlineKeyboardMarkup:
 
 
 def _preparing_markup() -> InlineKeyboardMarkup:
+    """Working… (tap: the live status) | ✖ Cancel (stops the download)."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏳ Working…", callback_data=WAIT_CALLBACK),
+        InlineKeyboardButton("✖ Cancel", callback_data=CANCEL_CALLBACK),
+    ]])
+
+
+def _sending_markup() -> InlineKeyboardMarkup:
+    # Too late to cancel once the file is on its way to Telegram.
     return _status_markup("⏳ Working…")
 
 
@@ -253,7 +263,8 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not q or not INLINE_ENABLED:
         return
     hint = InlineQueryResultsButton(
-        text="🔎 Type to search YouTube — or paste a link", start_parameter="inline")
+        text="🎵 Type a song — “video …” for videos, or paste a link",
+        start_parameter="inline")
     urls = extract_urls((q.query or "").strip(), expand=False)
     if not urls:
         text = yt_search.normalize_query(q.query or "")
@@ -345,6 +356,7 @@ async def _answer(
 
 _VIDEO_ID = __import__("re").compile(r"[A-Za-z0-9_-]{11}")
 _AUDIO_PREFIXES = ("audio ", "mp3 ", "music ", "song ", "🎵")
+_VIDEO_PREFIXES = ("video ", "videos ", "vid ", "🎬", "🎥")
 # Per user: the newest query id. A search starts only once typing pauses, so a
 # word typed letter by letter costs one YouTube search, not one per keystroke.
 _LATEST: dict[int, str] = {}
@@ -355,17 +367,25 @@ _SEARCH_SLOTS = asyncio.Semaphore(3)
 
 
 def _split_mode(text: str) -> tuple[str, str]:
-    """'audio lofi beats' -> ('audio', 'lofi beats'); anything else is video."""
+    """
+    Songs by default: 'lofi beats' -> ('audio', 'lofi beats');
+    'video lofi beats' -> ('video', 'lofi beats'). "audio …" still works.
+    """
     low = text.lower()
     word = low.strip()
-    if any(m.startswith(word) for m in ("audio", "music")) or word in ("mp3", "song"):
-        # The mode word alone, or still being typed ("au", "aud"…): nothing
-        # to search for yet.
+    if len(word) >= 3 and any(m.startswith(word) for m in ("video", "videos")):
+        # "vid", "vide", "video": the mode word alone or still being typed —
+        # nothing to search for yet.
+        return "video", ""
+    if word in ("audio", "music", "mp3", "song"):
         return "audio", ""
+    for p in _VIDEO_PREFIXES:
+        if low.startswith(p):
+            return "video", text[len(p):].strip()
     for p in _AUDIO_PREFIXES:
         if low.startswith(p):
             return "audio", text[len(p):].strip()
-    return "video", text
+    return "audio", text
 
 
 async def _search(q, text: str) -> None:
@@ -373,7 +393,7 @@ async def _search(q, text: str) -> None:
     if len(terms) < 3:
         # One or two letters match everything: don't spend a YouTube search on it.
         await _answer(q, [], button=InlineQueryResultsButton(
-            text="🎵 Now type a song name" if mode == "audio" else "🔎 Keep typing…",
+            text="🎬 Now type a video name" if mode == "video" else "🎵 Keep typing a song name…",
             start_parameter="inline"), cache_time=60)
         return
     uid = q.from_user.id
@@ -427,8 +447,8 @@ async def _search(q, text: str) -> None:
     await _answer(q, results, cache_time=300, personal=False,
                   next_offset=str(nxt) if nxt < len(hits) else None,
                   button=None if start else InlineQueryResultsButton(
-                      text=("🎵 Audio results — type without “audio” for video"
-                            if mode == "audio" else "🎬 Video results — start with “audio” for music"),
+                      text=("🎵 Songs — start with “video” for videos"
+                            if mode == "audio" else "🎬 Videos — type without “video” for songs"),
                       start_parameter="inline"))
 
 
@@ -531,8 +551,23 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
     logger.info("inline %s chosen by %s: %s", mode, user_id, url[:80])
 
     title = _known_title(url, code, ref)
+    job = jobs.start(f"i:{imid}", user_id)
 
-    async def status(label: str, *, force: bool = False) -> None:
+    async def cancelled_card() -> None:
+        async with edits:
+            state["done"] = True
+            _STATUS.pop(imid, None)
+            head = f"<b>{_esc(title)}</b>\n" if title else ""
+            try:
+                await context.bot.edit_message_caption(
+                    inline_message_id=imid, caption=f"{head}✖ Cancelled"[:1024],
+                    parse_mode=ParseMode.HTML, reply_markup=None)
+            except TelegramError as e:
+                logger.info("inline cancel edit failed: %s", e)
+
+    job.on_cancel = cancelled_card
+
+    async def status(label: str, *, force: bool = False, markup=None) -> None:
         """
         One status line under the name; the button stays "⏳ Working…" (tap it
         for the same status). Button-only edits never showed up in Telegram's
@@ -553,7 +588,7 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
             try:
                 await context.bot.edit_message_caption(
                     inline_message_id=imid, caption=f"{head}{_esc(label)}"[:1024],
-                    parse_mode=ParseMode.HTML, reply_markup=_preparing_markup())
+                    parse_mode=ParseMode.HTML, reply_markup=markup or _preparing_markup())
             except TelegramError as e:
                 logger.info("inline status edit failed: %s", e)
 
@@ -570,6 +605,15 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
             except TelegramError as e:
                 logger.info("inline final edit failed: %s", e)
 
+    try:
+        await _deliver(context, job, mode, url, user_id, imid, title, started,
+                       status, finish, state)
+    finally:
+        jobs.drop(job)
+
+
+async def _deliver(context, job, mode, url, user_id, imid, title, started,
+                   status, finish, state) -> None:
     allowed, retry = rate_limiter.allow(user_id)
     if not allowed and user_id not in ADMIN_IDS:
         await finish(rate_limit_text(retry, user_id))
@@ -583,6 +627,8 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         if await _swap_in(context, imid, hit["kind"], hit["file_id"], hit.get("title", "")):
             return
         inline_cache.forget(url, _key(mode))  # Telegram refused it: fetch afresh below
+    if job.cancelled:
+        return
 
     view = ProgressView()
 
@@ -605,16 +651,25 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
     result = None
     platform = platform_from_url(url)
     try:
-        result = await download_queue.run(
-            lambda: download_manager.download(
-                # m4a: YouTube's own AAC stream, remuxed — no minute-long MP3
-                # re-encode on a small VPS. Telegram plays it as audio natively.
-                url=url, mode=mode, quality=INLINE_QUALITY, audio_format="m4a",
-                title_hint=title or "media", progress_cb=on_progress,
-            ),
-            on_position=lambda n: on_progress(0, f"Queued — you're #{n} in line"),
-            priority=user_prefs.is_premium(user_id),
-        )
+        try:
+            result = await jobs.run_queued(
+                job, download_queue,
+                lambda: download_manager.download(
+                    # m4a: YouTube's own AAC stream, remuxed — no minute-long MP3
+                    # re-encode on a small VPS. Telegram plays it as audio natively.
+                    url=url, mode=mode, quality=INLINE_QUALITY, audio_format="m4a",
+                    title_hint=title or "media", progress_cb=on_progress,
+                    cancel=job.event,
+                ),
+                on_position=lambda n: on_progress(0, f"Queued — you're #{n} in line"),
+                priority=user_prefs.is_premium(user_id),
+            )
+        except asyncio.CancelledError:
+            if job.cancelled:
+                return  # withdrawn from the queue; the card already says so
+            raise
+        if job.cancelled:
+            return  # the card already says "Cancelled"
         if not result.success or not result.primary:
             record_download(user_id, url, "", platform, mode, INLINE_QUALITY, False, error=result.error)
             error = (result.error or "Unknown error")[:700]
@@ -631,8 +686,11 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         if chat is None:
             await finish("❌ Inline mode isn't set up on this server yet.")
             return
+        job.cancellable = False
+        if job.cancelled:
+            return
         view.sending()
-        await status(view.short(), force=True)
+        await status(view.short(), force=True, markup=_sending_markup())
         state["done"] = True  # from here the card only changes into the file
         sent = await download_handlers._send_media(
             context, chat, result.primary, result, caption="", silent=True
@@ -660,6 +718,8 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
                     time.monotonic() - started, format_size(size), url[:80])
     except Exception:
         logger.exception("inline download failed for %s", url[:80])
+        if job.cancelled:
+            return
         state["done"] = False
         await finish("❌ Something went wrong. Please try again.")
     finally:

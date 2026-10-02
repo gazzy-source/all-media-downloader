@@ -305,7 +305,7 @@ async def post_init(app: Application) -> None:
             BotCommand("history", "Your recent downloads"),
             BotCommand("help", "All features & limits"),
             BotCommand("platforms", "Supported sites"),
-            BotCommand("cancel", "Cancel a link you haven't started"),
+            BotCommand("cancel", "Stop the current download"),
             BotCommand("paysupport", "Help with a payment"),
         ]
     )
@@ -317,11 +317,12 @@ async def post_init(app: Application) -> None:
             await app.bot.set_my_name(BOT_NAME_OVERRIDE)
             logger.info("Applied BOT_NAME from .env")
         if BOT_DESCRIPTION:
-            await app.bot.set_my_description(BOT_DESCRIPTION)
-            logger.info("Applied BOT_DESCRIPTION from .env")
+            me = f"@{app.bot.username}" if app.bot.username else "the bot"
+            await app.bot.set_my_description(BOT_DESCRIPTION.replace("{me}", me)[:512])
+            logger.info("Applied bot description")
         if BOT_SHORT_DESCRIPTION:
-            await app.bot.set_my_short_description(BOT_SHORT_DESCRIPTION)
-            logger.info("Applied BOT_SHORT_DESCRIPTION from .env")
+            await app.bot.set_my_short_description(BOT_SHORT_DESCRIPTION[:120])
+            logger.info("Applied bot short description")
         if not any((BOT_NAME_OVERRIDE, BOT_DESCRIPTION, BOT_SHORT_DESCRIPTION)):
             logger.info(
                 "Profile left unchanged (edit via @BotFather, or set BOT_* in .env)"

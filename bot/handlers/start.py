@@ -46,14 +46,16 @@ def welcome_text(bot_username: str) -> str:
 
 {__bot_bio__}
 
-<b>📥 Download</b>
-• <b>Here:</b> paste a link → pick Video / Audio and quality
-• <b>Any chat:</b> type <code>{me} &lt;link&gt;</code> → pick 🎬 or 🎵
+<b>🎵 Songs in any chat</b>
+• <code>{me} arijit singh</code> → pick a song, it arrives right there
+• <code>{me} video kya hua tera wada</code> → videos instead
+
+<b>📥 Links</b>
+• <b>Here:</b> paste a link → pick 🎬 Video or 🎵 Audio and quality
+• <b>Any chat:</b> <code>{me} &lt;link&gt;</code> → pick 🎬 or 🎵
 • <b>Groups / channels:</b> links download automatically
 
-<b>🔎 Search inline</b>
-• <code>{me} kya hua tera wada</code> → videos
-• <code>{me} audio arijit singh</code> → songs, with cover art
+Changed your mind? Tap <b>✖ Cancel</b> on any download.
 
 <b>⚡ Make it yours</b>
 • /settings — save a default (e.g. 🎵 M4A) and skip the menu
@@ -72,22 +74,22 @@ def help_text(bot_username: str) -> str:
 /settings — default type, quality &amp; audio format
 {'/premium — more downloads per hour + priority' + chr(10) if PREMIUM_ENABLED else ''}/history — your recent downloads
 /platforms — supported sites
-/cancel — cancel a link you haven't started
+/cancel — stop the current download
 /paysupport — help with a payment
 
 <b>Inline (works in any chat)</b>
+• <code>{me} song name</code> — search songs 🎵
+• <code>{me} video name</code> — search videos 🎬
 • <code>{me} &lt;link&gt;</code> — pick 🎬 Video or 🎵 Audio
-• <code>{me} song name</code> — search YouTube
-• <code>{me} audio song name</code> — search songs
 The card shows the name and live status, then turns into the file.
 
 <b>Progress</b>
 Every download shows its steps — Finding source → Downloading (% and
 time left) → Finishing → Sending — and the file says how long it took.
-Busy? You'll see your place in the queue.
+Busy? You'll see your place in the queue. Tap <b>✖ Cancel</b> to stop one.
 
 <b>Formats &amp; quality</b>
-🎥 Video 480p · 720p · 1080p · Max
+🎬 Video 480p · 720p · 1080p · Max
 🎵 Audio M4A (original, fastest) · MP3 · Opus — with title, artist &amp; cover
 🎞 Video + subtitles · 🖼 Images
 
@@ -287,12 +289,21 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if not update.effective_message or not update.effective_user:
         return
-    s = sessions.get_for_user(update.effective_user.id)
-    if s and s.started:
-        # Downloads can't be interrupted mid-transfer; don't claim otherwise.
+    from bot.services import jobs
+
+    uid = update.effective_user.id
+    s = sessions.get_for_user(uid)
+    running = jobs.key_for_owner(uid)
+    if running:
+        outcome = await jobs.cancel(running, uid)
         await update.effective_message.reply_text(
-            "⏳ That download is already running and will finish shortly — "
-            "it can't be stopped mid-transfer.",
+            "✖ Cancelled." if outcome in ("ok", "gone")
+            else "⏳ It's already being sent — too late to cancel.",
+            reply_markup=_kb(update),
+        )
+    elif s and s.started:
+        await update.effective_message.reply_text(
+            "⏳ That one is already being sent — too late to cancel.",
             reply_markup=_kb(update),
         )
     elif s:

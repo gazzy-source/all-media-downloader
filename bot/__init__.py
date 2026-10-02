@@ -3,7 +3,7 @@
 __version__ = "1.0.0"
 __bot_name__ = "All-Media Downloader Bot"
 __bot_bio__ = (
-    "Download videos, audio, and images from any platform instantly. "
+    "Songs, videos and images from any platform — fast, in good quality. "
     "Built by Gazzy Labs."
 )
 __author__ = "Gazzy Labs"

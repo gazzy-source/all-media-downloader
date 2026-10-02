@@ -849,6 +849,9 @@ class JobRefused(yt_dlp.utils.DownloadError):
     """
 
 
+CANCELLED = "Cancelled"
+
+
 class JobAborted(yt_dlp.utils.DownloadCancelled):
     """
     The byte/time guard tripping mid-transfer. NOT a DownloadError: yt-dlp's
@@ -1526,7 +1529,9 @@ class DownloadManager:
         audio_format: str = "mp3",
         title_hint: str = "media",
         progress_cb: ProgressCallback | None = None,
+        cancel: threading.Event | None = None,
     ) -> DownloadResult:
+        """`cancel`, once set, stops the job at its next step or chunk."""
         self.waiting += 1
         try:
             # Only show "queued" when we would actually wait for a free slot
@@ -1557,6 +1562,7 @@ class DownloadManager:
                     title_hint=title_hint,
                     progress_cb=progress_cb,
                     loop=loop,
+                    cancel=cancel,
                 ),
             )
             # Auto: video request on image-only posts (Pinterest pins, etc.)
@@ -1568,6 +1574,7 @@ class DownloadManager:
                 not result.success
                 and mode == "video"
                 and time.monotonic() - started < DOWNLOAD_ATTEMPT_BUDGET
+                and not (cancel is not None and cancel.is_set())
                 and self._looks_like_image_only_error(result.error or "")
             ):
                 logger.info("Retrying as image download for %s", url)
@@ -1583,6 +1590,7 @@ class DownloadManager:
                         title_hint=title_hint,
                         progress_cb=progress_cb,
                         loop=loop,
+                        cancel=cancel,
                     ),
                 )
             return result
@@ -1620,7 +1628,10 @@ class DownloadManager:
         title_hint: str,
         progress_cb: ProgressCallback | None,
         loop: asyncio.AbstractEventLoop,
+        cancel: threading.Event | None = None,
     ) -> DownloadResult:
+        if cancel is not None and cancel.is_set():
+            return DownloadResult(success=False, error=CANCELLED, mode=mode)
         # The handlers check this too; repeating it here covers every caller.
         # yt-dlp would otherwise fetch http://127.0.0.1:9123/... and hand the
         # body back as a "video" file.
@@ -1714,7 +1725,9 @@ class DownloadManager:
             if d.get("status") != "downloading":
                 return
             reason = None
-            if (d.get("downloaded_bytes") or 0) > DOWNLOAD_MAX_BYTES:
+            if cancel is not None and cancel.is_set():
+                reason = CANCELLED
+            elif (d.get("downloaded_bytes") or 0) > DOWNLOAD_MAX_BYTES:
                 reason = "File is larger than max-filesize for Telegram"
             elif time.monotonic() - job_started > DOWNLOAD_MAX_SECONDS:
                 reason = f"Download timed out after {DOWNLOAD_MAX_SECONDS // 60} min"
@@ -1727,6 +1740,12 @@ class DownloadManager:
         cookie_path = _cookie_jar_for_job()
         if cookie_path:
             job_cookies.append(cookie_path)
+
+        def _stage(pct: float, text: str) -> None:
+            """Between extraction attempts: the earliest point a cancel can land."""
+            if cancel is not None and cancel.is_set():
+                raise JobAborted(CANCELLED)
+            _emit(pct, text)
 
         _emit(2, "Resolving…")
         opts = _base_opts(host=host, cookiefile=cookie_path)
@@ -1828,7 +1847,7 @@ class DownloadManager:
 
             info, prepared, title = self._extract_with_format_fallback(
                 opts, url, title_hint, job_cookies=job_cookies,
-                on_stage=_emit,
+                on_stage=_stage,
             )
             if tripped:
                 # The guard fired but something downstream swallowed it: the

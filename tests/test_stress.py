@@ -25,7 +25,7 @@ class TestDownloadConcurrency:
         state = {"in_flight": 0, "max_seen": 0}
 
         def fake_sync(self, *, url, mode, quality, subtitle_lang, audio_format,
-                      title_hint, progress_cb, loop):
+                      title_hint, progress_cb, loop, cancel=None):
             state["in_flight"] += 1
             state["max_seen"] = max(state["max_seen"], state["in_flight"])
             time.sleep(0.15)

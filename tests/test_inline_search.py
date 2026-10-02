@@ -48,8 +48,17 @@ async def _ask(env, text, offset=""):
 
 
 class TestSearchResults:
-    async def test_words_become_a_video_result_list(self, env):
+    async def test_words_become_a_song_list(self, env):
         q = await _ask(env, "lofi beats")
+        results, _ = q.answers[0]
+        assert env.calls == ["lofi beats"]
+        first = results[0]
+        assert isinstance(first, InlineQueryResultAudio) and first.id == "sa:vid00000000"
+        row = first.reply_markup.inline_keyboard[0]
+        assert [b.callback_data for b in row] == ["inl:wait", "inl:x"]
+
+    async def test_video_prefix_becomes_a_video_result_list(self, env):
+        q = await _ask(env, "video lofi beats")
         results, kw = q.answers[0]
         assert env.calls == ["lofi beats"]
         assert len(results) == inl.INLINE_SEARCH_PAGE
@@ -73,14 +82,14 @@ class TestSearchResults:
         assert len({r.audio_url for r in results}) == len(results)
 
     async def test_scrolling_pages_through_results(self, env):
-        q = await _ask(env, "lofi beats", offset="20")
+        q = await _ask(env, "video lofi beats", offset="20")
         results, kw = q.answers[0]
         assert [r.id for r in results] == [f"sv:vid{i:08d}" for i in range(20, 25)]
         assert kw["next_offset"] is None
 
     async def test_previously_fetched_video_comes_back_finished(self, env):
         inline_cache.put(HITS[0].url, inl._key("video"), file_id="DONE", kind="video", title="Song 0")
-        q = await _ask(env, "lofi beats")
+        q = await _ask(env, "video lofi beats")
         assert isinstance(q.answers[0][0][0], InlineQueryResultCachedVideo)
 
     async def test_typing_letter_by_letter_searches_once(self, env, monkeypatch):

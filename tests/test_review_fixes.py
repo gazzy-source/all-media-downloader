@@ -65,10 +65,13 @@ class InlineBot:
 
     def __init__(self, refuse_media=False):
         self.refuse_media = refuse_media
-        self.captions, self.media = [], []
+        self.captions, self.media, self.statuses = [], [], []
 
     async def edit_message_caption(self, inline_message_id=None, caption=None, **kw):
         self.captions.append((caption, kw.get("reply_markup")))
+
+    async def edit_message_reply_markup(self, inline_message_id=None, reply_markup=None, **kw):
+        self.statuses.append(reply_markup.inline_keyboard[0][0].text)
 
     async def edit_message_media(self, inline_message_id=None, media=None, **kw):
         if self.refuse_media:

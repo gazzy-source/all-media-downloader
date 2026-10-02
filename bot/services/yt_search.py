@@ -141,6 +141,16 @@ def search(query: str) -> list[SearchHit]:
             ev.set()
 
 
+def title_for(video_id: str) -> str | None:
+    """Title of a recently listed video (the card a pick came from)."""
+    with _CACHE_LOCK:
+        for _, hits in _CACHE.values():
+            for h in hits:
+                if h.id == video_id:
+                    return h.title
+    return None
+
+
 def cached(query: str) -> list[SearchHit] | None:
     """Results if this query was searched recently — lets typing skip the debounce."""
     key = normalize_query(query).lower()

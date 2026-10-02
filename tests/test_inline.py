@@ -27,6 +27,7 @@ class InlineBot:
     def __init__(self):
         self.photos, self.deleted, self.captions, self.media_edits = [], [], [], []
         self.markups = []
+        self.statuses = []
         self._mid = 100
 
     async def send_photo(self, chat_id, photo=None, **kw):
@@ -41,6 +42,10 @@ class InlineBot:
     async def edit_message_caption(self, inline_message_id=None, caption=None, **kw):
         self.captions.append(caption)
         self.markups.append(kw.get("reply_markup"))
+
+    async def edit_message_reply_markup(self, inline_message_id=None, reply_markup=None, **kw):
+        self.markups.append(reply_markup)
+        self.statuses.append(reply_markup.inline_keyboard[0][0].text)
 
     async def edit_message_media(self, inline_message_id=None, media=None, **kw):
         self.media_edits.append((inline_message_id, media))
@@ -292,7 +297,7 @@ class TestNoDuplicateDownloads:
         monkeypatch.setattr(inl.download_manager, "download", fake_download)
         monkeypatch.setattr(inl.download_manager, "cleanup_result_files", lambda r: None)
         await inl.handle_chosen_inline_result(_update(chosen_inline_result=_chosen("vp:x")), ctx)
-        assert any("Finishing" in (c or "") for c in ctx.bot.captions)
+        assert any("Finishing" in s for s in ctx.bot.statuses)
 
     async def test_inline_audio_skips_the_mp3_reencode(self, ctx, monkeypatch):
         seen = {}
@@ -311,7 +316,7 @@ class TestNoDuplicateDownloads:
 
         q = FakeCallbackQuery(data="inl:wait")
         await hd.handle_callback(fx.update(callback_query=q), fx.ctx)
-        assert "Still downloading" in q.answers[0][0]
+        assert "replace this card" in q.answers[0][0]
 
 
 def test_suite_never_touches_real_data():

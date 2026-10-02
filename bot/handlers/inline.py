@@ -68,7 +68,7 @@ from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
 from bot.services.history import record_download
 from bot.services.rate_limit import RateLimiter, rate_limiter
 from bot.services.url_tokens import put_url
-from bot.utils.helpers import extract_urls, format_size, platform_from_url, progress_bar
+from bot.utils.helpers import extract_urls, format_size, platform_from_url
 from bot.utils.safe_fetch import (
     UnresolvableURLError,
     UnsafeURLError,
@@ -204,14 +204,26 @@ async def _quiet_delete(context, chat_id: int, message_id: int) -> None:
 WAIT_CALLBACK = "inl:wait"
 
 
-def _preparing_markup() -> InlineKeyboardMarkup:
+# Live status per inline message (what its button says), so tapping the
+# button can answer with the same thing. Bounded; dropped when a job ends.
+_STATUS: dict[str, str] = {}
+
+
+def _status_markup(label: str) -> InlineKeyboardMarkup:
     # An inline keyboard is REQUIRED: without one Telegram omits the
     # inline_message_id, and the message could never be edited into the media.
-    # It must NOT lead anywhere while the download runs — an "Open bot" link
-    # here started a second, parallel download of the same link in the DM.
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("⏳ Preparing…", callback_data=WAIT_CALLBACK)]]
-    )
+    # The button IS the live status ("⬇ 45%"); it must not lead anywhere while
+    # the download runs — an "Open bot" link here started a second, parallel
+    # download of the same link in the DM.
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label[:60], callback_data=WAIT_CALLBACK)]])
+
+
+def _preparing_markup() -> InlineKeyboardMarkup:
+    return _status_markup("⏳ Starting…")
+
+
+def current_status(inline_message_id: str | None) -> str | None:
+    return _STATUS.get(inline_message_id or "")
 
 
 def _open_bot_markup(bot_username: str, start: str = "inline") -> InlineKeyboardMarkup:
@@ -281,7 +293,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
                 photo_file_id=photo,
                 title=f"{verb} · {label}"[:100],
                 description=f"{platform} — downloads after you send it",
-                caption=f"⏳ <b>Preparing</b> {_esc(label)}…",
+                caption=f"<b>{_esc(label)}</b>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=_preparing_markup(),
             )
@@ -342,6 +354,8 @@ _SEARCH_SLOTS = asyncio.Semaphore(3)
 def _split_mode(text: str) -> tuple[str, str]:
     """'audio lofi beats' -> ('audio', 'lofi beats'); anything else is video."""
     low = text.lower()
+    if low.strip() in ("audio", "mp3", "music", "song"):
+        return "audio", ""  # the mode word alone — nothing to search for yet
     for p in _AUDIO_PREFIXES:
         if low.startswith(p):
             return "audio", text[len(p):].strip()
@@ -350,9 +364,11 @@ def _split_mode(text: str) -> tuple[str, str]:
 
 async def _search(q, text: str) -> None:
     mode, terms = _split_mode(text)
-    if len(terms) < 2:
+    if len(terms) < 3:
+        # One or two letters match everything: don't spend a YouTube search on it.
         await _answer(q, [], button=InlineQueryResultsButton(
-            text="🎵 Now type a song or video name", start_parameter="inline"), cache_time=60)
+            text="🎵 Now type a song name" if mode == "audio" else "🔎 Keep typing…",
+            start_parameter="inline"), cache_time=60)
         return
     uid = q.from_user.id
     # Every query (cached or not) becomes the user's latest, so an older one
@@ -395,6 +411,10 @@ async def _search(q, text: str) -> None:
             text=f"No results for “{terms[:30]}”", start_parameter="inline"), cache_time=60)
         return
     results = [_search_result(mode, h) for h in page]
+    if start == 0 and page and not inline_cache.get(page[0].url, _key(mode)):
+        task = asyncio.create_task(_prefetch_if_still_latest(uid, q.id, page[0].url))
+        _BACKGROUND.add(task)
+        task.add_done_callback(_BACKGROUND.discard)
     nxt = start + INLINE_SEARCH_PAGE
     # Not personal: everyone typing the same search gets the same list, so
     # Telegram can answer repeats from its own cache without asking the bot.
@@ -406,13 +426,24 @@ async def _search(q, text: str) -> None:
                       start_parameter="inline"))
 
 
+async def _prefetch_if_still_latest(uid: int, query_id: str, url: str) -> None:
+    """
+    Most picks are the top result: once the user has stopped typing and is
+    looking at the list, extract it ahead of time so a pick starts warm. Not
+    while they are still typing — every word would cost an extraction.
+    """
+    await asyncio.sleep(1.5)
+    if _LATEST.get(uid) == query_id:
+        await _prefetch(url)
+
+
 def _search_result(mode: str, h: "yt_search.SearchHit"):
     hit = inline_cache.get(h.url, _key(mode))
     if hit:  # fetched before: send the finished file itself, instantly
         return _cached_result("v" if mode == "video" else "a", mode, h.url, hit)
     meta = " · ".join(x for x in (h.channel, yt_search.human_duration(h.duration),
                                   yt_search.human_views(h.views)) if x)
-    caption = f"⏳ <b>Preparing</b> {_esc(h.title[:150])}…"
+    caption = f"<b>{_esc(h.title[:200])}</b>"
     if mode == "audio":
         # An audio placeholder swaps cleanly into the real track.
         return InlineQueryResultAudio(
@@ -490,32 +521,46 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
     started = time.monotonic()
     logger.info("inline %s chosen by %s: %s", mode, user_id, url[:80])
 
-    async def caption(
-        text: str, *, force: bool = False, final: bool = False, progress: bool = False
-    ) -> None:
+    title = _known_title(url, code, ref)
+
+    async def status(label: str, *, force: bool = False) -> None:
+        """Progress lives on the button only: the card keeps showing the name."""
         async with edits:
-            if progress and state["done"]:
-                return
-            if not progress:
-                state["done"] = True
+            if state["done"] or label == state.get("label"):
+                return  # identical edits are refused ("message is not modified")
             now = time.monotonic()
-            if not force and now - last["t"] < 3:
+            if not force and now - last["t"] < 2:
                 return  # Telegram limits how often one message may be edited
             last["t"] = now
+            state["label"] = label
+            _STATUS[imid] = label
+            if len(_STATUS) > 2000:
+                _STATUS.pop(next(iter(_STATUS)))
+            try:
+                await context.bot.edit_message_reply_markup(
+                    inline_message_id=imid, reply_markup=_status_markup(label))
+            except TelegramError as e:
+                logger.debug("inline status edit failed: %s", e)
+
+    async def finish(text: str) -> None:
+        """Terminal state: the reason in the card, and the way out (Open bot)."""
+        async with edits:
+            state["done"] = True
+            _STATUS.pop(imid, None)
+            head = f"<b>{_esc(title)}</b>\n" if title else ""
             try:
                 await context.bot.edit_message_caption(
-                    inline_message_id=imid, caption=text[:1024], parse_mode=ParseMode.HTML,
-                    reply_markup=give_up if final else _preparing_markup(),
-                )
+                    inline_message_id=imid, caption=(head + text)[:1024],
+                    parse_mode=ParseMode.HTML, reply_markup=give_up)
             except TelegramError as e:
-                logger.info("inline caption edit failed: %s", e)
+                logger.info("inline final edit failed: %s", e)
 
     allowed, retry = rate_limiter.allow(user_id)
     if not allowed and user_id not in ADMIN_IDS:
-        await caption(f"⏳ Rate limit reached — try again in {retry}s.", force=True, final=True)
+        await finish(f"⏳ Rate limit reached — try again in {retry}s.")
         return
     if not await _is_public(url):
-        await caption(f"🚫 {_esc(PRIVATE_URL_ERROR)}", force=True, final=True)
+        await finish(f"🚫 {_esc(PRIVATE_URL_ERROR)}")
         return
 
     hit = inline_cache.get(url, _key(mode))
@@ -525,13 +570,12 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         inline_cache.forget(url, _key(mode))  # Telegram refused it: fetch afresh below
 
     async def on_progress(pct: float, msg: str) -> None:
-        # The last stages (finishing / converting) must always show — dropped
-        # by the throttle, the card sat on an early "7%" for the whole tail.
-        await caption(
-            f"{progress_bar(pct)}\n<code>{_esc(msg)}</code>", force=pct >= 99, progress=True
-        )
+        # Short, single status on the button. The finishing steps (converting,
+        # cover art) always show — throttled away, the card looked stuck.
+        label = f"⬇ {pct:.0f}%" if msg.startswith("⬇") else msg.strip()
+        await status(label, force=pct >= 99)
 
-    await caption("⏳ <b>Starting…</b>", force=True, progress=True)
+    _STATUS[imid] = "⏳ Starting…"
     inline_cache.add_pending(imid)
     result = None
     platform = platform_from_url(url)
@@ -543,43 +587,43 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
                 url=url, mode=mode, quality=INLINE_QUALITY, audio_format="m4a",
                 title_hint="media", progress_cb=on_progress,
             ),
-            on_position=lambda n: caption(
-                f"⏳ <b>Queued</b> — you're #{n} in line", force=True, progress=True),
+            on_position=lambda n: status(f"⏳ Queued — #{n} in line", force=True),
             priority=user_prefs.is_premium(user_id),
         )
         if not result.success or not result.primary:
             record_download(user_id, url, "", platform, mode, INLINE_QUALITY, False, error=result.error)
             error = (result.error or "Unknown error")[:700]
-            await caption(f"❌ <b>Download failed</b>\n{_esc(error)}", force=True, final=True)
+            await finish(f"❌ {_esc(error)}")
             return
         size = result.file_size or result.primary.stat().st_size
         if size > MAX_FILE_SIZE_BYTES:
             record_download(user_id, url, result.title or "", platform, mode, INLINE_QUALITY,
                             False, file_size=size, error="File too large")
-            await caption(
-                f"⚠️ This is <b>{format_size(size)}</b> — over Telegram's "
-                f"{format_size(MAX_FILE_SIZE_BYTES)} limit for bots.\n"
-                "Tap <b>Open bot</b> to pick a lower quality.",
-                force=True, final=True,
+            await finish(
+                f"⚠️ {format_size(size)} — over Telegram's "
+                f"{format_size(MAX_FILE_SIZE_BYTES)} limit for bots. "
+                "Tap <b>Open bot</b> for a lower quality."
             )
             return
         chat = _storage_chat()
         if chat is None:
-            await caption("❌ Inline mode isn't set up on this server yet.", force=True, final=True)
+            await finish("❌ Inline mode isn't set up on this server yet.")
             return
-        await caption("📤 <b>Uploading…</b>", force=True)
+        await status("📤 Sending…", force=True)
+        state["done"] = True  # from here the card only changes into the file
         sent = await download_handlers._send_media(
             context, chat, result.primary, result, caption="", silent=True
         )
         found = _file_of(sent)
         if not found:
-            await caption("❌ Upload failed.", force=True, final=True)
+            state["done"] = False
+            await finish("❌ Upload failed.")
             return
         kind, file_id = found
-        title = (result.title or "")[:200]
+        title = (result.title or title or "")[:200]
         if not await _swap_in(context, imid, kind, file_id, title):
-            await caption("❌ Telegram refused this file here. Tap <b>Open bot</b> to get it.",
-                          force=True, final=True)
+            state["done"] = False
+            await finish("❌ Telegram refused this file here. Tap <b>Open bot</b> to get it.")
             return
         # Cached only once Telegram has accepted it in a message (an invalid
         # file_id would make every later inline answer for this link fail as
@@ -593,8 +637,10 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
                     time.monotonic() - started, format_size(size), url[:80])
     except Exception:
         logger.exception("inline download failed for %s", url[:80])
-        await caption("❌ <b>Something went wrong.</b> Please try again.", force=True, final=True)
+        state["done"] = False
+        await finish("❌ Something went wrong. Please try again.")
     finally:
+        _STATUS.pop(imid, None)
         inline_cache.drop_pending(imid)
         if result is not None:
             download_manager.cleanup_result_files(result)
@@ -610,6 +656,14 @@ async def _swap_in(context, imid: str, kind: str, file_id: str, title: str) -> b
     except TelegramError:
         logger.exception("could not swap the inline placeholder for the media")
         return False
+
+
+def _known_title(url: str, code: str, ref: str) -> str:
+    """The name the card already shows (search hit or link title), for final captions."""
+    if code in ("sv", "sa"):
+        return yt_search.title_for(ref) or ""
+    hit = _TITLE_CACHE.get(url)
+    return hit[1] if hit else ""
 
 
 async def rescue_interrupted(app) -> None:

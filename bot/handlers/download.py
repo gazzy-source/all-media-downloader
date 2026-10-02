@@ -666,19 +666,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     if not query or not query.data or not update.effective_user:
         return
+    if query.data == "inl:wait":
+        # The inline card's status button: answer with that same status.
+        from bot.handlers.inline import current_status
+
+        now = current_status(getattr(query, "inline_message_id", None))
+        try:
+            await query.answer(
+                f"{now} — the file will replace this card." if now
+                else "Working on it — the file will replace this card.")
+        except TelegramError:
+            pass
+        return
     if query.data.startswith(("pref:", "prem:")):
+        # Answered first, or Telegram keeps a spinner on the tapped button.
+        try:
+            await query.answer()
+        except TelegramError:
+            pass
         from bot.handlers import premium, start
 
         handler = start.handle_pref_callback if query.data.startswith("pref:") \
             else premium.handle_premium_callback
         await handler(update, context)
-        return
-    if query.data == "inl:wait":
-        # The inline placeholder's own button: nothing to do but reassure.
-        try:
-            await query.answer("Still downloading — it will appear right here.")
-        except TelegramError:
-            pass
         return
     # Answer exactly once, right away — every later query.answer() would raise
     # BadRequest ("query is too old / already answered"). Feedback that used to

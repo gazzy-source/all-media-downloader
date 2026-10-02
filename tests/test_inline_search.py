@@ -89,7 +89,7 @@ class TestSearchResults:
         await asyncio.gather(*(inl.handle_inline_query(_update(inline_query=q), env.ctx)
                                for q in queries))
         assert env.calls == ["lofi"]
-        assert queries[-1].answers and not queries[0].answers
+        assert queries[-1].answers and not queries[1].answers  # "lof" stood down
 
     async def test_search_failure_is_a_hint_not_a_crash(self, env, monkeypatch):
         def boom(terms):

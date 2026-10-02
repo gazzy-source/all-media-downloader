@@ -58,7 +58,8 @@ class TestSearchResults:
         assert first.id == "sv:vid00000000" and first.title == "Song 0"
         assert first.thumbnail_url.endswith("/vid00000000/hqdefault.jpg")
         assert "Chan" in first.description and "1.5M views" in first.description
-        assert first.video_url.endswith("placeholder_v1.mp4") and first.mime_type == "video/mp4"
+        assert first.video_url.endswith("placeholder_v1.mp4?v=vid00000000")
+        assert first.mime_type == "video/mp4"
         assert first.reply_markup.inline_keyboard[0][0].callback_data == "inl:wait"
         assert kw["is_personal"] is False and kw["next_offset"] == str(inl.INLINE_SEARCH_PAGE)
 
@@ -68,6 +69,8 @@ class TestSearchResults:
         assert env.calls == ["lofi beats"]
         assert isinstance(results[0], InlineQueryResultAudio) and results[0].id == "sa:vid00000000"
         assert results[0].performer == "Chan"
+        # Each result its own placeholder URL, or Telegram shows a cached title.
+        assert len({r.audio_url for r in results}) == len(results)
 
     async def test_scrolling_pages_through_results(self, env):
         q = await _ask(env, "lofi beats", offset="20")

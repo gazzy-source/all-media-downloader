@@ -416,7 +416,10 @@ def _search_result(mode: str, h: "yt_search.SearchHit"):
     if mode == "audio":
         # An audio placeholder swaps cleanly into the real track.
         return InlineQueryResultAudio(
-            id=f"sa:{h.id}", audio_url=INLINE_ASSET_BASE + "placeholder_v1.mp3",
+            # Per-result URL: Telegram caches a file by URL WITH the title it
+            # was first sent with, so one shared URL showed the previous
+            # song's name on every later pick while it downloaded.
+            id=f"sa:{h.id}", audio_url=f"{INLINE_ASSET_BASE}placeholder_v1.mp3?v={h.id}",
             title=h.title[:100], performer=h.channel[:60] or None,
             audio_duration=h.duration, caption=caption, parse_mode=ParseMode.HTML,
             reply_markup=_preparing_markup(),
@@ -424,7 +427,7 @@ def _search_result(mode: str, h: "yt_search.SearchHit"):
     # A video result shows the real thumbnail, title and stats in the list; the
     # sent message is a short placeholder clip that becomes the real video.
     return InlineQueryResultVideo(
-        id=f"sv:{h.id}", video_url=INLINE_ASSET_BASE + "placeholder_v1.mp4",
+        id=f"sv:{h.id}", video_url=f"{INLINE_ASSET_BASE}placeholder_v1.mp4?v={h.id}",
         mime_type="video/mp4", thumbnail_url=h.thumbnail, title=h.title[:100],
         description=meta[:200] or None, caption=caption, parse_mode=ParseMode.HTML,
         video_duration=h.duration, reply_markup=_preparing_markup(),

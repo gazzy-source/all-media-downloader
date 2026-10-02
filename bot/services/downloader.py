@@ -148,6 +148,69 @@ class DownloadResult:
     actual_height: int | None = None
     # Performer shown by Telegram's music player (audio only).
     artist: str | None = None
+    # Small square cover (<=320px JPEG) for Telegram's audio thumbnail.
+    cover: Path | None = None
+
+
+_PART_RE = re.compile(r"\.f[\w-]+\.\w+(?:\.part)?$")
+_PP_LABELS = {
+    "Merger": "🔗 Joining video + audio…",
+    "FFmpegMerger": "🔗 Joining video + audio…",
+    "ExtractAudio": "🎵 Converting audio…",
+    "FFmpegExtractAudio": "🎵 Converting audio…",
+    "EmbedThumbnail": "🎨 Adding cover art…",
+    "Metadata": "🏷 Adding title & artist…",
+    "FFmpegMetadata": "🏷 Adding title & artist…",
+    "EmbedSubtitle": "💬 Adding subtitles…",
+    "FFmpegEmbedSubtitle": "💬 Adding subtitles…",
+}
+
+
+def _part_kind(d: dict[str, Any]) -> str:
+    """
+    "video"/"audio" when this file is one half of a video+audio pair (yt-dlp
+    names those *.f<format>.<ext>), else "single".
+    """
+    name = str(d.get("filename") or d.get("tmpfilename") or "")
+    if not _PART_RE.search(name):
+        return "single"
+    vcodec = (d.get("info_dict") or {}).get("vcodec")
+    return "audio" if vcodec == "none" else "video"
+
+
+def _telegram_cover(work_dir: Path) -> Path | None:
+    """
+    Telegram wants an audio thumbnail as a JPEG of at most 320x320 and 200 KB;
+    the YouTube cover is 1280x720. Square-crop and shrink it. Best effort.
+    """
+    import subprocess
+
+    from bot.utils.ffmpeg import find_ffmpeg
+
+    covers = [p for p in work_dir.glob("*.jpg") if not p.name.startswith("tg_cover")]
+    ff = find_ffmpeg()
+    if not covers or ff is None:
+        return None
+    out = work_dir / "tg_cover.jpg"
+    try:
+        subprocess.run(
+            [str(ff), "-loglevel", "error", "-y", "-i", str(covers[0]), "-vf",
+             "scale=320:320:force_original_aspect_ratio=increase,crop=320:320",
+             "-q:v", "4", str(out)],
+            check=True, timeout=20, capture_output=True,
+        )
+        return out if out.is_file() and out.stat().st_size < 200_000 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _overall_pct(part: str, file_pct: float) -> float:
+    """The video half is ~90% of the bytes, the audio ~10%."""
+    if part == "video":
+        return file_pct * 0.9
+    if part == "audio":
+        return 90 + file_pct * 0.1
+    return file_pct
 
 
 def _artist_of(info: dict[str, Any] | None) -> str | None:
@@ -1578,6 +1641,7 @@ class DownloadManager:
 
         def hook(d: dict[str, Any]) -> None:
             status = d.get("status")
+            part = _part_kind(d)
             if status == "downloading":
                 total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
                 done = d.get("downloaded_bytes") or 0
@@ -1593,17 +1657,34 @@ class DownloadManager:
                     last_tick["t"] = now
                     _emit(0, f"⬇ {format_size(done)} · {speed_s}")
                     return
-                pct = done / total * 100
+                pct = _overall_pct(part, done / total * 100)
+                # One bar for the whole job, forward only: video+audio arrive
+                # as two files, and per-file percentages made the bar run to
+                # 100%, drop back to 0% and say "Finishing" twice.
+                # Capped at 98: the finishing steps (merge, convert, cover)
+                # still follow and show at 99 — the bar must not go 100 -> 99.
+                pct = min(max(pct, last_pct["v"]), 98.0)
                 # Throttle Telegram edits (still update often enough to feel
                 # live) — but never swallow the FIRST update. last_pct starts
                 # negative, so a download that begins under 8% used to have
                 # every early tick dropped and the bar stayed on "Resolving…".
-                if last_pct["v"] >= 0 and abs(pct - last_pct["v"]) < 8 and pct < 95:
+                if last_pct["v"] >= 0 and pct - last_pct["v"] < 8 and pct < 95:
                     return
                 last_pct["v"] = pct
-                _emit(pct, f"⬇ {pct:.0f}% · {speed_s}")
-            elif status == "finished":
-                _emit(100, "⚙️ Finishing…")
+                label = "⬇ Audio" if part == "audio" else "⬇"
+                _emit(pct, f"{label} {pct:.0f}% · {speed_s}")
+            elif status == "finished" and part != "video":
+                # A video part finishing is only half the job: its audio follows.
+                last_pct["v"] = max(last_pct["v"], 99.0)
+                _emit(99, "⚙️ Finishing…")
+
+        def pp_hook(d: dict[str, Any]) -> None:
+            """Say what the post-download steps are doing instead of sitting on 100%."""
+            if d.get("status") != "started":
+                return
+            label = _PP_LABELS.get(str(d.get("postprocessor") or ""))
+            if label:
+                _emit(99, label)
 
         tripped: dict[str, str] = {}
 
@@ -1633,6 +1714,7 @@ class DownloadManager:
             {
                 "outtmpl": outtmpl,
                 "progress_hooks": hooks,
+                "postprocessor_hooks": [pp_hook] if progress_cb else [],
                 # Refused before a single byte moves. Raising — not returning a
                 # reason — makes it an error the user sees, not an empty result.
                 "match_filter": _download_match_filter,
@@ -1680,7 +1762,9 @@ class DownloadManager:
                             },
                             {"key": "FFmpegMetadata", "add_metadata": True,
                              "add_chapters": False},
-                            {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+                            # Keep the jpg: Telegram shows an audio's cover only
+                            # from a thumbnail sent with it, not from the tags.
+                            {"key": "EmbedThumbnail", "already_have_thumbnail": True},
                         ],
                     }
                 )
@@ -1793,6 +1877,7 @@ class DownloadManager:
                 subtitle_file=sub_file,
                 actual_height=_delivered_height(info),
                 artist=_artist_of(info),
+                cover=_telegram_cover(work_dir) if mode == "audio" else None,
             )
         except (JobRefused, JobAborted) as e:
             # Deliberate refusals / limits: expected, no traceback needed.

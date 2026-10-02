@@ -913,6 +913,14 @@ async def _send_cached(context, chat_id: int, hit: dict, caption: str, reply_mar
         return None
 
 
+def _cover_file(result):
+    """The square cover Telegram's music player shows (None if there isn't one)."""
+    cover = getattr(result, "cover", None)
+    if cover is not None and cover.is_file():
+        return InputFile(cover.read_bytes(), filename="cover.jpg")
+    return None
+
+
 _MODES = frozenset({"video", "video_subs", "audio", "image"})
 _AUDIO_FORMATS = frozenset({"mp3", "m4a", "opus"})
 
@@ -1428,6 +1436,7 @@ async def _send_media_once(
                 audio=InputFile(f, filename=filename),
                 title=result.title[:64] if result.title else None,
                 performer=(result.artist or "")[:64] or None,
+                thumbnail=_cover_file(result),
                 **cap_kw,
                 **kw,
             )

@@ -126,7 +126,7 @@ class TestFriendlyErrorGaps:
             "[BiliBili] 1GJ411x7h7: Unable to download webpage: "
             "HTTP Error 412: Precondition Failed"
         )
-        assert "412" in out
+        assert "refused" in out
         assert "Precondition Failed" not in out
 
     def test_tumblr_remote_disconnect_is_explained(self):
@@ -145,13 +145,13 @@ class TestFriendlyErrorGaps:
     def test_non_youtube_403_does_not_advise_a_po_token_provider(self):
         """Rumble 403 used to tell the reader to run a YouTube PO-token server."""
         out = self._f("[Rumble] v2b2xtu: Unable to download webpage: HTTP Error 403: Forbidden")
-        assert "403" in out
+        assert "refused" in out
         assert "PO-token" not in out
         assert "bgutil" not in out
 
-    def test_youtube_403_still_advises_the_provider(self, monkeypatch):
+    def test_youtube_403_asks_for_a_retry_not_server_setup(self, monkeypatch):
         out = self._f("[youtube] abc: unable to download video data: HTTP Error 403: Forbidden")
-        assert "PO-token" in out
+        assert "try again" in out and "PO-token" not in out
 
     def test_specific_matches_still_win_over_the_new_branches(self):
         """
@@ -159,7 +159,7 @@ class TestFriendlyErrorGaps:
         bot-wall branch must keep priority over anything added below it.
         """
         out = self._f("[youtube] x: Sign in to confirm you’re not a bot")
-        assert "bot-walled" in out
+        assert "anti-bot" in out
 
 
 class TestMetaPlatformMessages:
@@ -184,13 +184,13 @@ class TestMetaPlatformMessages:
             "--cookies for the authentication."
         )
         assert "--cookies" not in out, "CLI flags must not reach a chat user"
-        assert "cookies.txt" in out
+        assert "cookies.txt" not in out, "server setup is not the user's job"
         assert "signed-in" in out.lower()
 
     def test_unparseable_page_does_not_promise_an_update_will_fix_it(self):
         out = self._f("ERROR: [facebook] 1122176382566360: Cannot parse data")
         assert "needs an update" not in out.lower()
-        assert "newest" in out.lower() or "updating would not help" in out.lower()
+        assert "nothing you did wrong" in out.lower()
 
     def test_image_only_instagram_post_still_routes_to_image_mode(self):
         """A post with no video is a different case and must keep its own advice."""
@@ -222,5 +222,5 @@ class TestMetaPlatformMessages:
 
     def test_generic_extractor_failure_does_not_claim_updates_are_useless(self):
         out = self._f("ERROR: [youtube] abc: Unable to extract uploader id")
-        assert "could not read this link" in out
+        assert "can't read this link" in out
         assert "updating would not help" not in out.lower()

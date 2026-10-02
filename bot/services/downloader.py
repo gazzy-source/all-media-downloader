@@ -221,6 +221,11 @@ def _bot_idle() -> bool:
             and download_queue.waiting == 0)
 
 
+def _operator_hint(text: str) -> None:
+    """Server-side fixes belong in the log, never in a user's chat."""
+    logger.warning("Operator hint: %s", text)
+
+
 def _artist_of(info: dict[str, Any] | None) -> str | None:
     """Best available artist: tagged artist, else the channel (minus " - Topic")."""
     if not info:
@@ -1538,11 +1543,7 @@ class DownloadManager:
 
         self.active += 1
         try:
-            await _emit_progress(
-                progress_cb,
-                1,
-                f"Starting… ({self.active}/{self.max_concurrent} parallel)",
-            )
+            await _emit_progress(progress_cb, 1, "Starting…")
             loop = asyncio.get_running_loop()
             started = time.monotonic()
             result = await loop.run_in_executor(
@@ -2414,25 +2415,22 @@ class DownloadManager:
             # Don't advise running a provider when one is already running — on a
             # bot-walled datacenter IP it mints tokens fine and YouTube still
             # refuses every client, so the only real remedy left is a cleaner IP.
+            # Users get what to do; the operator's fix goes to the log.
             if pot_provider_available():
-                return (
-                    "YouTube bot-walled this server on every client it tried, "
-                    "even with a PO-token provider running.\n\n"
-                    "That means this server's IP is blocked outright — common on "
-                    "datacenter/VPS ranges. Cookies are not the issue; public "
-                    "videos need none.\n\n"
-                    "Fix: set PROXY to a residential/mobile IP (PROXY_HOSTS can "
-                    "limit it to just the platforms that need it)."
-                )
+                _operator_hint(
+                    "YouTube bot-walled every client even with a PO-token "
+                    "provider running: the IP is blocked — set PROXY to a "
+                    "residential/mobile IP (PROXY_HOSTS limits it). Public "
+                    "videos need no cookies.")
+            else:
+                _operator_hint(
+                    "YouTube bot-walled every client: run a PO-token provider "
+                    "(bgutil, see docker-compose.yml), else set PROXY to a "
+                    "clean IP. Public videos need no cookies.")
             return (
-                "YouTube bot-walled this server on every client it tried.\n\n"
-                "The bot needs no cookies for public videos — it falls back to a "
-                "client that works without them. If even that fails, the server's "
-                "IP is blocked outright.\n\n"
-                "Fixes, easiest first:\n"
-                "1. Run a PO-token provider (bgutil) — see docker-compose.yml\n"
-                "2. Set PROXY to a residential/clean IP\n"
-                "3. Only for private or age-restricted videos: add a cookies.txt"
+                "YouTube is refusing the bot right now (its anti-bot check).\n\n"
+                "Nothing is wrong with your link — please try again in a few "
+                "minutes."
             )
         # Instagram's own wording leaked to users verbatim, truncated mid
         # sentence and telling them to pass --cookies-from-browser — a yt-dlp
@@ -2450,36 +2448,40 @@ class DownloadManager:
             or "registered users" in low
             or "redirected to the login page" in low
         ):
+            _operator_hint("Instagram login wall: add or refresh Instagram "
+                           "cookies in cookies.txt.")
             return (
-                "Instagram only serves this post to signed-in viewers, so the "
-                "bot cannot read it.\n\nThe server needs valid Instagram "
-                "cookies in its cookies.txt (added, or refreshed if they have "
-                "expired)."
+                "Instagram only shows this post to signed-in viewers, so the "
+                "bot can't read it right now.\n\nPublic posts and reels "
+                "usually work — try another link."
             )
         if "private" in low or "login required" in low or "sign in" in low:
+            _operator_hint("Login-only content: needs a cookies.txt.")
             return (
-                "This content is private, age-restricted, or requires login. "
-                "Public posts need no setup; this one needs a cookies.txt on the "
-                "server."
+                "This one is private, age-restricted or needs a login, so the "
+                "bot can't download it. Public posts work fine."
             )
         # Must be before generic "not available" (format errors were mislabeled as region)
         if "format is not available" in low or "requested format" in low:
             return (
                 "That quality/format isn't offered for this link. "
-                "Try Max quality, or Video again — the bot will auto-fallback."
+                "Pick another quality, or Max."
             )
         if "only images are available" in low or "no video formats" in low:
             return (
-                "No video on this link (likely an image post). "
-                "The bot will retry as image automatically; "
-                "in private chat pick 🖼 Image."
+                "No video on this link — it looks like an image post. "
+                "Pick 🖼 Image instead."
             )
         # Before "not found": yt-dlp says "ffprobe and ffmpeg not found", which
         # would otherwise blame the user's link for a server misconfiguration.
         if "ffmpeg" in low or "ffprobe" in low:
-            return "FFmpeg is required for this format. Install FFmpeg and try again."
+            _operator_hint("FFmpeg/ffprobe missing on the server.")
+            return (
+                "The bot couldn't convert this file (FFmpeg isn't working on the "
+                "server). Try 🎵 M4A or a plain Video instead."
+            )
         if "geo" in low or "region" in low or "not available in your country" in low:
-            return "This media is blocked in the server's region."
+            return "This media isn't available in the bot's region."
         if (
             "unavailable" in low
             or "has been removed" in low
@@ -2508,18 +2510,17 @@ class DownloadManager:
         # "unable to extract" / "unexpected response" are often fixed by one.
         if "cannot parse data" in low:
             return (
-                "The bot could not read this link — the platform changed its "
-                "page format and there is no working extractor for it yet.\n\n"
-                "Nothing you did wrong, and updating would not help: this was "
-                "checked against the newest yt-dlp. If the post also has a "
+                "The bot can't read this link — the platform changed its page "
+                "format.\n\nNothing you did wrong. If the post also has a "
                 "normal video/watch link, try that one."
             )
         if "unexpected response" in low or "unable to extract" in low:
+            _operator_hint("Extractor failed (unable to extract/unexpected "
+                           "response): try a yt-dlp update.")
             return (
-                "The bot could not read this link — the platform changed its "
-                "page format, which usually needs a yt-dlp update on the "
-                "server.\n\nNothing you did wrong; try a different link or try "
-                "again later."
+                "The bot can't read this link right now — the platform changed "
+                "its page format.\n\nNothing you did wrong; try another link, "
+                "or this one again later."
             )
         if (
             "is not supported" in low  # e.g. Substack: page type "newsletter"
@@ -2536,22 +2537,22 @@ class DownloadManager:
         if "timed out" in low or "timeout" in low:
             return "The download timed out. Please try again."
         if "rate-limit" in low or "rate limit" in low or "too many requests" in low:
-            return "The platform rate-limited the bot. Wait a minute and try again."
+            return "The platform is limiting the bot. Wait a minute and try again."
         if "403" in low or "forbidden" in low:
             # The PO-token advice is YouTube-specific. Printing it for a Rumble
             # or Bilibili 403 sends the reader after a provider that has nothing
             # to do with the platform that just refused them.
             if "youtu" in low or "youtu" in raw_low:
+                _operator_hint("YouTube 403 on every client: PO-token provider "
+                               "(bgutil) or a cleaner IP.")
                 return (
-                    "The platform blocked the media stream (HTTP 403) on every "
-                    "client the bot tried. For YouTube this usually means the "
-                    "server needs a PO-token provider (bgutil) or a cleaner IP — "
-                    "cookies are not required for public videos."
+                    "YouTube refused the download this time.\n\n"
+                    "Nothing is wrong with your link — please try again in a "
+                    "few minutes."
                 )
             return (
-                "The platform blocked this request (HTTP 403). It usually means "
-                "the site refuses this server's IP, or the post is not "
-                "public.\n\n"
+                "The site refused the bot's request — it may block the bot, or "
+                "the post isn't public.\n\n"
                 "Try again later, or send a different link."
             )
         # 412 is what Bilibili (and a few others) answer when they refuse the
@@ -2559,9 +2560,9 @@ class DownloadManager:
         # "Unable to download webpage: HTTP Error 412: Precondition Failed".
         if "412" in low or "precondition failed" in low:
             return (
-                "The platform refused this request (HTTP 412) — it is blocking "
-                "this server, or the link needs a region/account the bot does "
-                "not have.\n\nTry a different link."
+                "The site refused the bot's request — it blocks the bot, or the "
+                "link needs a region or account the bot doesn't have.\n\n"
+                "Try a different link."
             )
         # Transport-level failures surfaced as raw Python repr, e.g. Tumblr's
         # "('Connection aborted.', RemoteDisconnected('Remote end closed
@@ -2595,10 +2596,10 @@ class DownloadManager:
         # ("the JSON object must be str, bytes or bytearray, not dict" — a real
         # yt-dlp OK.ru crash) tells a Telegram user nothing and looks broken.
         if _looks_like_internal_error(msg):
+            _operator_hint(f"Extractor crashed ({msg[:120]}): try a yt-dlp update.")
             return (
-                "This platform's extractor failed on this link — usually the site "
-                "changed and yt-dlp needs an update. Try another link, or update "
-                "yt-dlp on the server."
+                "The bot can't read this link right now — the site changed.\n\n"
+                "Nothing you did wrong; try another link, or this one again later."
             )
         # Verbatim extractor text is often the clearest answer ("This video
         # is only available to Music Premium members"), but not when it carries

@@ -318,3 +318,20 @@ class TestPremiumPayments:
         msg = fx.msg("/paysupport")
         await prem.cmd_paysupport(fx.update(msg), fx.ctx)
         assert "Payment support" in msg.replies[0][0]
+        assert "/paysupport" in msg.replies[0][0]
+
+    async def test_paysupport_reaches_the_owner(self, fx, monkeypatch, tmp_path):
+        from bot.services import user_prefs
+
+        user_prefs._reset_for_tests(tmp_path / "p.json")
+        monkeypatch.setattr(prem, "ADMIN_IDS", {999})
+        prem._last_support.clear()
+        fx.ctx.args = ["charged", "<but>", "not", "active"]
+        msg = fx.msg("/paysupport charged <but> not active")
+        await prem.cmd_paysupport(fx.update(msg), fx.ctx)
+        (kind, (chat, text), _kw), = fx.ctx.bot.sent
+        assert chat == 999 and "&lt;but&gt;" in text and "/refund" in text
+        assert "Sent to the bot owner" in msg.replies[0][0]
+        # A second request right away is acknowledged, not re-forwarded.
+        await prem.cmd_paysupport(fx.update(fx.msg("/paysupport again")), fx.ctx)
+        assert len(fx.ctx.bot.sent) == 1

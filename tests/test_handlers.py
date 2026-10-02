@@ -108,7 +108,7 @@ class TestHandleMessage:
         monkeypatch.setattr(hd.rate_limiter, "allow", lambda uid: (False, 77))
         msg = fx.msg("https://youtu.be/abc")
         await hd.handle_message(fx.update(msg), fx.ctx)
-        assert msg.replies and "Rate limit" in msg.replies[0][0]
+        assert msg.replies and "Hourly limit" in msg.replies[0][0]
 
     async def test_admin_bypasses_rate_limit(self, fx, monkeypatch):
         monkeypatch.setattr(hd, "ADMIN_IDS", {42})

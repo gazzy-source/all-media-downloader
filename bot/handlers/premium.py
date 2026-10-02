@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 CURRENCY = "XTR"  # Telegram Stars
 
 
+def _html(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _payload(user_id: int) -> str:
     return f"premium:{user_id}:{PREMIUM_DAYS}:{PREMIUM_STARS}"
 
@@ -168,19 +172,58 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
     )
 
 
+_SUPPORT_COOLDOWN = 600  # one forwarded request per user per 10 min
+_last_support: dict[int, float] = {}
+
+
 async def cmd_paysupport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Required by Telegram for bots that sell digital goods."""
-    if not update.effective_message:
+    """
+    Required by Telegram for bots that sell digital goods. "/paysupport <what
+    happened>" reaches the owner; a plain reply in the chat would go nowhere.
+    """
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user:
         return
-    await update.effective_message.reply_text(
-        "💬 <b>Payment support</b>\n\n"
-        "Premium is a digital service paid with Telegram Stars. If something went "
-        "wrong with a purchase — you were charged but Premium isn't active, or you "
-        "want a refund — reply here describing the issue, including the date of "
-        "the payment. Refunds are handled by the bot owner and returned to your "
-        "Stars balance.",
-        parse_mode=ParseMode.HTML,
+    text = " ".join(getattr(context, "args", None) or []).strip()
+    if not text:
+        await msg.reply_text(
+            "💬 <b>Payment support</b>\n\n"
+            "Premium is paid with Telegram Stars. If you were charged but Premium "
+            "isn't active, or you want a refund, send:\n\n"
+            "<code>/paysupport what happened and the date</code>\n\n"
+            "It goes straight to the bot owner. Refunds return to your Stars "
+            "balance.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    now = time.monotonic()
+    if now - _last_support.get(user.id, -_SUPPORT_COOLDOWN) < _SUPPORT_COOLDOWN:
+        await msg.reply_text("✅ Your earlier request was received — the owner "
+                             "will get back to you here.")
+        return
+    who = f"@{user.username}" if getattr(user, "username", None) else "no username"
+    until = user_prefs.premium_until(user.id)
+    note = (
+        f"💬 <b>Payment support</b> from <code>{user.id}</code> ({_html(who)})\n"
+        f"Premium: {'active' if until > time.time() else 'not active'}\n\n"
+        f"{_html(text[:1500])}\n\nRefund: <code>/refund {user.id}</code>"
     )
+    delivered = False
+    for admin in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin, note, parse_mode=ParseMode.HTML)
+            delivered = True
+        except TelegramError as e:
+            logger.warning("paysupport forward to %s failed: %s", admin, e)
+    if not delivered:
+        logger.error("paysupport from %s not delivered (no reachable admin): %s",
+                     user.id, text[:300])
+        await msg.reply_text("⚠️ Couldn't reach the owner right now — please try "
+                             "again in a little while.")
+        return
+    _last_support[user.id] = now
+    await msg.reply_text("✅ Sent to the bot owner. You'll get an answer in this "
+                         "chat.")
 
 
 async def cmd_refund(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

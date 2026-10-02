@@ -215,11 +215,11 @@ class TestFriendlyError:
     @pytest.mark.parametrize(
         ("msg", "expect"),
         [
-            ("Sign in to confirm you're not a bot", "bot-walled"),
-            ("HTTP Error 403: Forbidden", "403"),
+            ("Sign in to confirm you're not a bot", "anti-bot"),
+            ("HTTP Error 403: Forbidden", "refused"),
             ("This video is unavailable", "unavailable"),
             ("Unsupported URL", "No downloadable media"),
-            ("ffprobe failed", "FFmpeg"),
+            ("ffprobe failed", "convert"),
             ("The download timed out", "timed out"),
             ("requested format is not available", "quality/format"),
         ],
@@ -756,7 +756,7 @@ class TestInternalErrorMasking:
             "the JSON object must be str, bytes or bytearray, not dict"
         )
         assert "JSON object" not in out
-        assert "extractor failed" in out.lower()
+        assert "can't read this link" in out.lower()
 
     @pytest.mark.parametrize("msg", [
         "'NoneType' object is not subscriptable",
@@ -764,13 +764,13 @@ class TestInternalErrorMasking:
         "AttributeError: 'dict' object has no attribute 'group'",
     ])
     def test_other_internal_crashes_masked(self, msg):
-        assert "extractor failed" in dl.DownloadManager._friendly_error(msg).lower()
+        assert "can't read this link" in dl.DownloadManager._friendly_error(msg).lower()
 
     def test_real_extractor_messages_still_shown(self):
         """Must not swallow genuine, useful extractor text."""
         out = dl.DownloadManager._friendly_error("Video unavailable")
         assert "unavailable" in out.lower()
-        assert "extractor failed" not in out.lower()
+        assert "can't read this link" not in out.lower()
 
 
 class TestSelectiveProxy:
@@ -823,29 +823,40 @@ class TestSelectiveProxy:
 
 
 class TestBotWallAdviceMatchesSetup:
-    """Don't tell an operator to run something they are already running."""
+    """Users get what to do; the operator's fix (matched to the setup) is logged."""
 
     MSG = "Sign in to confirm you're not a bot"
 
-    def test_without_provider_suggests_running_one(self, monkeypatch):
+    def test_without_provider_logs_running_one(self, monkeypatch, caplog):
         monkeypatch.setattr(dl, "pot_provider_available", lambda: False)
-        out = dl.DownloadManager._friendly_error(self.MSG)
-        assert "PO-token provider" in out
-        assert "even with a PO-token provider running" not in out
+        with caplog.at_level("WARNING"):
+            dl.DownloadManager._friendly_error(self.MSG)
+        assert "PO-token provider (bgutil" in caplog.text
 
-    def test_with_provider_points_at_the_ip_instead(self, monkeypatch):
+    def test_with_provider_logs_the_ip_instead(self, monkeypatch, caplog):
         """Measured on the VPS: provider mints tokens, YouTube still refuses."""
         monkeypatch.setattr(dl, "pot_provider_available", lambda: True)
-        out = dl.DownloadManager._friendly_error(self.MSG)
-        assert "even with a PO-token provider running" in out
-        assert "PROXY" in out
-        assert "see docker-compose.yml" not in out, "stale advice for this host"
+        with caplog.at_level("WARNING"):
+            dl.DownloadManager._friendly_error(self.MSG)
+        assert "PROXY" in caplog.text
+        assert "docker-compose.yml" not in caplog.text, "stale advice for this host"
 
-    def test_never_blames_cookies_for_a_public_video(self, monkeypatch):
+    @pytest.mark.parametrize("msg", [
+        "Sign in to confirm you're not a bot",
+        "[youtube] x: HTTP Error 403: Forbidden",
+        "[instagram] x: empty media response",
+        "This video is private",
+        "ffprobe and ffmpeg not found",
+        "Unable to extract data",
+        "the JSON object must be str, bytes or bytearray, not dict",
+    ])
+    def test_users_never_see_operator_advice(self, monkeypatch, msg):
         for available in (True, False):
             monkeypatch.setattr(dl, "pot_provider_available", lambda: available)
-            out = dl.DownloadManager._friendly_error(self.MSG)
-            assert "public videos need none" in out.lower() or "no cookies" in out.lower()
+            out = dl.DownloadManager._friendly_error(msg)
+            for jargon in ("PROXY", "cookies.txt", "PO-token", "bgutil", "yt-dlp",
+                           "HTTP 4", "Install", "server's IP"):
+                assert jargon not in out, (msg, jargon, out)
 
 
 class TestNoMediaLinks:
@@ -908,7 +919,7 @@ class TestNoMediaLinks:
         # could not read the link and is not shown yt-dlp's maintainer-facing
         # boilerplate. The wording changed when the old copy was found to
         # promise falsely that updating yt-dlp would fix it.
-        assert "could not read this link" in out
+        assert "can't read this link" in out
         assert "please report this issue" not in out
         assert "github.com" not in out
 

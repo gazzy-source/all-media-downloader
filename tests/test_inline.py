@@ -226,7 +226,7 @@ class TestChosenResult:
         monkeypatch.setattr(inl.download_manager, "download",
                             lambda **k: pytest.fail("must not download"))
         await inl.handle_chosen_inline_result(_update(chosen_inline_result=_chosen("vp:x")), ctx)
-        assert "Rate limit" in ctx.bot.captions[-1]
+        assert "Hourly limit" in ctx.bot.captions[-1]
 
     async def test_private_link_refused(self, ctx, monkeypatch):
         def refuse(url):

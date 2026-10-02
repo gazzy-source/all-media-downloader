@@ -208,7 +208,7 @@ class TestStatsPrivacy:
         monkeypatch.setattr(start_handlers, "get_stats", must_not_load)
         msg = fx.msg("/stats")
         await start_handlers.cmd_stats(fx.update(msg), fx.ctx)
-        assert "quota" in msg.replies[0][0]
+        assert "left of" in msg.replies[0][0]
 
 
 class TestCookieJarSweep:

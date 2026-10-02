@@ -35,6 +35,7 @@ from bot.keyboards.menus import (
 )
 from bot.services import activity, inline_cache, user_prefs
 from bot.services.dl_queue import download_queue
+from bot.utils.texts import rate_limit_text, too_big_text, upload_failed_text
 from bot.utils.progress_view import ProgressView
 from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
 from bot.services.history import record_download
@@ -44,11 +45,10 @@ from bot.services.rate_limit import rate_limiter
 from bot.services.session import DownloadSession, sessions
 from bot.utils.safe_fetch import UnresolvableURLError, UnsafeURLError, check_public_url
 from bot.utils.helpers import (
-    analysing_percent,
     extract_urls,
     format_size,
     platform_from_url,
-    progress_bar,
+    safe_filename,
     short_id,
 )
 
@@ -231,7 +231,7 @@ async def auto_download_flow(
     if not allowed and actor not in ADMIN_IDS:
         try:
             await msg.reply_text(
-                f"⏳ Rate limit — try again in {retry}s.",
+                rate_limit_text(retry, actor),
                 parse_mode=ParseMode.HTML,
             )
         except TelegramError:
@@ -285,7 +285,8 @@ async def auto_download_flow(
         sent = await _send_cached(
             context, chat.id, hit,
             "" if is_chan else f"🎬 <b>{title}</b>\n⚡ Instant · All-Media Downloader · Gazzy Labs",
-            reply_markup=None if is_chan else after_download_keyboard(url, user_id=actor),
+            reply_markup=None if is_chan else after_download_keyboard(
+                url, user_id=actor, private=chat.type == "private"),
             url=url, key=repeat,
         )
         if sent is not None:
@@ -374,7 +375,8 @@ async def auto_download_flow(
             f"{kind} · 💾 {format_size(size)} · ⏱ ready in {view.elapsed():.0f}s\n"
             f"⚡ All-Media Downloader · Gazzy Labs"
         )
-        actions = after_download_keyboard(url, user_id=actor)
+        actions = after_download_keyboard(url, user_id=actor,
+                                          private=chat.type == "private")
 
     try:
         if size > MAX_FILE_SIZE_BYTES:
@@ -385,8 +387,8 @@ async def auto_download_flow(
                     pass
             else:
                 await status.edit_text(
-                    f"⚠️ File is <b>{format_size(size)}</b> (limit "
-                    f"~{format_size(MAX_FILE_SIZE_BYTES)}). Try a shorter video.",
+                    too_big_text(size, "Open the bot in private chat to pick a "
+                                       "lower quality or 🎵 Audio."),
                     parse_mode=ParseMode.HTML,
                 )
             record_download(
@@ -433,10 +435,7 @@ async def auto_download_flow(
             file_size=size, error=str(e),
         )
         try:
-            await status.edit_text(
-                f"❌ Upload failed:\n<code>{_esc(str(e)[:200])}</code>",
-                parse_mode=ParseMode.HTML,
-            )
+            await status.edit_text(upload_failed_text(e), parse_mode=ParseMode.HTML)
         except TelegramError:
             pass
     finally:
@@ -462,7 +461,7 @@ async def start_url_flow(
     allowed, retry = rate_limiter.allow(user.id)
     if not allowed and user.id not in ADMIN_IDS:
         await msg.reply_text(
-            f"⏳ Rate limit reached. Try again in <b>{retry}</b> seconds.",
+            rate_limit_text(retry, user.id),
             parse_mode=ParseMode.HTML,
             reply_markup=main_reply_keyboard(),
         )
@@ -470,10 +469,7 @@ async def start_url_flow(
     if await _refuse_private_url(msg, url):
         return
 
-    status = await msg.reply_text(
-        "🔍 <b>Analyzing…</b>\n<code>Getting title, formats &amp; options</code>",
-        parse_mode=ParseMode.HTML,
-    )
+    status = await msg.reply_text("🔍 <b>Reading link…</b>", parse_mode=ParseMode.HTML)
     # Analysis can take tens of seconds on a slow platform. A restart in
     # that window used to leave this message frozen on Analyzing forever,
     # since only the download phase was registered for rescue.
@@ -490,9 +486,7 @@ async def start_url_flow(
                 elapsed = int(time.time() - started)
                 try:
                     await status.edit_text(
-                        f"🔍 <b>Analyzing…</b>\n"
-                        f"{progress_bar(analysing_percent(elapsed))}\n"
-                        f"<code>Reading formats · {elapsed}s</code>",
+                        f"🔍 <b>Reading link…</b> · {elapsed}s",
                         parse_mode=ParseMode.HTML,
                     )
                 except TelegramError:
@@ -513,7 +507,7 @@ async def start_url_flow(
         body = (
             "⏱ <b>Took too long to read this link</b>\n\n"
             f"Gave up after {EXTRACT_TIMEOUT}s — the platform is slow or "
-            "blocking the server right now.\n\n"
+            "busy right now.\n\n"
             "Try again, or send a different link."
         )
         try:
@@ -529,9 +523,7 @@ async def start_url_flow(
 
         friendly = DownloadManager._friendly_error(str(e))
         body = (
-            f"❌ <b>Could not read this link</b>\n\n{_esc(friendly)}\n\n"
-            "Tips: the post must be public, the link must not be a story/private "
-            "account, and some platforms block datacenter IPs."
+            f"❌ <b>Could not read this link</b>\n\n{_esc(friendly)}"
         )
         # editMessageText accepts an INLINE keyboard only. Passing the
         # persistent reply keyboard here raised BadRequest("Inline keyboard
@@ -782,10 +774,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         if not query.message:
             return
-        await query.message.reply_text(
-            f"🔄 Re-analyzing…\n<code>{_esc(url[:100])}</code>",
-            parse_mode=ParseMode.HTML,
-        )
         await start_url_flow(update, context, url)
         return
 
@@ -1058,29 +1046,12 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
     quality = session.quality or "720"
     chat_id = session.chat_id
 
-    summary = (
-        f"{_session_header(session)}\n\n"
-        f"⚙️ <b>Starting download…</b>\n"
-        f"Mode: <b>{_mode_label(mode)}</b>\n"
-    )
-    if mode in ("video", "video_subs"):
-        summary += f"Quality: <b>{QUALITY_MAP.get(quality, {}).get('label', quality)}</b>\n"
-    if mode == "audio":
-        summary += f"Format: <b>{session.audio_format.upper()}</b>\n"
-    if mode == "video_subs":
-        summary += f"Subtitles: <b>{_esc(session.subtitle_lang or 'auto')}</b>\n"
-    summary += (
-        f"\n{progress_bar(0)}\n"
-        f"<code>Starting… ({download_manager.active}/{download_manager.max_concurrent} parallel)</code>"
-    )
-
-    try:
-        await query.edit_message_text(summary, parse_mode=ParseMode.HTML)
-    except TelegramError:
-        pass
-
     view = ProgressView()
     dm_head = _dm_header(session, mode, quality)
+    try:
+        await query.edit_message_text(view.render(dm_head), parse_mode=ParseMode.HTML)
+    except TelegramError:
+        pass
 
     async def _edit_dm(text: str, **kw) -> None:
         await context.bot.edit_message_text(
@@ -1117,10 +1088,9 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         session.started = False
         session.quality = None
         await query.edit_message_text(
-            f"⚠️ <b>{QUALITY_MAP.get(quality, {}).get('label', quality)}</b> for this "
-            f"video is at least <b>{format_size(floor)}</b>, over Telegram's "
-            f"{format_size(MAX_FILE_SIZE_BYTES)} limit for bots.\n\n"
-            f"Nothing was downloaded, so you lost no time. {tip}",
+            too_big_text(floor, f"Nothing was downloaded, so you lost no time. {tip}")
+            .replace("This file is", f"{QUALITY_MAP.get(quality, {}).get('label', quality)} "
+                                     "for this video is at least", 1),
             parse_mode=ParseMode.HTML,
             reply_markup=quality_keyboard(session),
         )
@@ -1241,18 +1211,14 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         if size > MAX_FILE_SIZE_BYTES:
             try:
                 await query.edit_message_text(
-                    f"⚠️ File is <b>{format_size(size)}</b>, which exceeds the "
-                    f"Telegram bot upload limit (~{format_size(MAX_FILE_SIZE_BYTES)}).\n\n"
-                    f"Tips: pick a lower quality (480p/720p) or audio-only.",
+                    too_big_text(size, "Pick a lower quality (480p or 720p) or 🎵 Audio."),
                     parse_mode=ParseMode.HTML,
                     reply_markup=actions,
                 )
             except TelegramError:
                 await context.bot.send_message(
                     chat_id,
-                    f"⚠️ File is <b>{format_size(size)}</b>, which exceeds the "
-                    f"Telegram bot upload limit (~{format_size(MAX_FILE_SIZE_BYTES)}).\n\n"
-                    f"Tips: pick a lower quality (480p/720p) or audio-only.",
+                    too_big_text(size, "Pick a lower quality (480p or 720p) or 🎵 Audio."),
                     parse_mode=ParseMode.HTML,
                     reply_markup=actions,
                 )
@@ -1321,21 +1287,13 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
             file_size=size,
             error=str(e),
         )
-        hint = ""
-        if "timed out" in str(e).lower():
-            hint = (
-                "\n\n💡 <i>Upload timed out — often slow network or large file. "
-                "Try 480p/720p, or send again.</i>"
-            )
+        failed = upload_failed_text(e)
         try:
-            await query.edit_message_text(
-                f"❌ Upload failed:\n<code>{_esc(str(e)[:200])}</code>{hint}",
-                parse_mode=ParseMode.HTML,
-            )
+            await query.edit_message_text(failed, parse_mode=ParseMode.HTML)
         except TelegramError:
             await context.bot.send_message(
                 chat_id,
-                f"❌ Upload failed:\n<code>{_esc(str(e)[:200])}</code>{hint}",
+                failed,
                 parse_mode=ParseMode.HTML,
                 reply_markup=main_reply_keyboard(),
             )
@@ -1407,6 +1365,8 @@ async def _send_media(
     Returns the sent Message (its file_id is what inline mode re-sends).
     """
     filename = path.name
+    if path.stem == "media" and result is not None and getattr(result, "title", None):
+        filename = f"{safe_filename(result.title)}{path.suffix}"
     if len(caption) > 1024:
         caption = caption[:1000] + "…"
 

@@ -205,4 +205,4 @@ def test_placeholder_assets_exist():
 
     assets = Path(inl.__file__).resolve().parent.parent / "assets"
     assert (assets / "placeholder_v1.mp4").stat().st_size > 1000
-    assert (assets / "placeholder_v1.mp3").stat().st_size > 1000
+    assert (assets / "preparing_audio_v3.mp3").stat().st_size > 1000

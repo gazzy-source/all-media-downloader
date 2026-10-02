@@ -67,6 +67,7 @@ from bot.services.dl_queue import download_queue
 from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
 from bot.services.history import record_download
 from bot.services.rate_limit import RateLimiter, rate_limiter
+from bot.utils.texts import rate_limit_text, too_big_text, upload_failed_text
 from bot.services.url_tokens import put_url
 from bot.utils.helpers import extract_urls, format_size, platform_from_url
 from bot.utils.progress_view import ProgressView
@@ -454,8 +455,10 @@ def _search_result(mode: str, h: "yt_search.SearchHit"):
         return InlineQueryResultAudio(
             # Per-result URL: Telegram caches a file by URL WITH the title it
             # was first sent with, so one shared URL showed the previous
-            # song's name on every later pick while it downloaded.
-            id=f"sa:{h.id}", audio_url=f"{INLINE_ASSET_BASE}placeholder_v1.mp3?v={h.id}",
+            # song's name on every later pick while it downloaded. The file
+            # carries ID3 tags ("Arrives here in a moment" / "All-Media
+            # Downloader"): untagged, Telegram showed its file name.
+            id=f"sa:{h.id}", audio_url=f"{INLINE_ASSET_BASE}preparing_audio_v3.mp3?v={h.id}",
             title=h.title[:100], performer=h.channel[:60] or None,
             audio_duration=h.duration, caption=caption, parse_mode=ParseMode.HTML,
             reply_markup=_preparing_markup(),
@@ -569,7 +572,7 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
 
     allowed, retry = rate_limiter.allow(user_id)
     if not allowed and user_id not in ADMIN_IDS:
-        await finish(f"⏳ Rate limit reached — try again in {retry}s.")
+        await finish(rate_limit_text(retry, user_id))
         return
     if not await _is_public(url):
         await finish(f"🚫 {_esc(PRIVATE_URL_ERROR)}")
@@ -597,7 +600,7 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
                 await status(view.short())
 
     ticker = asyncio.create_task(tick())
-    _STATUS[imid] = "⏳ Starting…"
+    _STATUS[imid] = "🔎 Finding source"
     inline_cache.add_pending(imid)
     result = None
     platform = platform_from_url(url)
@@ -607,7 +610,7 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
                 # m4a: YouTube's own AAC stream, remuxed — no minute-long MP3
                 # re-encode on a small VPS. Telegram plays it as audio natively.
                 url=url, mode=mode, quality=INLINE_QUALITY, audio_format="m4a",
-                title_hint="media", progress_cb=on_progress,
+                title_hint=title or "media", progress_cb=on_progress,
             ),
             on_position=lambda n: on_progress(0, f"Queued — you're #{n} in line"),
             priority=user_prefs.is_premium(user_id),
@@ -621,11 +624,8 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         if size > MAX_FILE_SIZE_BYTES:
             record_download(user_id, url, result.title or "", platform, mode, INLINE_QUALITY,
                             False, file_size=size, error="File too large")
-            await finish(
-                f"⚠️ {format_size(size)} — over Telegram's "
-                f"{format_size(MAX_FILE_SIZE_BYTES)} limit for bots. "
-                "Tap <b>Open bot</b> for a lower quality."
-            )
+            await finish(too_big_text(
+                size, "Tap <b>Open bot</b> to pick a lower quality or 🎵 Audio."))
             return
         chat = _storage_chat()
         if chat is None:
@@ -640,7 +640,7 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
         found = _file_of(sent)
         if not found:
             state["done"] = False
-            await finish("❌ Upload failed.")
+            await finish(upload_failed_text("inline storage upload returned no file"))
             return
         kind, file_id = found
         title = (result.title or title or "")[:200]

@@ -79,9 +79,11 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = getattr(update, "effective_message", None)
     if msg is not None:
         try:
-            await msg.reply_text(
-                "⚠️ Something went wrong. Please try again or /cancel."
-            )
+            # Private chats only: in a group it is noise for everyone else.
+            chat = getattr(update, "effective_chat", None)
+            if chat is not None and getattr(chat, "type", "private") != "private":
+                return
+            await msg.reply_text("⚠️ Something went wrong. Please try again.")
         except Exception:
             pass
 
@@ -303,7 +305,7 @@ async def post_init(app: Application) -> None:
             BotCommand("history", "Your recent downloads"),
             BotCommand("help", "All features & limits"),
             BotCommand("platforms", "Supported sites"),
-            BotCommand("cancel", "Cancel current download"),
+            BotCommand("cancel", "Cancel a link you haven't started"),
             BotCommand("paysupport", "Help with a payment"),
         ]
     )

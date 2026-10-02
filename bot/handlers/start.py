@@ -25,6 +25,20 @@ from bot.services.rate_limit import rate_limiter
 from bot.utils.helpers import format_size
 
 
+
+def _kb(update: Update):
+    """The menu keyboard is personal: in a group it would pop up for everyone."""
+    chat = update.effective_chat
+    return main_reply_keyboard() if chat is None or chat.type == "private" else None
+
+
+def _premium_line() -> str:
+    if not PREMIUM_ENABLED:
+        return ""
+    more = RATE_LIMIT_PER_HOUR * PREMIUM_RATE_MULT
+    return f"• /premium — {more} downloads/hour + priority queue ⭐\n"
+
+
 def welcome_text(bot_username: str) -> str:
     me = f"@{bot_username}" if bot_username else "@bot"
     return f"""
@@ -43,8 +57,7 @@ def welcome_text(bot_username: str) -> str:
 
 <b>⚡ Make it yours</b>
 • /settings — save a default (e.g. 🎵 M4A) and skip the menu
-• /premium — {RATE_LIMIT_PER_HOUR * PREMIUM_RATE_MULT} downloads/hour + priority queue ⭐
-
+{_premium_line()}
 YouTube · Instagram · TikTok · X · Facebook · Pinterest &amp; 1000+ sites.
 Just paste a link 👇
 """.strip()
@@ -57,10 +70,9 @@ def help_text(bot_username: str) -> str:
 
 <b>Commands</b>
 /settings — default type, quality &amp; audio format
-/premium — more downloads per hour + priority
-/history — your recent downloads
+{'/premium — more downloads per hour + priority' + chr(10) if PREMIUM_ENABLED else ''}/history — your recent downloads
 /platforms — supported sites
-/cancel — cancel what you started
+/cancel — cancel a link you haven't started
 /paysupport — help with a payment
 
 <b>Inline (works in any chat)</b>
@@ -81,7 +93,7 @@ Busy? You'll see your place in the queue.
 
 <b>Limits</b>
 • Telegram bots can send files up to ~50 MB — pick a lower quality for long videos
-• {RATE_LIMIT_PER_HOUR} downloads/hour ({RATE_LIMIT_PER_HOUR * PREMIUM_RATE_MULT} with /premium)
+• {RATE_LIMIT_PER_HOUR} downloads/hour{f' ({RATE_LIMIT_PER_HOUR * PREMIUM_RATE_MULT} with /premium)' if PREMIUM_ENABLED else ''}
 • Search shows videos up to 1 hour long
 
 Built with ❤️ by <b>Gazzy Labs</b>
@@ -105,7 +117,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         welcome_text(getattr(context.bot, "username", "") or ""),
         parse_mode=ParseMode.HTML,
-        reply_markup=main_reply_keyboard(),
+        reply_markup=_kb(update),
         disable_web_page_preview=True,
     )
 
@@ -116,7 +128,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         help_text(getattr(context.bot, "username", "") or ""),
         parse_mode=ParseMode.HTML,
-        reply_markup=main_reply_keyboard(),
+        reply_markup=_kb(update),
         disable_web_page_preview=True,
     )
 
@@ -135,7 +147,7 @@ async def cmd_platforms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.effective_message.reply_text(
         "\n".join(lines),
         parse_mode=ParseMode.HTML,
-        reply_markup=main_reply_keyboard(),
+        reply_markup=_kb(update),
         disable_web_page_preview=True,
     )
 
@@ -148,7 +160,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not items:
         await update.effective_message.reply_text(
             "🕘 No downloads yet. Send a media link to get started!",
-            reply_markup=main_reply_keyboard(),
+            reply_markup=_kb(update),
         )
         return
     lines = ["🕘 <b>Your recent downloads</b>\n"]
@@ -165,7 +177,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.effective_message.reply_text(
         "\n".join(lines),
         parse_mode=ParseMode.HTML,
-        reply_markup=main_reply_keyboard(),
+        reply_markup=_kb(update),
         disable_web_page_preview=True,
     )
 
@@ -178,9 +190,10 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Server-wide numbers (user count, traffic, platforms) are the
         # operator's business; everyone else gets their own quota.
         await update.effective_message.reply_text(
-            f"⏱ Your remaining quota this hour: <b>{remaining}</b>/{RATE_LIMIT_PER_HOUR}",
+            f"⏱ Downloads this hour: <b>{remaining}</b> left of "
+            f"{user_prefs.hourly_limit(update.effective_user.id)}",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_reply_keyboard(),
+            reply_markup=_kb(update),
         )
         return
     stats = await asyncio.to_thread(get_stats)
@@ -206,7 +219,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=main_reply_keyboard(),
+        reply_markup=_kb(update),
     )
 
 
@@ -280,18 +293,18 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text(
             "⏳ That download is already running and will finish shortly — "
             "it can't be stopped mid-transfer.",
-            reply_markup=main_reply_keyboard(),
+            reply_markup=_kb(update),
         )
     elif s:
         sessions.remove(s.session_id)
         await update.effective_message.reply_text(
             "❌ Cancelled. Send a new link whenever you're ready.",
-            reply_markup=main_reply_keyboard(),
+            reply_markup=_kb(update),
         )
     else:
         await update.effective_message.reply_text(
             "Nothing to cancel. Paste a media link to start.",
-            reply_markup=main_reply_keyboard(),
+            reply_markup=_kb(update),
         )
 
 
@@ -319,6 +332,7 @@ async def text_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "🌐 Platforms": None,
         "🕘 History": None,
         "📊 Stats": None,
+        "⭐ Premium": None,
         "⚙️ Settings": None,
     }
     if text not in mapping:
@@ -331,12 +345,16 @@ async def text_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await cmd_history(update, context)
     elif text == "📊 Stats":
         await cmd_stats(update, context)
+    elif text == "⭐ Premium":
+        from bot.handlers.premium import cmd_premium
+
+        await cmd_premium(update, context)
     elif text == "⚙️ Settings":
         await cmd_settings(update, context)
     elif text == "📥 New Download":
         await update.effective_message.reply_text(
             mapping[text],
             parse_mode=ParseMode.HTML,
-            reply_markup=main_reply_keyboard(),
+            reply_markup=_kb(update),
         )
     return True

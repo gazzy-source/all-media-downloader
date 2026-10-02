@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 
+from bot.config import PREMIUM_ENABLED
 from bot.services.downloader import quality_buttons_meta
 from bot.services.session import DownloadSession
 
@@ -13,7 +14,8 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton("📥 New Download"), KeyboardButton("🕘 History")],
             [KeyboardButton("🌐 Platforms"), KeyboardButton("❓ Help")],
-            [KeyboardButton("📊 Stats"), KeyboardButton("⚙️ Settings")],
+            [KeyboardButton("⭐ Premium" if PREMIUM_ENABLED else "📊 Stats"),
+             KeyboardButton("⚙️ Settings")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -193,7 +195,7 @@ def image_size_keyboard(session: DownloadSession) -> InlineKeyboardMarkup:
 # callback is still handled for buttons sitting in older chats.
 
 
-def after_download_keyboard(url: str, user_id: int = 0) -> InlineKeyboardMarkup:
+def after_download_keyboard(url: str, user_id: int = 0, *, private: bool = True) -> InlineKeyboardMarkup:
     """
     Telegram callback_data max is 64 BYTES. Never put full URLs here.
     Store URL under a short token instead.
@@ -211,8 +213,7 @@ def after_download_keyboard(url: str, user_id: int = 0) -> InlineKeyboardMarkup:
                     "🔄 Download Again", callback_data=cb
                 )
             ],
-            [InlineKeyboardButton("📥 New Link", callback_data="new")],
-        ]
+        ] + ([[InlineKeyboardButton("📥 New Link", callback_data="new")]] if private else [])
     )
 
 

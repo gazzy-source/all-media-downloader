@@ -124,7 +124,7 @@ class TestFailedLinkShowsRealReason:
         await hd.start_url_flow(fx.update(msg), fx.ctx, self.URL)
         shown = self._shown(msg)
         assert "Could not read this link" in shown, shown[:400]
-        assert "bot-walled" in shown or "PO-token" in shown, shown[:400]
+        assert "anti-bot" in shown and "PO-token" not in shown, shown[:400]
         assert "Something went wrong" not in shown
 
     async def test_falls_back_to_a_new_message_if_edit_fails(self, fx, monkeypatch):

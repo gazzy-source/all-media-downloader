@@ -66,6 +66,8 @@ logger = logging.getLogger("all-media-bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.INFO)
+# "Running job heartbeat_job…" twice every 30s buried the real log lines.
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 
 def _who(update: object) -> str:

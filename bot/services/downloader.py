@@ -219,6 +219,19 @@ _META_INFLIGHT = 0  # analyses running right now (the yt-meta pool)
 _META_INFLIGHT_LOCK = threading.Lock()
 
 
+class _MetaFlight:
+    """One URL's extraction, shared by every caller asking for it meanwhile."""
+
+    __slots__ = ("cf", "fut", "started", "waiters")
+
+    def __init__(self, cf: concurrent.futures.Future, fut: asyncio.Future,
+                 started: dict) -> None:
+        self.cf = cf          # the pool job (cancel() only works before it starts)
+        self.fut = fut        # its asyncio side, awaited through shield()
+        self.started = started
+        self.waiters = 0
+
+
 def _rotation_harmless(own_downloads: int) -> bool:
     """True when a WARP rotation would cut no one else's connection."""
     from bot.services.dl_queue import download_queue
@@ -1521,6 +1534,12 @@ class DownloadManager:
             max_workers=4,
             thread_name_prefix="yt-meta",
         )
+        # One extraction per URL at a time (key = the cache key). A caller that
+        # times out leaves its thread running; a retry of the same link, or the
+        # same link sent four times, joins that work instead of stacking more
+        # ladders onto the pool — and with one run per URL an abandoned result
+        # can never land on top of a newer one in _META_CACHE.
+        self._meta_inflight: dict[str, _MetaFlight] = {}
 
     @property
     def free_slots(self) -> int:
@@ -1548,11 +1567,44 @@ class DownloadManager:
                 with _META_INFLIGHT_LOCK:
                     _META_INFLIGHT -= 1
 
-        info = await loop.run_in_executor(self._meta_executor, _run, url)
+        key = url.strip()
+        flight = self._meta_inflight.get(key)
+        if flight is None or flight.fut.done() or flight.cf.cancelled():
+            cf = self._meta_executor.submit(_run, url)
+            flight = _MetaFlight(cf, asyncio.wrap_future(cf, loop=loop), started)
+            self._meta_inflight[key] = flight
+
+            def _landed(fut: asyncio.Future, key=key, flight=flight) -> None:
+                if self._meta_inflight.get(key) is flight:
+                    del self._meta_inflight[key]
+                if not fut.cancelled():
+                    fut.exception()  # retrieved: nobody may be waiting any more
+
+            flight.fut.add_done_callback(_landed)
+        else:
+            started = flight.started
+        flight.waiters += 1
+        try:
+            # shield: one caller's timeout must not cancel the shared run.
+            info = await asyncio.shield(flight.fut)
+        finally:
+            flight.waiters -= 1
+            if flight.fut.done():
+                # Landed: forget it now (the done-callback may not have run yet).
+                if self._meta_inflight.get(key) is flight:
+                    del self._meta_inflight[key]
+            elif flight.waiters == 0:
+                # Everyone gave up. Not started yet -> drop it (as plain
+                # run_in_executor did). Already running -> it can't be
+                # stopped; it finishes under its deadline and caches.
+                if flight.cf.cancel() and self._meta_inflight.get(key) is flight:
+                    del self._meta_inflight[key]  # a newcomer must start fresh
         done = time.monotonic()
         result = build_media_info(url, info)
-        wait = (started.get("t", queued_at) - queued_at)
-        work = done - started.get("t", queued_at)
+        # A caller that joined a run already under way counts from its arrival.
+        t0 = max(started.get("t", queued_at), queued_at)
+        wait = t0 - queued_at
+        work = done - t0
         total = time.monotonic() - queued_at
         level = logger.warning if total > 8 else logger.info
         level(

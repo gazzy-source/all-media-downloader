@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from telegram import Bot, InputFile
-from telegram.error import TelegramError, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.request import HTTPXRequest
 
 import bot.handlers.download as hd
@@ -63,12 +63,19 @@ class FakeTelegram:
         outcome = (self.script.get(method) or ["ok"]).pop(0) if self.script.get(method) else "ok"
         if outcome == "timeout":
             raise httpx.WriteTimeout("simulated", request=request)
+        if outcome == "network":
+            raise httpx.ReadError("simulated", request=request)
+        if outcome == "retryafter":
+            return httpx.Response(429, json={"ok": False, "error_code": 429,
+                                             "description": "Too Many Requests",
+                                             "parameters": {"retry_after": 3}})
         if outcome == "forbidden":
             return httpx.Response(403, json={"ok": False, "error_code": 403,
                                              "description": "Forbidden: not allowed"})
-        if outcome == "badrequest":
+        if outcome == "badrequest" or isinstance(outcome, tuple):
+            description = outcome[1] if isinstance(outcome, tuple) else "wrong file type"
             return httpx.Response(400, json={"ok": False, "error_code": 400,
-                                             "description": "Bad Request: wrong file type"})
+                                             "description": "Bad Request: " + description})
         result = ME if method == "getMe" else (True if method == "sendChatAction" else MSG)
         return httpx.Response(200, content=json.dumps({"ok": True, "result": result}).encode())
 
@@ -103,9 +110,11 @@ async def _nosleep(_s):
 # 1 ----------------------------------------------------- every call site streams
 class _Recorder(InputFile):
     seen: list = []
+    handles: list = []
 
     def __init__(self, obj, *a, **kw):
         _Recorder.seen.append(kw.get("read_file_handle", True))
+        _Recorder.handles.append(obj)
         super().__init__(obj, *a, **kw)
 
 
@@ -131,8 +140,7 @@ async def test_all_six_upload_sites_stream_the_file(tmp_path, monkeypatch, kind,
             media = kw.get(name.removeprefix("send_"))
             contents.append(media.input_file_content)
             if name == fail:
-                # A non-network Telegram error: the kind the fallback handles
-                # today (see the xfail below for BadRequest).
+                # Preserve the existing non-network TelegramError fallback.
                 raise TelegramError("refused")
             return SimpleNamespace()
         return send
@@ -271,16 +279,145 @@ async def _ok(*a, **k):
     return True
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "PRE-EXISTING (not Step 0): PTB's BadRequest subclasses NetworkError, so "
-    "`except NetworkError: raise` in _send_media_once runs before the document "
-    "fallback, and _send_media then retries the same send. Fails the same on "
-    "the code before Step 0. Strict: this starts failing once it is fixed."))
-async def test_video_bad_request_falls_back_to_document(tg, tmp_path):
+@pytest.mark.parametrize("rejection", [
+    "wrong file type", "VIDEO_CONTENT_TYPE_INVALID", "VIDEO_FILE_INVALID",
+])
+async def test_video_bad_request_falls_back_to_document(tg, tmp_path, monkeypatch, rejection):
     f, data, res = _video(tmp_path, size=10_000)
+    tg.script["sendVideo"] = [("badrequest", rejection)]
+    await _assert_format_fallback(tg, monkeypatch, f, data, res, "sendVideo", "video/mp4")
+
+
+@pytest.mark.parametrize("rejection", [
+    "wrong file type", "PHOTO_INVALID_DIMENSIONS", "PHOTO_EXT_INVALID", "IMAGE_PROCESS_FAILED",
+])
+async def test_photo_bad_request_falls_back_to_document(tg, tmp_path, monkeypatch, rejection):
+    data = os.urandom(10_000)
+    f = tmp_path / "photo.jpg"
+    f.write_bytes(data)
+    res = DownloadResult(success=True, files=[f], primary=f, is_image=True)
+    tg.script["sendPhoto"] = [("badrequest", rejection)]
+    await _assert_format_fallback(tg, monkeypatch, f, data, res, "sendPhoto", "image/jpeg")
+
+
+async def _assert_format_fallback(tg, monkeypatch, f, data, res, method, mime):
+    _Recorder.seen, _Recorder.handles = [], []
+    monkeypatch.setattr(hd, "InputFile", _Recorder)
+    await hd._send_media(tg.ctx, 1, f, res, "<b>cap</b>", attempts=1,
+                         silent=True, thread_id=7)
+    assert len(tg.uploads(method)) == 1
+    (request, body), = tg.uploads("sendDocument")
+    parts = _parts(request, body)
+    assert parts["document"] == {"filename": f.name, "type": mime, "data": data}
+    assert parts["caption"]["data"] == b"<b>cap</b>"
+    assert parts["parse_mode"]["data"] == b"HTML"
+    assert parts["disable_notification"]["data"] == b"true"
+    assert parts["message_thread_id"]["data"] == b"7"
+    assert "supports_streaming" not in parts
+    assert int(request.headers["content-length"]) == len(body)
+    assert _Recorder.seen == [False, False]
+    assert _Recorder.handles[0] is _Recorder.handles[1]  # same file, rewound
+    assert all(handle.closed for handle in _Recorder.handles)
+    assert hd.upload_gate.running_uploads == hd.upload_gate.in_flight_bytes == 0
+    assert f.read_bytes() == data  # handler cleanup still owns the result files
+
+
+@pytest.mark.parametrize("kind,method,field", [
+    ("video", "sendVideo", "video"), ("photo", "sendPhoto", "photo"),
+])
+@pytest.mark.parametrize("failure,wait", [("network", 2), ("timeout", 2), ("retryafter", 4)])
+async def test_media_transport_and_flood_retries_are_unchanged(
+    tg, tmp_path, monkeypatch, kind, method, field, failure, wait,
+):
+    f, data, res = _video(tmp_path, size=10_000)
+    res.is_video, res.is_image = kind == "video", kind == "photo"
+    tg.script[method] = [failure, "ok"]
+    sleeps = []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(hd, "_sleep", sleep)
+    await hd._send_media(tg.ctx, 1, f, res, "cap", attempts=3)
+    assert sleeps == [wait]
+    assert len(tg.uploads(method)) == 2
+    assert not tg.uploads("sendDocument")
+    assert all(_parts(req, body)[field]["data"] == data for req, body in tg.uploads(method))
+
+
+@pytest.mark.parametrize("kind,method", [("video", "sendVideo"), ("photo", "sendPhoto")])
+@pytest.mark.parametrize("failure,error,waits", [
+    ("network", NetworkError, [2, 4]),
+    ("timeout", TimedOut, [2, 4]),
+    ("retryafter", RetryAfter, [4, 4, 4]),
+])
+async def test_media_retry_exhaustion_preserves_error_and_cleanup(
+    tg, tmp_path, monkeypatch, kind, method, failure, error, waits,
+):
+    f, _, res = _video(tmp_path, size=1000)
+    res.is_video, res.is_image = kind == "video", kind == "photo"
+    tg.script[method] = [failure] * 3
+    sleeps = []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(hd, "_sleep", sleep)
+    with pytest.raises(error):
+        await hd._send_media(tg.ctx, 1, f, res, "cap", attempts=3)
+    assert sleeps == waits
+    assert len(tg.uploads(method)) == 3
+    assert not tg.uploads("sendDocument")
+    assert hd.upload_gate.running_uploads == hd.upload_gate.in_flight_bytes == 0
+
+
+@pytest.mark.parametrize("kind,method", [("video", "sendVideo"), ("photo", "sendPhoto")])
+@pytest.mark.parametrize("rejection", [
+    "chat not found", "can't parse entities", "message thread not found",
+    "file is too big", "file must be non-empty", "wrong file identifier/http url specified",
+    "upload failed",
+])
+async def test_unrelated_bad_request_is_not_sent_as_document(
+    tg, tmp_path, monkeypatch, kind, method, rejection,
+):
+    f, _, res = _video(tmp_path, size=1000)
+    res.is_video, res.is_image = kind == "video", kind == "photo"
+    tg.script[method] = [("badrequest", rejection)] * 2
+    monkeypatch.setattr(hd, "_sleep", _nosleep)
+    with pytest.raises(BadRequest) as raised:
+        await hd._send_media(tg.ctx, 1, f, res, "cap", attempts=2)
+    assert str(raised.value).lower() == rejection
+    # The outer retry loop is unchanged, including its existing treatment of
+    # BadRequest as a NetworkError. It must preserve the original error.
+    assert len(tg.uploads(method)) == 2
+    assert not tg.uploads("sendDocument")
+    assert hd.upload_gate.running_uploads == hd.upload_gate.in_flight_bytes == 0
+
+
+@pytest.mark.parametrize("kind,rejection", [
+    ("photo", "VIDEO_CONTENT_TYPE_INVALID"), ("video", "PHOTO_INVALID_DIMENSIONS"),
+])
+async def test_format_rejections_are_specific_to_the_media_kind(tmp_path, kind, rejection):
+    f, _, res = _video(tmp_path, size=1000)
+    res.is_video, res.is_image = kind == "video", kind == "photo"
+
+    async def reject(*a, **kw):
+        raise BadRequest(rejection)
+
+    ctx = SimpleNamespace(bot=SimpleNamespace(send_chat_action=_ok,
+                                              send_video=reject, send_photo=reject))
+    with pytest.raises(BadRequest, match=rejection):
+        await hd._send_media_once(ctx, 1, f, res, "cap", f.name)
+
+
+async def test_document_bad_request_after_fallback_propagates(tg, tmp_path):
+    f, _, res = _video(tmp_path, size=1000)
     tg.script["sendVideo"] = ["badrequest"]
-    await hd._send_media(tg.ctx, 1, f, res, "cap", attempts=1)
-    assert _parts(*tg.uploads("sendDocument")[0])["document"]["data"] == data
+    tg.script["sendDocument"] = [("badrequest", "chat not found")]
+    with pytest.raises(BadRequest, match="(?i)chat not found"):
+        await hd._send_media(tg.ctx, 1, f, res, "cap", attempts=1)
+    assert len(tg.uploads("sendVideo")) == len(tg.uploads("sendDocument")) == 1
+    assert hd.upload_gate.running_uploads == hd.upload_gate.in_flight_bytes == 0
 
 
 # The point of Step 0: memory does not grow with the file size.

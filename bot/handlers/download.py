@@ -1662,6 +1662,18 @@ async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
+def _is_media_format_rejection(error: BadRequest, kind: str) -> bool:
+    # Keep this narrow: caption, permission, file-size and chat errors must
+    # not silently turn a rejected media send into a document send.
+    allowed = {
+        "photo": {"wrong file type", "photo_invalid_dimensions",
+                  "photo_ext_invalid", "image_process_failed"},
+        "video": {"wrong file type", "video_content_type_invalid",
+                  "video_file_invalid"},
+    }
+    return str(error).strip().lower() in allowed[kind]
+
+
 async def _send_media_once(
     context,
     chat_id: int,
@@ -1715,6 +1727,12 @@ async def _send_media_once(
                     **cap_kw,
                     **kw,
                 )
+            except BadRequest as e:
+                # BadRequest subclasses NetworkError: classify the media
+                # rejection before the transport-error branch below.
+                if not _is_media_format_rejection(e, "photo"):
+                    raise
+                logger.info("send_photo failed (%s), falling back to document", e)
             except (RetryAfter, NetworkError):
                 # Flood control and transport failures (TimedOut included) go
                 # back to the retry loop. Re-sending as a document right away
@@ -1723,13 +1741,13 @@ async def _send_media_once(
                 raise
             except TelegramError as e:
                 logger.info("send_photo failed (%s), falling back to document", e)
-                f.seek(0)
-                return await context.bot.send_document(
-                    chat_id,
-                    document=InputFile(f, filename=filename, read_file_handle=False),
-                    **cap_kw,
-                    **kw,
-                )
+            f.seek(0)
+            return await context.bot.send_document(
+                chat_id,
+                document=InputFile(f, filename=filename, read_file_handle=False),
+                **cap_kw,
+                **kw,
+            )
 
     if result.is_video:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
@@ -1742,6 +1760,10 @@ async def _send_media_once(
                     **cap_kw,
                     **kw,
                 )
+            except BadRequest as e:
+                if not _is_media_format_rejection(e, "video"):
+                    raise
+                logger.info("send_video failed (%s), falling back to document", e)
             except RetryAfter:
                 # Flood control must be waited out by the retry loop —
                 # falling back to document here would hit the same limit again.
@@ -1750,13 +1772,13 @@ async def _send_media_once(
                 raise
             except TelegramError as e:
                 logger.info("send_video failed (%s), falling back to document", e)
-                f.seek(0)
-                return await context.bot.send_document(
-                    chat_id,
-                    document=InputFile(f, filename=filename, read_file_handle=False),
-                    **cap_kw,
-                    **kw,
-                )
+            f.seek(0)
+            return await context.bot.send_document(
+                chat_id,
+                document=InputFile(f, filename=filename, read_file_handle=False),
+                **cap_kw,
+                **kw,
+            )
 
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
     with path.open("rb") as f:

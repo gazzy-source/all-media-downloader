@@ -154,6 +154,16 @@ class DownloadResult:
     cover: Path | None = None
 
 
+@dataclass(frozen=True)
+class QualityRecommendation:
+    """A lower quality supported by current format metadata and its size data."""
+
+    quality: str
+    height: int
+    estimated_bytes: int
+    is_exact: bool = False
+
+
 _PART_RE = re.compile(r"\.f[\w-]+\.\w+(?:\.part)?$")
 _PP_LABELS = {
     "Merger": "🔗 Joining video + audio…",
@@ -1566,6 +1576,11 @@ class DownloadManager:
     def free_slots(self) -> int:
         return max(0, self.max_concurrent - self.active)
 
+    def cached_media_info(self, url: str) -> MediaInfo | None:
+        """Build media estimates from an existing extraction only; never fetch."""
+        raw = _meta_cache_get(url, max_age=DOWNLOAD_REUSE_TTL)
+        return build_media_info(url, raw) if raw is not None else None
+
     async def extract_info(self, url: str, limit: float | None = None) -> MediaInfo:
         loop = asyncio.get_running_loop()
         # Timed in three parts so a slow "Analyzing…" can be attributed rather
@@ -2843,6 +2858,62 @@ def available_qualities_for(heights: list[int]) -> list[str]:
     filtered.append("max")
     # Deduplicate
     return list(dict.fromkeys(filtered))
+
+
+def recommend_fitting_quality(
+    available_heights: list[int],
+    estimated_sizes: dict[str, int],
+    requested_quality: str | None,
+    max_bytes: int,
+    *,
+    exact_sizes: set[str] | None = None,
+) -> QualityRecommendation | None:
+    """Return the highest lower available quality with a known size under cap.
+
+    `estimated_sizes` comes from yt-dlp format metadata. A key only qualifies
+    when the corresponding choice maps to an actually available height and its
+    metadata size is present. Those values remain estimates of final output;
+    even exact source-part sizes can change slightly during mux/post-processing.
+    `exact_sizes` is reserved for callers that possess an exact final-size
+    value for that quality. No arbitrary margin is applied to metadata sizes.
+    """
+    if requested_quality not in QUALITY_MAP or not available_heights or max_bytes <= 0:
+        return None
+    heights = sorted({int(h) for h in available_heights if int(h) > 0})
+    if not heights:
+        return None
+    requested_cap = QUALITY_MAP[requested_quality]["height"]
+    requested_height = max((h for h in heights if h <= requested_cap), default=None)
+    if requested_quality == "max":
+        requested_height = max(heights)
+    if requested_height is None:
+        return None
+
+    exact_sizes = exact_sizes or set()
+    candidates: list[tuple[int, int, str, int]] = []
+    for key in available_qualities_for(heights):
+        cap = QUALITY_MAP[key]["height"]
+        actual_height = max((h for h in heights if h <= cap), default=None)
+        if key == "max":
+            actual_height = max(heights)
+        if actual_height is None or actual_height >= requested_height:
+            continue
+        size = estimated_sizes.get(key)
+        if not isinstance(size, int) or size <= 0 or size > max_bytes:
+            continue
+        # If several menu caps resolve to the same source height, prefer the
+        # narrowest cap (e.g. 480p instead of "720p up to 480p").
+        candidates.append((actual_height, -cap, key, size))
+
+    if not candidates:
+        return None
+    height, _, quality, size = max(candidates)
+    return QualityRecommendation(
+        quality=quality,
+        height=height,
+        estimated_bytes=size,
+        is_exact=quality in exact_sizes,
+    )
 
 
 def quality_buttons_meta(heights: list[int], estimated: dict[str, int] | None = None) -> list[dict[str, str]]:

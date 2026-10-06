@@ -36,7 +36,12 @@ from bot.services import activity, inline_cache, jobs, user_prefs
 from bot.services.dl_queue import download_queue
 from bot.services.upload_gate import UploadCancelled, upload_gate
 from bot.utils import redact
-from bot.utils.texts import rate_limit_text, too_big_text, upload_failed_text
+from bot.utils.texts import (
+    oversized_video_advice,
+    rate_limit_text,
+    too_big_text,
+    upload_failed_text,
+)
 from bot.utils.progress_view import ProgressView
 from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
 from bot.services.history import record_download
@@ -426,9 +431,16 @@ async def auto_download_flow(
                 except TelegramError:
                     pass
             else:
+                advice = "Open the bot in private chat to pick a lower quality or 🎵 Audio."
+                if mode == "video":
+                    cached_info = download_manager.cached_media_info(url)
+                    advice = oversized_video_advice(
+                        cached_info.available_heights if cached_info else [],
+                        cached_info.estimated_sizes if cached_info else {},
+                        quality,
+                    )
                 await status.edit_text(
-                    too_big_text(size, "Open the bot in private chat to pick a "
-                                       "lower quality or 🎵 Audio."),
+                    too_big_text(size, advice),
                     parse_mode=ParseMode.HTML,
                 )
             record_download(
@@ -1272,15 +1284,10 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
     # the largest one alone can be a codec yt-dlp would never pick.
     floor = (session.min_sizes or {}).get(quality) or est
     if est and floor and floor > MAX_FILE_SIZE_BYTES:
-        fits = [
-            (q, sz) for q, sz in (session.estimated_sizes or {}).items()
-            if sz and sz <= MAX_FILE_SIZE_BYTES
-        ]
-        best = max(fits, key=lambda qs: qs[1])[0] if fits else None
-        tip = (
-            f"Pick <b>{QUALITY_MAP[best]['label']}</b> — it fits."
-            if best and best in QUALITY_MAP
-            else "Try 🎵 Audio instead."
+        tip = oversized_video_advice(
+            session.available_heights,
+            session.estimated_sizes or {},
+            quality,
         )
         # Keep the session alive and re-armed: the keyboard below is the way
         # out, and removing the session (or leaving `started` set) made every
@@ -1438,16 +1445,25 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
 
     try:
         if size > MAX_FILE_SIZE_BYTES:
+            advice = (
+                oversized_video_advice(
+                    session.available_heights,
+                    session.estimated_sizes or {},
+                    quality,
+                )
+                if mode in ("video", "video_subs")
+                else "Pick a lower quality (480p or 720p) or 🎵 Audio."
+            )
             try:
                 await query.edit_message_text(
-                    too_big_text(size, "Pick a lower quality (480p or 720p) or 🎵 Audio."),
+                    too_big_text(size, advice),
                     parse_mode=ParseMode.HTML,
                     reply_markup=actions,
                 )
             except TelegramError:
                 await context.bot.send_message(
                     chat_id,
-                    too_big_text(size, "Pick a lower quality (480p or 720p) or 🎵 Audio."),
+                    too_big_text(size, advice),
                     parse_mode=ParseMode.HTML,
                     reply_markup=actions,
                 )

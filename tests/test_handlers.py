@@ -458,6 +458,42 @@ class TestExecuteDownload:
             "exceeds" in e[0].lower() or "limit" in e[0].lower() for e in q.edits
         ), f"oversize edit expected, got: {[e[0] for e in q.edits]}"
 
+    async def test_oversize_video_recommends_highest_estimated_fit(self, fx, monkeypatch, tmp_path):
+        s = self._session()
+        s.mode = "video"
+        s.quality = "1080"
+        s.available_heights = [480, 720, 1080]
+        s.estimated_sizes = {
+            "1080": MAX_FILE_SIZE_BYTES + 5_000_000,
+            "720": int(MAX_FILE_SIZE_BYTES * 0.78),
+            "480": int(MAX_FILE_SIZE_BYTES * 0.45),
+        }
+        # The format floor allows a possible smaller 1080p rendition; the
+        # actual downloaded file is then over the Telegram limit.
+        s.min_sizes = {"1080": int(MAX_FILE_SIZE_BYTES * 0.7)}
+        sessions.put(s)
+        res = _ok_result(tmp_path, size=MAX_FILE_SIZE_BYTES + 5)
+        monkeypatch.setattr(hd, "record_download", lambda *a, **k: None)
+        q, _ = await self._run(fx, s, res, monkeypatch)
+        text = "\n".join(edit[0] for edit in q.edits)
+        assert "estimated" in text and "720p" in text
+        assert "480p" not in text, "recommend the highest fitting quality"
+        assert "Audio" in text
+
+    async def test_oversized_audio_keeps_existing_non_video_advice(self, fx, monkeypatch, tmp_path):
+        s = self._session()
+        s.mode = "audio"
+        s.quality = None
+        s.available_heights = [480, 720, 1080]
+        s.estimated_sizes = {"720": MAX_FILE_SIZE_BYTES // 2}
+        sessions.put(s)
+        res = _ok_result(tmp_path, size=MAX_FILE_SIZE_BYTES + 5, is_video=False)
+        monkeypatch.setattr(hd, "record_download", lambda *a, **k: None)
+        q, _ = await self._run(fx, s, res, monkeypatch)
+        text = "\n".join(edit[0] for edit in q.edits)
+        assert "Pick a lower quality (480p or 720p)" in text
+        assert "estimated" not in text
+
 
 class FakeChat2:
     def __init__(self, chat_id):

@@ -234,16 +234,31 @@ class TestChosenResult:
         assert "upstream unavailable" in ctx.bot.captions[-1]
 
     async def test_too_big_offers_the_bot_instead(self, ctx, monkeypatch, tmp_path):
-        monkeypatch.setattr(inl, "MAX_FILE_SIZE_BYTES", 1000)
+        from bot.services.downloader import _meta_cache_put
+
+        url = "https://youtu.be/abc"
+        _meta_cache_put(url, {"formats": [
+            {"vcodec": "avc1", "acodec": "mp4a", "height": 360,
+             "filesize": 15_000_000, "ext": "mp4"},
+            {"vcodec": "avc1", "acodec": "none", "height": 480,
+             "filesize": 20_000_000, "ext": "mp4"},
+            {"vcodec": "avc1", "acodec": "none", "height": 720,
+             "filesize": 50_000_000, "ext": "mp4"},
+            {"vcodec": "none", "acodec": "mp4a", "filesize": 2_000_000, "ext": "m4a"},
+        ]})
+        monkeypatch.setattr(inl.download_manager, "extract_info",
+                            lambda *a, **k: pytest.fail("must not extract for the recommendation"))
 
         async def fake_download(**kw):
-            return _result(tmp_path)
+            return _result(tmp_path, file_size=inl.MAX_FILE_SIZE_BYTES + 100)
 
         monkeypatch.setattr(inl.download_manager, "download", fake_download)
         monkeypatch.setattr(inl.download_manager, "cleanup_result_files", lambda r: None)
         monkeypatch.setattr(hd, "_send_media", lambda *a, **k: pytest.fail("must not upload"))
         await inl.handle_chosen_inline_result(_update(chosen_inline_result=_chosen("vp:x")), ctx)
         assert "Open bot" in ctx.bot.captions[-1] and ctx.bot.media_edits == []
+        assert "480p" in ctx.bot.captions[-1] and "estimated" in ctx.bot.captions[-1]
+        assert "tap <b>open bot</b>" in ctx.bot.captions[-1].lower()
         assert ctx.bot.markups[-1].inline_keyboard[0][0].url.startswith("https://t.me/mediabot?start=dl_")
 
     async def test_failure_is_shown_in_the_message(self, ctx, monkeypatch):

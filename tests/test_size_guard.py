@@ -9,7 +9,14 @@ checked the estimate before spending the download.
 from __future__ import annotations
 
 from bot.config import MAX_FILE_SIZE_BYTES
-from bot.services.downloader import _parse_formats, quality_buttons_meta
+from bot.services.downloader import (
+    _meta_cache_put,
+    _parse_formats,
+    download_manager,
+    quality_buttons_meta,
+    recommend_fitting_quality,
+)
+from bot.utils.texts import oversized_video_advice
 
 MB = 1024 * 1024
 
@@ -69,6 +76,87 @@ class TestOverLimitIsVisible:
         label = next(m["label"] for m in metas if m["key"] == "720")
         assert "⚠️" not in label, label
         assert "10.0 MB" in label
+
+
+class TestFittingQualityRecommendation:
+    heights = [480, 720, 1080]
+
+    def test_current_quality_oversized_recommends_next_lower(self):
+        rec = recommend_fitting_quality(
+            self.heights, {"1080": 55 * MB, "720": 38 * MB, "480": 24 * MB},
+            "1080", 49 * MB,
+        )
+        assert (rec.quality, rec.height, rec.estimated_bytes) == ("720", 720, 38 * MB)
+
+    def test_multiple_lower_choices_choose_highest_that_fits(self):
+        rec = recommend_fitting_quality(
+            [720, 1080, 1440], {"max": 70 * MB, "1080": 48 * MB, "720": 38 * MB,
+                                "480": 24 * MB}, "max", 49 * MB,
+        )
+        assert rec.quality == "1080" and rec.height == 1080
+
+    def test_none_fit_returns_no_recommendation(self):
+        assert recommend_fitting_quality(
+            self.heights, {"1080": 80 * MB, "720": 60 * MB, "480": 50 * MB},
+            "max", 49 * MB,
+        ) is None
+
+    def test_metadata_estimates_are_not_marked_exact(self):
+        rec = recommend_fitting_quality(
+            self.heights, {"720": 38 * MB}, "1080", 49 * MB,
+        )
+        assert rec is not None and rec.is_exact is False
+        assert "estimated at 38.0 MB" in oversized_video_advice(
+            self.heights, {"720": 38 * MB}, "1080")
+
+    def test_explicit_exact_candidate_is_reported_as_exact(self):
+        rec = recommend_fitting_quality(
+            self.heights, {"720": 38 * MB}, "1080", 49 * MB,
+            exact_sizes={"720"},
+        )
+        assert rec is not None and rec.is_exact is True
+        assert "Try <b>720p</b> (~38.0 MB)." in oversized_video_advice(
+            self.heights, {"720": 38 * MB}, "1080", exact_sizes={"720"})
+
+    def test_size_at_limit_is_allowed_but_over_limit_is_not(self):
+        exact = recommend_fitting_quality(
+            self.heights, {"720": 49 * MB}, "1080", 49 * MB,
+        )
+        assert exact is not None and exact.estimated_bytes == 49 * MB
+        assert recommend_fitting_quality(
+            self.heights, {"720": 49 * MB + 1}, "1080", 49 * MB,
+        ) is None
+
+    def test_no_size_metadata_never_invents_a_recommendation(self):
+        assert recommend_fitting_quality(self.heights, {}, "1080", 49 * MB) is None
+        assert "no lower-quality size estimate is available" in oversized_video_advice(
+            self.heights, {}, "1080").lower()
+
+    def test_only_real_available_height_is_recommended(self):
+        rec = recommend_fitting_quality(
+            [360, 1080], {"1080": 40 * MB, "720": 30 * MB, "480": 20 * MB},
+            "max", 49 * MB,
+        )
+        assert rec is not None and rec.quality == "480" and rec.height == 360
+
+    def test_no_lower_quality_for_audio_or_current_lowest_video_quality(self):
+        assert recommend_fitting_quality(self.heights, {"480": 10 * MB}, "480", 49 * MB) is None
+
+    def test_inline_advice_keeps_bot_handoff_and_recommendation(self):
+        text = oversized_video_advice(
+            self.heights, {"720": 38 * MB}, "1080", inline=True)
+        assert "720p" in text and "estimated" in text and "Open bot" in text
+
+    def test_existing_metadata_cache_can_be_read_without_another_extraction(self, monkeypatch):
+        url = "https://example.test/cached-quality-estimates"
+        _meta_cache_put(url, {"formats": [
+            {"vcodec": "avc1", "acodec": "mp4a", "height": 720,
+             "filesize": 30 * MB, "ext": "mp4"},
+        ]})
+        monkeypatch.setattr(download_manager, "extract_info",
+                            lambda *a, **k: pytest.fail("must not extract to read cached estimates"))
+        cached = download_manager.cached_media_info(url)
+        assert cached is not None and cached.estimated_sizes["720"] == 30 * MB
 
     def test_exactly_at_the_limit_is_allowed(self):
         """The check is strictly greater-than; the boundary itself still fits."""

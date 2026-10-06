@@ -64,7 +64,12 @@ from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
 from bot.services.history import record_download
 from bot.services.rate_limit import RateLimiter, rate_limiter
 from bot.utils import redact
-from bot.utils.texts import rate_limit_text, too_big_text, upload_failed_text
+from bot.utils.texts import (
+    oversized_video_advice,
+    rate_limit_text,
+    too_big_text,
+    upload_failed_text,
+)
 from bot.services.url_tokens import put_url
 from bot.utils.helpers import extract_urls, format_size, platform_from_url
 from bot.utils.progress_view import ProgressView
@@ -679,8 +684,17 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
         if size > MAX_FILE_SIZE_BYTES:
             record_download(user_id, url, result.title or "", platform, mode, INLINE_QUALITY,
                             False, file_size=size, error="File too large")
+            advice = "Tap <b>Open bot</b> to pick a lower quality or 🎵 Audio."
+            if mode == "video":
+                cached_info = download_manager.cached_media_info(url)
+                advice = oversized_video_advice(
+                    cached_info.available_heights if cached_info else [],
+                    cached_info.estimated_sizes if cached_info else {},
+                    INLINE_QUALITY,
+                    inline=True,
+                )
             await finish(too_big_text(
-                size, "Tap <b>Open bot</b> to pick a lower quality or 🎵 Audio."))
+                size, advice))
             return
         chat = _storage_chat()
         if chat is None:

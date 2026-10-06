@@ -1,94 +1,9 @@
-# Cookies for YouTube / Instagram (VPS)
+# Optional cookie handling
 
-YouTube often returns:
+Cookies may help with sources that require an authenticated session. They are credentials: use a dedicated account where appropriate, restrict file permissions, keep them out of Git and logs, and revoke/rotate them if exposed. Cookie validity and site access rules can change independently of this project.
 
-> Sign in to confirm you’re not a bot  
-> The provided YouTube account cookies are no longer valid
+Set `COOKIES_FILE` in the private `.env` to the source jar path, or place a `cookies.txt` beside the application as supported by current configuration. Upload the Netscape-format jar over a secure channel and restrict it to the service operator. Never paste tokens, cookie rows, or proxy credentials into issues or documentation.
 
-**Datacenter VPS IPs** trigger this. Fresh Netscape cookies usually fix it — until Google rotates them again.
+In v1, the application preserves the uploaded source jar, creates a sanitized copy at `data/cookies.sanitized.txt`, and makes per-job disposable copies named `data/cookies.job_*.txt` for yt-dlp. The bot cleans up those job copies. Do not delete the sanitized/source data as a routine restart step. Follow [Operations](OPERATIONS.md) for production update and restart procedures.
 
-## Critical rules (or cookies die immediately)
-
-1. Export cookies **only when logged into youtube.com**
-2. After export: **do not open YouTube in that browser** until the bot has used them  
-   (opening YT rotates `LOGIN_INFO` / PSID and kills the export)
-3. Upload + restart the bot **right away** (within 1–2 minutes)
-4. Prefer a **secondary Google account** used only for the bot
-5. After the bot works, avoid heavy YouTube browsing in the **same browser profile** you exported from
-
-## 1. Export on your PC (exact steps)
-
-1. Install **Get cookies.txt LOCALLY** (Chrome Web Store).
-2. Close other YouTube tabs.
-3. Open **only** `https://www.youtube.com` and confirm you are logged in.
-4. Click the extension → **Export** → save as:
-
-```
-C:\path\to\cookies.txt
-```
-
-5. **Immediately** close that YouTube tab (do not open YouTube again yet).
-6. Upload (step 2) right away.
-
-Optional: also open Instagram logged-in, then export “all cookies” once for IG.
-
-## 2. Upload to VPS (PowerShell)
-
-```powershell
-scp -i "C:\path\to\your-ssh-key.key" `
-  "C:\path\to\cookies.txt" `
-  ubuntu@YOUR_SERVER_IP:/opt/all-media-downloader/cookies.txt
-
-ssh -i "C:\path\to\your-ssh-key.key" ubuntu@YOUR_SERVER_IP `
-  "chmod 600 /opt/all-media-downloader/cookies.txt; rm -f /opt/all-media-downloader/data/cookies.sanitized.txt /opt/all-media-downloader/data/cookies.runtime.txt; sudo systemctl restart all-media-downloader"
-```
-
-The bot builds:
-
-- `data/cookies.sanitized.txt` — media domains only (**source of truth**)
-- `data/cookies.runtime.txt` — disposable copy yt-dlp may rewrite
-
-Your uploaded `cookies.txt` is **never** overwritten by the bot.
-
-## 3. Verify
-
-```bash
-cd /opt/all-media-downloader
-export PATH="$HOME/.deno/bin:$PATH"
-# Always test with a COPY so the original is not mutated
-cp cookies.txt /tmp/yt-cookies-test.txt
-.venv/bin/yt-dlp --cookies /tmp/yt-cookies-test.txt --skip-download \
-  --print "%(id)s %(title).40s" "https://www.youtube.com/watch?v=jNQXAC9IVRw"
-```
-
-- Success → title prints; bot is ready.
-- `cookies are no longer valid` → re-export (you reopened YouTube, or Google already rotated).
-- `Sign in to confirm you're not a bot` with **fresh** cookies → VPS IP is hard-blocked; use a residential `PROXY=` in `.env` or re-export again from a secondary account.
-
-## 4. Security
-
-- Never commit `cookies.txt` to git
-- `chmod 600` on the server
-- Rotate/revoke if leaked
-- Use a throwaway Google account if possible
-
-## 5. Keep yt-dlp fresh
-
-```bash
-cd /opt/all-media-downloader
-.venv/bin/pip install -U "yt-dlp[default]"
-sudo systemctl restart all-media-downloader
-```
-
-## 6. If cookies keep dying within minutes
-
-Datacenter IPs are treated as bots. Options:
-
-1. Re-export more carefully (secondary account, no browser use after export)
-2. Set a **residential HTTP/SOCKS proxy** in `/opt/all-media-downloader/.env`:
-
-```env
-PROXY=socks5://user:pass@host:port
-```
-
-Then `sudo systemctl restart all-media-downloader`.
+If authenticated extraction fails, first verify the source jar is current using a secure, local test copy. Do not update yt-dlp or restart production solely as an automatic response; review the change and use the normal tested deployment process in [Operations](OPERATIONS.md).

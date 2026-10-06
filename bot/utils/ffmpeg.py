@@ -24,21 +24,31 @@ def _candidate_bins() -> list[Path]:
     env = os.getenv("FFMPEG_LOCATION") or os.getenv("FFMPEG_PATH")
     if env:
         p = Path(env)
-        if p.is_file():
-            dirs.append(p.parent)
-        else:
-            dirs.append(p)
+        try:
+            if p.is_file():
+                dirs.append(p.parent)
+            else:
+                dirs.append(p)
+        except OSError:
+            # A stale or inaccessible optional override must not prevent the
+            # normal PATH and common-installation search from running.
+            logger.debug("Cannot inspect configured FFmpeg path %s", p, exc_info=True)
 
     # WinGet Gyan.FFmpeg package (Windows)
     winget_pkg = local / "Microsoft" / "WinGet" / "Packages"
-    if winget_pkg.is_dir():
-        for pkg in winget_pkg.glob("Gyan.FFmpeg*"):
-            for bin_dir in pkg.glob("**/bin"):
-                if (bin_dir / "ffmpeg.exe").exists() or (bin_dir / "ffmpeg").exists():
-                    dirs.append(bin_dir)
-        # Scoop / other layouts
-        for exe in winget_pkg.glob("**/ffmpeg.exe"):
-            dirs.append(exe.parent)
+    try:
+        if winget_pkg.is_dir():
+            for pkg in winget_pkg.glob("Gyan.FFmpeg*"):
+                for bin_dir in pkg.glob("**/bin"):
+                    if (bin_dir / "ffmpeg.exe").exists() or (bin_dir / "ffmpeg").exists():
+                        dirs.append(bin_dir)
+            # Scoop / other layouts
+            for exe in winget_pkg.glob("**/ffmpeg.exe"):
+                dirs.append(exe.parent)
+    except OSError:
+        # WinGet is an optional discovery source. Restricted profiles can
+        # deny even stat/list access; keep checking PATH and standard roots.
+        logger.debug("Cannot inspect WinGet FFmpeg packages at %s", winget_pkg, exc_info=True)
 
     # Common install roots
     for root in (
@@ -57,8 +67,11 @@ def _candidate_bins() -> list[Path]:
 
     # WinGet Links folder
     links = local / "Microsoft" / "WinGet" / "Links"
-    if links.is_dir():
-        dirs.append(links)
+    try:
+        if links.is_dir():
+            dirs.append(links)
+    except OSError:
+        logger.debug("Cannot inspect WinGet links at %s", links, exc_info=True)
 
     return dirs
 
@@ -72,10 +85,15 @@ def find_ffmpeg() -> Path | None:
     # 0. An explicit FFMPEG_LOCATION / FFMPEG_PATH wins over whatever is on
     #    PATH, and may name the binary itself (e.g. /opt/ff/ffmpeg7).
     env = os.getenv("FFMPEG_LOCATION") or os.getenv("FFMPEG_PATH")
-    if env and Path(env).is_file():
-        _ensure_path(Path(env).parent)
-        logger.info("FFmpeg from FFMPEG_LOCATION: %s", env)
-        return Path(env)
+    if env:
+        try:
+            configured = Path(env)
+            if configured.is_file():
+                _ensure_path(configured.parent)
+                logger.info("FFmpeg from FFMPEG_LOCATION: %s", env)
+                return configured
+        except OSError:
+            logger.warning("Cannot inspect configured FFmpeg path %s; continuing discovery", env)
 
     # 1. PATH
     which = shutil.which("ffmpeg")

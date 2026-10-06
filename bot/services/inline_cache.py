@@ -109,12 +109,23 @@ def get(url: str, mode: str) -> dict[str, Any] | None:
         return _load().get(_key(url, mode))
 
 
-def put(url: str, mode: str, *, file_id: str, kind: str, title: str = "") -> None:
+def put(
+    url: str,
+    mode: str,
+    *,
+    file_id: str,
+    kind: str,
+    title: str = "",
+    performer: str = "",
+) -> None:
     with _lock:
         data = _load()
-        data[_key(url, mode)] = {
+        entry = {
             "file_id": file_id, "kind": kind, "title": title[:200], "t": time.time(),
         }
+        if performer:
+            entry["performer"] = performer[:64]
+        data[_key(url, mode)] = entry
         links = [(k, v) for k, v in data.items() if not k.startswith("meta|")]
         if len(links) > _MAX_ENTRIES:
             # Drop the oldest tenth in one go rather than one per write; the

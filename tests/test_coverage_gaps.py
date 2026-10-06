@@ -394,8 +394,42 @@ class TestCandidateBins:
         assert len(dirs) >= 10  # common roots + winget links
         assert Path("/usr/bin") in dirs
 
+    def test_inaccessible_winget_roots_do_not_abort_discovery(self, monkeypatch, tmp_path):
+        local = tmp_path / "local"
+        monkeypatch.setenv("LOCALAPPDATA", str(local))
+        monkeypatch.delenv("FFMPEG_LOCATION", raising=False)
+        monkeypatch.delenv("FFMPEG_PATH", raising=False)
+        packages = local / "Microsoft" / "WinGet" / "Packages"
+        links = local / "Microsoft" / "WinGet" / "Links"
+        original = Path.is_dir
+
+        def denied(path):
+            if path in (packages, links):
+                raise PermissionError("access denied")
+            return original(path)
+
+        monkeypatch.setattr(Path, "is_dir", denied)
+        dirs = ff._candidate_bins()
+        assert Path("/usr/bin") in dirs
+
 
 class TestFindFfmpeg:
+    def test_inaccessible_explicit_path_falls_back_to_path_search(self, monkeypatch, tmp_path):
+        configured = tmp_path / "restricted" / "ffmpeg.exe"
+        bindir = tmp_path / "bin"
+        fallback = bindir / "ffmpeg.exe"
+        original = Path.is_file
+        monkeypatch.setenv("FFMPEG_LOCATION", str(configured))
+        monkeypatch.setattr(ff.shutil, "which", lambda name: str(fallback))
+
+        def denied(path):
+            if path == configured:
+                raise PermissionError("access denied")
+            return original(path)
+
+        monkeypatch.setattr(Path, "is_file", denied)
+        assert ff.find_ffmpeg() == fallback
+
     def test_found_on_path(self, monkeypatch, tmp_path):
         bindir = tmp_path / "bin"
         bindir.mkdir()

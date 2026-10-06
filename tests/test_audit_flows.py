@@ -66,6 +66,9 @@ class TestPrivacyAndGroups:
     def test_logs_hash_users_and_drop_query_strings(self):
         assert redact.uid(123) == redact.uid(123) and "123" not in redact.uid(123)
         assert redact.url("https://youtu.be/x?si=TRACK&t=1") == "https://youtu.be/x"
+        safe = redact.url("https://user:secret@example.org/media?sig=private")
+        assert safe == "https://example.org/media"
+        assert "user" not in safe and "secret" not in safe and "private" not in safe
 
 
 def test_unreadable_link_gives_the_download_back():

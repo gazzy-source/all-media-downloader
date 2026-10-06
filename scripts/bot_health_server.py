@@ -9,7 +9,7 @@ Health endpoint for Uptime Kuma.
     "systemctl is-active" never noticed.
 "degraded" (503) when it runs but something it depends on is broken:
   - polling stopped, the PO-token provider or the WARP proxy is unreachable,
-  - the YouTube warm-up failed 3 times in a row, or the disk is nearly full.
+  - the YouTube warm-up failed 2 times in a row, or the disk is nearly full.
 
 Results are cached for a few seconds: each check costs a subprocess and two
 local connections, and this endpoint must stay cheap to poll.
@@ -17,6 +17,8 @@ local connections, and this endpoint must stay cheap to poll.
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 import shutil
 import socket
@@ -36,6 +38,7 @@ PORT = int(os.getenv("HEALTH_PORT", "9123"))
 HEARTBEAT_MAX_AGE = 120
 MIN_FREE_BYTES = 1 << 30  # 1 GB
 CACHE_SECONDS = 5
+logger = logging.getLogger(__name__)
 
 
 def _env(name: str) -> str | None:
@@ -72,11 +75,20 @@ def proxy_up() -> bool:
     proxy = _env("PROXY")
     if not proxy:
         return True
-    p = urlsplit(proxy)
-    if not p.hostname or not p.port:
-        return True
     try:
-        with socket.create_connection((p.hostname, p.port), timeout=3):
+        p = urlsplit(proxy)
+        host = p.hostname
+        port = p.port
+        if port is None:
+            port = {"http": 80, "https": 443, "socks5": 1080, "socks5h": 1080}.get(
+                p.scheme.lower()
+            )
+    except ValueError:
+        return False
+    if not host or not port:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=3):
             return True
     except OSError:
         return False
@@ -94,7 +106,8 @@ def service_active() -> bool:
 def heartbeat() -> dict:
     data_dir = Path(_env("DATA_DIR") or APP / "data")
     try:
-        return json.loads((data_dir / "heartbeat.json").read_text(encoding="utf-8"))
+        data = json.loads((data_dir / "heartbeat.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
@@ -102,21 +115,37 @@ def heartbeat() -> dict:
 def check() -> tuple[int, dict]:
     active = service_active()
     hb = heartbeat()
-    age = time.time() - float(hb.get("ts") or 0)
-    alive = active and age < HEARTBEAT_MAX_AGE
-    free = shutil.disk_usage(APP).free
+    try:
+        ts = float(hb.get("ts"))
+        age = time.time() - ts
+        if not math.isfinite(age) or age < 0:
+            age = None
+    except (TypeError, ValueError, OverflowError):
+        age = None
+    alive = active and age is not None and age < HEARTBEAT_MAX_AGE
+    try:
+        free = shutil.disk_usage(APP).free
+    except OSError as e:
+        logger.warning("health disk check failed (%s)", type(e).__name__)
+        free = 0  # unknown disk headroom must not be reported as healthy
+    try:
+        warmup_fail_streak = int(hb.get("warmup_fail_streak") or 0)
+        if warmup_fail_streak < 0:
+            warmup_fail_streak = 2  # invalid data must not report healthy
+    except (TypeError, ValueError, OverflowError):
+        warmup_fail_streak = 2
     checks = {
         "active": active,
-        "heartbeat_age_s": round(age) if hb else None,
+        "heartbeat_age_s": round(age) if age is not None else None,
         "polling": bool(hb.get("polling")),
         "pot_provider": pot_provider_up(),
         "proxy": proxy_up(),
-        "youtube_warmup_fail_streak": hb.get("warmup_fail_streak", 0),
+        "youtube_warmup_fail_streak": warmup_fail_streak,
         "disk_free_gb": round(free / (1 << 30), 1),
         "queue": {"running": hb.get("queue_running"), "waiting": hb.get("queue_waiting")},
     }
     degraded = not (checks["polling"] and checks["pot_provider"] and checks["proxy"]
-                    and checks["youtube_warmup_fail_streak"] < 3
+                    and checks["youtube_warmup_fail_streak"] < 2
                     and free >= MIN_FREE_BYTES)
     status = "down" if not alive else ("degraded" if degraded else "ok")
     return (200 if status == "ok" else 503), {"status": status, "service": SERVICE, **checks}

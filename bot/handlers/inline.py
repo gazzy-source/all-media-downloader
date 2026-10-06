@@ -108,7 +108,7 @@ async def _prefetch(url: str) -> None:
         async with _PREFETCH_SLOTS:
             await asyncio.wait_for(download_manager.extract_info(url), 90)
     except Exception as e:  # best effort: the download extracts by itself
-        logger.debug("inline prefetch skipped for %s: %s", url[:80], e)
+        logger.debug("inline prefetch skipped for %s (%s)", redact.url(url), type(e).__name__)
     finally:
         _PREFETCHING.discard(url)
 
@@ -744,7 +744,14 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
         # file_id would make every later inline answer for this link fail as
         # a whole) — and only if it IS the promised quality, not a fallback.
         if inline_cache.good_enough(mode, INLINE_QUALITY, result):
-            inline_cache.put(url, _key(mode), file_id=file_id, kind=kind, title=title)
+            inline_cache.put(
+                url,
+                _key(mode),
+                file_id=file_id,
+                kind=kind,
+                title=title,
+                performer=(getattr(result, "artist", None) or "") if kind == "audio" else "",
+            )
         if STORAGE_CHAT_ID is None:
             await _quiet_delete(context, chat, sent.message_id)
         record_download(user_id, url, title, platform, mode, INLINE_QUALITY, True, file_size=size)

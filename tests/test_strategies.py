@@ -106,10 +106,21 @@ class TestExtractInfoSync:
         assert dl._YT_WINNER_META == 2
         assert dl._YT_WINNER_DL == 0
 
-    def test_bot_wall_errors_retry_then_raise(self, fake_ydl, monkeypatch):
-        fake_ydl.fail_on = {"visionos", "default", "android", "android_vr"}
+    def test_youtube_bot_wall_stops_after_two_attempts(self, fake_ydl, monkeypatch):
+        calls = []
+
+        def bot_wall(self, url, download=False):
+            calls.append(FakeYDL.opts_client())
+            raise dl.yt_dlp.utils.DownloadError(
+                "Sign in to confirm you're not a bot"
+            )
+
+        monkeypatch.setattr(dl, "PROXY", "")
+        monkeypatch.setattr(dl, "rotate_warp_ip", lambda: False)
+        monkeypatch.setattr(FakeYDL, "extract_info", bot_wall)
         with pytest.raises(dl.yt_dlp.utils.DownloadError):
             dl._extract_info_sync("https://www.youtube.com/watch?v=abc")
+        assert len(calls) == 2, "do not burn the remaining clients after repeated IP-level denial"
 
     def test_meta_cache_hit_avoids_extract(self, fake_ydl, monkeypatch):
         url = "https://www.youtube.com/watch?v=cached"
@@ -215,6 +226,22 @@ class TestDownloadStrategyFallback:
         with pytest.raises(dl.yt_dlp.utils.DownloadError):
             self._run("https://vimeo.com/123", set())
         assert calls["n"] == 1, "a permanent error must not burn every strategy"
+
+    def test_youtube_bot_wall_stops_after_two_attempts(self, fake_ydl, monkeypatch):
+        calls = []
+
+        def bot_wall(self, url, download=False):
+            calls.append(FakeYDL.opts_client())
+            raise dl.yt_dlp.utils.DownloadError(
+                "Sign in to confirm you're not a bot"
+            )
+
+        monkeypatch.setattr(dl, "PROXY", "")
+        monkeypatch.setattr(dl, "rotate_warp_ip", lambda: False)
+        monkeypatch.setattr(FakeYDL, "extract_info", bot_wall)
+        with pytest.raises(dl.yt_dlp.utils.DownloadError):
+            self._run("https://www.youtube.com/watch?v=abc", set())
+        assert len(calls) == 2, "do not burn the remaining clients after repeated IP-level denial"
 
 
 class TestNonYtMetaTransportRetry:

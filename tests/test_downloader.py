@@ -823,22 +823,27 @@ class TestSelectiveProxy:
 
 
 class TestBotWallAdviceMatchesSetup:
-    """Users get what to do; the operator's fix (matched to the setup) is logged."""
+    """The operator gets an accurate upstream-refusal diagnosis without bypass advice."""
 
     MSG = "Sign in to confirm you're not a bot"
 
-    def test_without_provider_logs_running_one(self, monkeypatch, caplog):
+    def test_without_provider_logs_upstream_refusal(self, monkeypatch, caplog):
         monkeypatch.setattr(dl, "pot_provider_available", lambda: False)
         with caplog.at_level("WARNING"):
             dl.DownloadManager._friendly_error(self.MSG)
-        assert "PO-token provider (bgutil" in caplog.text
+        assert "upstream acceptance" in caplog.text
+        assert "stop retries" in caplog.text
+        assert "residential" not in caplog.text.lower()
 
-    def test_with_provider_logs_the_ip_instead(self, monkeypatch, caplog):
-        """Measured on the VPS: provider mints tokens, YouTube still refuses."""
+    def test_with_provider_logs_that_tokens_do_not_guarantee_acceptance(self, monkeypatch, caplog):
+        """A healthy token provider cannot override YouTube's upstream decision."""
         monkeypatch.setattr(dl, "pot_provider_available", lambda: True)
         with caplog.at_level("WARNING"):
             dl.DownloadManager._friendly_error(self.MSG)
-        assert "PROXY" in caplog.text
+        assert "provider being available" in caplog.text
+        assert "upstream access refusal" in caplog.text
+        assert "PROXY" not in caplog.text
+        assert "residential" not in caplog.text.lower()
         assert "docker-compose.yml" not in caplog.text, "stale advice for this host"
 
     @pytest.mark.parametrize("msg", [
@@ -1316,5 +1321,4 @@ class TestVideoRequestNeverReturnsAudioOnly:
             for q in ("480", "720", "1080", "max"):
                 f = dl._video_format_for_host(host, q)
                 assert "bv*+ba" in f, f"{host}/{q}: {f}"
-
 

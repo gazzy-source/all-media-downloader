@@ -514,6 +514,14 @@ def _platform_flags(host: str) -> dict[str, bool]:
     }
 
 
+def _is_youtube_bot_wall(message: str) -> bool:
+    """Recognize YouTube's explicit IP-level anti-bot response."""
+    low = (message or "").lower().replace("’", "'")
+    return (
+        "sign in to confirm" in low and "not a bot" in low
+    ) or "confirm you're not a bot" in low or "confirm you are not a bot" in low
+
+
 def _base_opts(
     *,
     host: str = "",
@@ -923,7 +931,9 @@ def _download_match_filter(info: dict[str, Any], *, incomplete: bool = False) ->
     # media at a private address, which the up-front URL check never sees.
     for key in ("url", "manifest_url"):
         target = info.get(key)
-        if isinstance(target, str) and target.startswith("http"):
+        # URI schemes are case-insensitive. Do not let an extracted uppercase
+        # HTTP(S) URL bypass the private-address guard.
+        if isinstance(target, str) and target.lower().startswith(("http://", "https://")):
             try:
                 check_public_url(target)
             except UnresolvableURLError:
@@ -1259,6 +1269,7 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
         base_strats = _yt_strategies(has_cookies=bool(cookie))
         strats, orig_indices = _order_yt_strategies(base_strats, download=False)
         last_err: Exception | None = None
+        bot_wall_failures = 0
         # Shared across the ladder: a dead relay must not sleep at every rung.
         meta_proxy_retries = 0
         # Self-imposed deadline, slightly inside the caller's asyncio cap.
@@ -1306,6 +1317,16 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
             except yt_dlp.utils.DownloadError as e:
                 last_err = e
                 err = str(e).lower()
+                if _is_youtube_bot_wall(err):
+                    bot_wall_failures += 1
+                    if bot_wall_failures >= 2:
+                        logger.warning(
+                            "YouTube anti-bot refusal persisted across two attempts; "
+                            "stopping the metadata strategy ladder"
+                        )
+                        raise
+                else:
+                    bot_wall_failures = 0
                 if (
                     "video unavailable" in err
                     or "private video" in err
@@ -1670,7 +1691,7 @@ class DownloadManager:
                 and not (cancel is not None and cancel.is_set())
                 and self._looks_like_image_only_error(result.error or "")
             ):
-                logger.info("Retrying as image download for %s", url)
+                logger.info("Retrying as image download for %s", redact.url(url))
                 await _emit_progress(progress_cb, 5, "Retrying as image…")
                 result = await loop.run_in_executor(
                     self._executor,
@@ -2042,7 +2063,7 @@ class DownloadManager:
             )
         except (JobRefused, JobAborted) as e:
             # Deliberate refusals / limits: expected, no traceback needed.
-            logger.warning("Download refused for %s: %s", url[:80], e)
+            logger.warning("Download refused for %s: %s", redact.url(url), e)
             self._cleanup_dir(work_dir)
             if isinstance(e, JobAborted):
                 # Concurrent fragment threads can still be finishing a write
@@ -2056,9 +2077,9 @@ class DownloadManager:
             msg = str(e).split("\n")[-1][:300]
             # Expected failures: keep logs light for speed/noise
             if self._looks_like_image_only_error(msg) or "403" in msg.lower():
-                logger.warning("Download error for %s: %s", url[:80], msg[:160])
+                logger.warning("Download error for %s: %s", redact.url(url), msg[:160])
             else:
-                logger.exception("Download error for %s", url)
+                logger.exception("Download error for %s", redact.url(url))
             self._cleanup_dir(work_dir)
             return DownloadResult(success=False, error=self._friendly_error(msg), mode=mode, quality=quality)
         except Exception as e:
@@ -2134,6 +2155,7 @@ class DownloadManager:
         # a persistently down relay still fails fast instead of sleeping per step.
         proxy_retries = 0
         warp_rotated = False
+        bot_wall_failures = 0
         # No NEW attempt starts past this; an in-flight transfer still finishes.
         attempt_deadline = time.monotonic() + DOWNLOAD_ATTEMPT_BUDGET
         for si, strat in enumerate(strategies):
@@ -2218,6 +2240,16 @@ class DownloadManager:
                 except yt_dlp.utils.DownloadError as e:
                     last_err = e
                     err = str(e).lower()
+                    if _is_youtube_bot_wall(err):
+                        bot_wall_failures += 1
+                        if bot_wall_failures >= 2:
+                            logger.warning(
+                                "YouTube anti-bot refusal persisted across two attempts; "
+                                "stopping the download strategy ladder"
+                            )
+                            raise
+                    else:
+                        bot_wall_failures = 0
                     if "no video formats" in err or "only images" in err:
                         if not is_yt:
                             raise
@@ -2539,7 +2571,7 @@ class DownloadManager:
             if dest.exists() and dest.stat().st_size > 0:
                 return dest
         except Exception:
-            logger.exception("Failed to fetch image %s", url)
+            logger.exception("Failed to fetch image %s", redact.url(url))
         dest.unlink(missing_ok=True)  # never leave a partial file behind
         return None
 
@@ -2561,24 +2593,22 @@ class DownloadManager:
             or "cookies are no longer valid" in low
         ):
             # Don't advise running a provider when one is already running — on a
-            # bot-walled datacenter IP it mints tokens fine and YouTube still
-            # refuses every client, so the only real remedy left is a cleaner IP.
-            # Users get what to do; the operator's fix goes to the log.
+            # bot-walled host it may mint tokens correctly while YouTube still
+            # refuses requests. Do not encourage egress rotation or more retries.
             if pot_provider_available():
                 _operator_hint(
-                    "YouTube bot-walled every client even with a PO-token "
-                    "provider running: the IP is blocked — set PROXY to a "
-                    "residential/mobile IP (PROXY_HOSTS limits it). Public "
-                    "videos need no cookies.")
+                    "YouTube rejected requests from this host despite the PO-token "
+                    "provider being available. Treat this as an upstream access "
+                    "refusal; stop retries and wait for recovery. Public videos "
+                    "do not require cookies.")
             else:
                 _operator_hint(
-                    "YouTube bot-walled every client: run a PO-token provider "
-                    "(bgutil, see docker-compose.yml), else set PROXY to a "
-                    "clean IP. Public videos need no cookies.")
+                    "YouTube rejected requests from this host. A PO-token provider "
+                    "does not guarantee upstream acceptance; stop retries and wait "
+                    "for recovery. Public videos do not require cookies.")
             return (
                 "YouTube is refusing the bot right now (its anti-bot check).\n\n"
-                "Nothing is wrong with your link — please try again in a few "
-                "minutes."
+                "Nothing is wrong with your link — please try again later."
             )
         # Instagram's own wording leaked to users verbatim, truncated mid
         # sentence and telling them to pass --cookies-from-browser — a yt-dlp
@@ -2695,8 +2725,7 @@ class DownloadManager:
                                "(bgutil) or a cleaner IP.")
                 return (
                     "YouTube refused the download this time.\n\n"
-                    "Nothing is wrong with your link — please try again in a "
-                    "few minutes."
+                    "Nothing is wrong with your link — please try again later."
                 )
             return (
                 "The site refused the bot's request — it may block the bot, or "

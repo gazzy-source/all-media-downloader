@@ -184,6 +184,105 @@ def test_health_endpoint_flags_a_dead_po_token_provider(monkeypatch):
     assert r.code == 503 and b"degraded" in r.body
 
 
+def test_health_endpoint_treats_malformed_heartbeat_as_down(monkeypatch, tmp_path):
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "health_malformed", Path(__file__).resolve().parents[1] / "scripts" / "bot_health_server.py")
+    health = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(health)
+    (tmp_path / "heartbeat.json").write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(health, "_env", lambda name: str(tmp_path) if name == "DATA_DIR" else None)
+    monkeypatch.setattr(health, "service_active", lambda: True)
+    monkeypatch.setattr(health, "pot_provider_up", lambda: True)
+    monkeypatch.setattr(health, "proxy_up", lambda: True)
+
+    assert health.heartbeat() == {}
+    code, body = health.check()
+    assert code == 503 and body["status"] == "down"
+    assert body["heartbeat_age_s"] is None
+
+
+def test_health_endpoint_fails_closed_on_invalid_heartbeat_fields(monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "health_invalid_fields", Path(__file__).resolve().parents[1] / "scripts" / "bot_health_server.py")
+    health = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(health)
+    monkeypatch.setattr(health, "service_active", lambda: True)
+    monkeypatch.setattr(health, "pot_provider_up", lambda: True)
+    monkeypatch.setattr(health, "proxy_up", lambda: True)
+    monkeypatch.setattr(health, "heartbeat", lambda: {
+        "ts": float("nan"), "polling": True, "warmup_fail_streak": "invalid",
+    })
+
+    code, body = health.check()
+    assert code == 503 and body["status"] == "down"
+    assert body["heartbeat_age_s"] is None
+    assert body["youtube_warmup_fail_streak"] == 2
+
+
+def test_health_endpoint_marks_configured_invalid_proxy_down(monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "health_bad_proxy", Path(__file__).resolve().parents[1] / "scripts" / "bot_health_server.py")
+    health = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(health)
+    monkeypatch.setattr(health, "_env", lambda name: "not-a-proxy" if name == "PROXY" else None)
+    assert health.proxy_up() is False
+
+
+def test_health_endpoint_degrades_when_disk_usage_cannot_be_read(monkeypatch):
+    import importlib.util
+    import time as _t
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "health_disk_error", Path(__file__).resolve().parents[1] / "scripts" / "bot_health_server.py")
+    health = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(health)
+    monkeypatch.setattr(health, "service_active", lambda: True)
+    monkeypatch.setattr(health, "pot_provider_up", lambda: True)
+    monkeypatch.setattr(health, "proxy_up", lambda: True)
+    monkeypatch.setattr(health, "heartbeat", lambda: {"ts": _t.time(), "polling": True})
+
+    def unreadable(_path):
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr(health.shutil, "disk_usage", unreadable)
+    code, body = health.check()
+    assert code == 503 and body["status"] == "degraded"
+    assert body["disk_free_gb"] == 0.0
+
+
+def test_health_degrades_after_two_consecutive_youtube_warmup_failures(monkeypatch):
+    import importlib.util
+    import time as _t
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "health_youtube_failures", Path(__file__).resolve().parents[1] / "scripts" / "bot_health_server.py")
+    health = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(health)
+    monkeypatch.setattr(health, "service_active", lambda: True)
+    monkeypatch.setattr(health, "pot_provider_up", lambda: True)
+    monkeypatch.setattr(health, "proxy_up", lambda: True)
+    state = {"ts": _t.time(), "polling": True, "warmup_fail_streak": 1}
+    monkeypatch.setattr(health, "heartbeat", lambda: state)
+
+    code, body = health.check()
+    assert code == 200 and body["status"] == "ok"
+
+    state["warmup_fail_streak"] = 2
+    code, body = health.check()
+    assert code == 503 and body["status"] == "degraded"
+
+
 def test_user_bot_wall_never_rotates_under_someone_elses_transfer(monkeypatch):
     import bot.services.downloader as dl
     from bot.services.dl_queue import download_queue

@@ -549,7 +549,7 @@ async def start_url_flow(
             download_manager.extract_info(url), timeout=EXTRACT_TIMEOUT
         )
     except asyncio.TimeoutError:
-        logger.warning("extract_info timed out after %ss: %s", EXTRACT_TIMEOUT, url[:80])
+        logger.warning("extract_info timed out after %ss: %s", EXTRACT_TIMEOUT, redact.url(url))
         body = (
             "⏱ <b>Took too long to read this link</b>\n\n"
             f"Gave up after {EXTRACT_TIMEOUT}s — the platform is slow or "
@@ -1150,7 +1150,7 @@ async def _refuse_private_url(msg, url: str, *, quiet: bool = False) -> bool:
     except UnresolvableURLError:
         return False  # a typo or dead domain is not "private": yt-dlp will say so
     except UnsafeURLError:
-        logger.warning("Refused non-public URL %s", url[:80])
+        logger.warning("Refused non-public URL %s", redact.url(url))
         if not quiet:
             try:
                 await msg.reply_text(f"🚫 {PRIVATE_URL_ERROR}")

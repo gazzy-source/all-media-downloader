@@ -108,7 +108,7 @@ async def _prefetch(url: str) -> None:
         async with _PREFETCH_SLOTS:
             await asyncio.wait_for(download_manager.extract_info(url), 90)
     except Exception as e:  # best effort: the download extracts by itself
-        logger.debug("inline prefetch skipped for %s: %s", url[:80], e)
+        logger.debug("inline prefetch skipped for %s (%s)", redact.url(url), type(e).__name__)
     finally:
         _PREFETCHING.discard(url)
 

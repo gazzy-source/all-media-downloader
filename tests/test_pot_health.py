@@ -160,6 +160,18 @@ class TestFriendlyErrorGaps:
         """
         out = self._f("[youtube] x: Sign in to confirm you’re not a bot")
         assert "anti-bot" in out
+        assert "try again later" in out.lower()
+        assert "few minutes" not in out.lower()
+
+    def test_bot_wall_operator_hint_does_not_recommend_egress_rotation(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(dl, "pot_provider_available", lambda: True)
+        with caplog.at_level("WARNING", logger="bot.services.downloader"):
+            self._f("[youtube] x: Sign in to confirm you're not a bot")
+        assert "stop retries" in caplog.text
+        assert "residential" not in caplog.text.lower()
+        assert "rotate" not in caplog.text.lower()
 
 
 class TestMetaPlatformMessages:

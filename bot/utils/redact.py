@@ -24,4 +24,7 @@ def url(u: str | None, limit: int = 100) -> str:
         return u.split("?", 1)[0][:limit]
     if not p.scheme:
         return u.split("?", 1)[0][:limit]
-    return f"{p.scheme}://{p.netloc}{p.path}"[:limit]
+    # Credentials are legal in a URL authority too; never preserve user-info
+    # when a sanitized URL is included in a log record.
+    netloc = p.netloc.rsplit("@", 1)[-1]
+    return f"{p.scheme}://{netloc}{p.path}"[:limit]

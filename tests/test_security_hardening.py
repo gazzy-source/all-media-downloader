@@ -44,6 +44,18 @@ class TestDownloadMatchFilter:
             dl._download_match_filter({"url": "http://127.0.0.1:9123/health"})
         assert dl._download_match_filter({"url": "https://cdn.example/v.mp4"}) is None
 
+    @pytest.mark.parametrize("target", [
+        "HTTP://127.0.0.1:9123/health",
+        "HtTpS://127.0.0.1:9123/health",
+    ])
+    def test_mixed_case_media_scheme_cannot_bypass_private_url_guard(self, monkeypatch, target):
+        def guard(url):
+            raise dl.UnsafeURLError("private")
+
+        monkeypatch.setattr(dl, "check_public_url", guard)
+        with pytest.raises(yt_dlp.utils.DownloadError, match="private"):
+            dl._download_match_filter({"url": target})
+
 
 class TestDownloadSyncGuards:
     @staticmethod

@@ -9,6 +9,7 @@ import time
 from urllib.request import Request
 
 from bot.utils.helpers import IMAGE_EXTS
+from bot.utils import redact
 from bot.utils.deadline import deadline
 from bot.utils.safe_fetch import open_public as urlopen
 
@@ -106,10 +107,10 @@ def _detect_pinterest(url: str) -> str:
     has_image = bool(html and _IMAGE_PIN_RE.search(html))
 
     if has_video:
-        logger.info("Pinterest VIDEO (html): %s", url[:80])
+        logger.info("Pinterest VIDEO (html): %s", redact.url(url))
         return "video"
     if has_image and not has_video:
-        logger.info("Pinterest IMAGE (html): %s", url[:80])
+        logger.info("Pinterest IMAGE (html): %s", redact.url(url))
         return "image"
 
     # HTML shell often has no pin media — ask yt-dlp (skip_download)
@@ -143,7 +144,7 @@ def _detect_via_ytdlp(url: str) -> str:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
         if not info:
-            logger.info("probe empty → image: %s", url[:80])
+            logger.info("probe empty → image: %s", redact.url(url))
             return "image"
         formats = info.get("formats") or []
         has_vid = any(
@@ -152,23 +153,23 @@ def _detect_via_ytdlp(url: str) -> str:
         )
         # duration / ext hints
         if info.get("duration") or has_vid:
-            logger.info("probe VIDEO: %s", url[:80])
+            logger.info("probe VIDEO: %s", redact.url(url))
             return "video"
         ext = (info.get("ext") or "").lower()
         if ext in IMAGE_EXTS or info.get("thumbnail"):
-            logger.info("probe IMAGE: %s", url[:80])
+            logger.info("probe IMAGE: %s", redact.url(url))
             return "image"
         # No usable video formats
         if not formats or not has_vid:
-            logger.info("probe no formats → IMAGE: %s", url[:80])
+            logger.info("probe no formats → IMAGE: %s", redact.url(url))
             return "image"
         return "video"  # pragma: no cover — unreachable (has_vid ⇒ returned above)
     except Exception as e:
         err = str(e).lower()
         if "no video formats" in err or "only images" in err:
-            logger.info("probe exception → IMAGE: %s", url[:80])
+            logger.info("probe exception → IMAGE: %s", redact.url(url))
             return "image"
-        logger.warning("probe failed (%s) → video default: %s", e, url[:80])
+        logger.warning("probe failed (%s) → video default: %s", type(e).__name__, redact.url(url))
         return "video"
 
 
@@ -216,7 +217,7 @@ def _fetch_html(url: str) -> str:
             data = resp.read(1_500_000)
         return data.decode("utf-8", "replace")
     except Exception as e:
-        logger.warning("media probe failed for %s: %s", url[:80], e)
+        logger.warning("media probe failed for %s (%s)", redact.url(url), type(e).__name__)
         return ""
 
 

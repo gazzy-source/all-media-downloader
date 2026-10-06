@@ -24,6 +24,11 @@ _SANDBOX = Path(tempfile.mkdtemp(prefix="amb_test_"))
 atexit.register(shutil.rmtree, _SANDBOX, ignore_errors=True)
 os.environ["TEMP_DIR"] = str(_SANDBOX / "temp")
 os.environ["DOWNLOAD_DIR"] = str(_SANDBOX / "downloads")
+# Do not let the developer machine's optional FFmpeg installation or WinGet
+# tree influence tests (these paths may be private or unreadable in CI/sandbox).
+os.environ["LOCALAPPDATA"] = str(_SANDBOX / "localappdata")
+os.environ["FFMPEG_LOCATION"] = ""
+os.environ["FFMPEG_PATH"] = ""
 # Never the deployment's data/: running the suite on the server used to append
 # fake rows to the real history.json / stats.json and touch inflight.json.
 os.environ["DATA_DIR"] = str(_SANDBOX / "data")

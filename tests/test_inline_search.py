@@ -8,8 +8,9 @@ from types import SimpleNamespace
 import pytest
 from telegram import (
     InlineQueryResultAudio,
-    InlineQueryResultCachedVideo,
     InlineQueryResultVideo,
+    InputMediaAudio,
+    InputMediaVideo,
 )
 
 import bot.handlers.inline as inl
@@ -20,6 +21,10 @@ from tests.test_inline import FakeInlineQuery, InlineBot, _update
 
 HITS = [SearchHit(id=f"vid{i:08d}", title=f"Song {i}", channel="Chan", duration=200 + i,
                   views=1_500_000) for i in range(25)]
+
+
+async def _yes():
+    return True
 
 
 @pytest.fixture
@@ -87,10 +92,56 @@ class TestSearchResults:
         assert [r.id for r in results] == [f"sv:vid{i:08d}" for i in range(20, 25)]
         assert kw["next_offset"] is None
 
-    async def test_previously_fetched_video_comes_back_finished(self, env):
+    async def test_previously_fetched_video_still_has_rich_picker_presentation(self, env):
         inline_cache.put(HITS[0].url, inl._key("video"), file_id="DONE", kind="video", title="Song 0")
         q = await _ask(env, "video lofi beats")
-        assert isinstance(q.answers[0][0][0], InlineQueryResultCachedVideo)
+        result = q.answers[0][0][0]
+        assert isinstance(result, InlineQueryResultVideo)
+        assert result.id == "sv:vid00000000"
+        assert result.thumbnail_url == HITS[0].thumbnail
+        assert result.title == HITS[0].title
+        assert "Chan" in result.description
+        assert result.video_url.endswith("placeholder_v1.mp4?v=vid00000000")
+
+    async def test_cached_video_selection_swaps_without_queue_download_or_upload(self, env, monkeypatch):
+        inline_cache.put(HITS[0].url, inl._key("video"), file_id="DONE", kind="video", title="Song 0")
+        monkeypatch.setattr(inl, "check_public_url", lambda _url: None)
+        monkeypatch.setattr(inl.rate_limiter, "allow", lambda _uid: (True, 0))
+        monkeypatch.setattr(inl.jobs, "run_queued", lambda *a, **k: pytest.fail("must not enter queue"))
+        monkeypatch.setattr(inl.download_manager, "download",
+                            lambda **k: pytest.fail("must not download"))
+        monkeypatch.setattr(inl.download_manager, "cleanup_result_files", lambda _r: None)
+        monkeypatch.setattr(inl, "_is_public", lambda _url: _yes())
+        from bot.handlers import download as hd
+        monkeypatch.setattr(hd, "_send_media", lambda *a, **k: pytest.fail("must not upload"))
+
+        chosen = SimpleNamespace(result_id="sv:vid00000000", query="video lofi beats",
+                                 inline_message_id="IM", from_user=SimpleNamespace(id=7))
+        await inl.handle_chosen_inline_result(SimpleNamespace(chosen_inline_result=chosen), env.ctx)
+        assert len(env.ctx.bot.media_edits) == 1
+        assert isinstance(env.ctx.bot.media_edits[0][1], InputMediaVideo)
+        assert env.ctx.bot.media_edits[0][1].media == "DONE"
+
+    async def test_cached_audio_keeps_audio_placeholder_and_swaps_instantly(self, env, monkeypatch):
+        inline_cache.put(HITS[0].url, inl._key("audio"), file_id="AUD", kind="audio", title="Song 0")
+        q = await _ask(env, "lofi beats")
+        result = q.answers[0][0][0]
+        assert isinstance(result, InlineQueryResultAudio)
+        assert result.id == "sa:vid00000000" and result.performer == "Chan"
+        assert "preparing_audio" in result.audio_url
+
+        monkeypatch.setattr(inl, "check_public_url", lambda _url: None)
+        monkeypatch.setattr(inl.rate_limiter, "allow", lambda _uid: (True, 0))
+        monkeypatch.setattr(inl.jobs, "run_queued", lambda *a, **k: pytest.fail("must not enter queue"))
+        monkeypatch.setattr(inl.download_manager, "download",
+                            lambda **k: pytest.fail("must not download"))
+        monkeypatch.setattr(inl.download_manager, "cleanup_result_files", lambda _r: None)
+        monkeypatch.setattr(inl, "_is_public", lambda _url: _yes())
+        chosen = SimpleNamespace(result_id=result.id, query="lofi beats", inline_message_id="IM",
+                                 from_user=SimpleNamespace(id=7))
+        await inl.handle_chosen_inline_result(SimpleNamespace(chosen_inline_result=chosen), env.ctx)
+        assert isinstance(env.ctx.bot.media_edits[0][1], InputMediaAudio)
+        assert env.ctx.bot.media_edits[0][1].media == "AUD"
 
     async def test_typing_letter_by_letter_searches_once(self, env, monkeypatch):
         monkeypatch.setattr(inl, "_DEBOUNCE", 0.05)

@@ -6,8 +6,7 @@ Telegram wants an inline answer within seconds and gives no way to upload a
 file into an inline message afterwards — an edit may only reference a file_id.
 So the flow is:
 
-1. Answer at once, before any download, with two labelled placeholder photos
-   (or, for a link fetched before, the finished file straight from the cache).
+1. Answer at once, before any download, with two labelled placeholder photos.
 2. When the user picks one, Telegram reports the chosen result (inline feedback
    must be enabled in @BotFather). Download in the background, showing progress
    in the placeholder's caption.
@@ -30,12 +29,8 @@ from pathlib import Path
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InlineQueryResultCachedAudio,
-    InlineQueryResultCachedDocument,
-    InlineQueryResultCachedMpeg4Gif,
     InlineQueryResultCachedPhoto,
     InlineQueryResultAudio,
-    InlineQueryResultCachedVideo,
     InlineQueryResultVideo,
     InlineQueryResultsButton,
     InputFile,
@@ -123,7 +118,7 @@ def _key(mode: str) -> str:
 
 
 def _result_id(kind: str, url: str) -> str:
-    """kind: 'vp'/'ap' placeholder, 'vc'/'ac' cached. Max 64 bytes."""
+    """kind: 'vp'/'ap' placeholder. Max 64 bytes."""
     return f"{kind}:{hashlib.sha1(url.encode()).hexdigest()[:24]}"
 
 
@@ -298,7 +293,9 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     platform = platform_from_url(url)
-    if not (inline_cache.get(url, _key("video")) and inline_cache.get(url, _key("audio"))):
+    # A cache hit will be swapped in after selection. Avoid eagerly extracting
+    # the same URL just because the other media mode has not been cached yet.
+    if not (inline_cache.get(url, _key("video")) or inline_cache.get(url, _key("audio"))):
         task = asyncio.create_task(_prefetch(url))
         _BACKGROUND.add(task)
         task.add_done_callback(_BACKGROUND.discard)
@@ -306,10 +303,6 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     label = title or f"{platform} link"
     results = []
     for code, mode in MODES.items():
-        hit = inline_cache.get(url, _key(mode))
-        if hit:
-            results.append(_cached_result(code, mode, url, hit))
-            continue
         photo = await _placeholder_file_id(context, mode)
         if not photo:
             continue
@@ -332,27 +325,6 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Personal: results depend on what THIS bot has cached, not on the user,
     # but a short cache keeps a fresh upload from hiding behind an old answer.
     await _answer(q, results, cache_time=30)
-
-
-def _cached_result(code: str, mode: str, url: str, hit: dict):
-    rid = _result_id(f"{code}c", url)
-    caption = f"<b>{_esc(hit.get('title') or '')}</b>" if hit.get("title") else None
-    kind, fid = hit["kind"], hit["file_id"]
-    title = f"⚡ {'Video' if mode == 'video' else 'Audio'} · {hit.get('title') or 'ready'}"[:100]
-    if kind == "video":
-        return InlineQueryResultCachedVideo(id=rid, video_file_id=fid, title=title,
-                                            caption=caption, parse_mode=ParseMode.HTML)
-    if kind == "audio":
-        return InlineQueryResultCachedAudio(id=rid, audio_file_id=fid,
-                                            caption=caption, parse_mode=ParseMode.HTML)
-    if kind == "photo":
-        return InlineQueryResultCachedPhoto(id=rid, photo_file_id=fid, title=title,
-                                            caption=caption, parse_mode=ParseMode.HTML)
-    if kind == "animation":
-        return InlineQueryResultCachedMpeg4Gif(id=rid, mpeg4_file_id=fid, title=title,
-                                               caption=caption, parse_mode=ParseMode.HTML)
-    return InlineQueryResultCachedDocument(id=rid, document_file_id=fid, title=title,
-                                           caption=caption, parse_mode=ParseMode.HTML)
 
 
 async def _answer(
@@ -480,9 +452,6 @@ async def _prefetch_if_still_latest(uid: int, query_id: str, url: str) -> None:
 
 
 def _search_result(mode: str, h: "yt_search.SearchHit"):
-    hit = inline_cache.get(h.url, _key(mode))
-    if hit:  # fetched before: send the finished file itself, instantly
-        return _cached_result("v" if mode == "video" else "a", mode, h.url, hit)
     meta = " · ".join(x for x in (h.channel, yt_search.human_duration(h.duration),
                                   yt_search.human_views(h.views)) if x)
     caption = f"<b>{_esc(h.title[:200])}</b>"
@@ -552,7 +521,7 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
             return
         url = urls[0]
     else:
-        return  # a cached result was sent as finished media already
+        return  # unknown/stale result id; placeholders use vp/ap or sv/sa
     user_id, imid = ch.from_user.id, ch.inline_message_id
     me = context.bot.username or ""
     give_up = _open_bot_markup(me, f"dl_{put_url(url, user_id)}")
@@ -649,10 +618,12 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
     if job.cancelled:
         return
     hit = inline_cache.get(url, _key(mode))
-    if hit:  # fetched by someone else while this user was choosing
+    if hit:  # fetched before or by someone else while this user was choosing
+        logger.info("inline cache hit — swapping cached %s", mode)
         if await _swap_in(context, imid, hit["kind"], hit["file_id"], hit.get("title", "")):
             return
         inline_cache.forget(url, _key(mode))  # Telegram refused it: fetch afresh below
+    logger.info("inline cache miss — downloading %s", mode)
     if job.cancelled:
         return
 

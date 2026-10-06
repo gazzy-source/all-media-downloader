@@ -7,10 +7,10 @@ from types import SimpleNamespace
 import pytest
 from telegram import (
     InlineQueryResultCachedPhoto,
-    InlineQueryResultCachedVideo,
     InputMediaAudio,
     InputMediaVideo,
 )
+from telegram.error import BadRequest
 
 import bot.handlers.download as hd
 import bot.handlers.inline as inl
@@ -117,13 +117,27 @@ class TestInlineQuery:
             await inl.handle_inline_query(_update(inline_query=FakeInlineQuery("https://youtu.be/abc")), ctx)
         assert len(ctx.bot.photos) == 2
 
-    async def test_cached_link_answers_with_the_finished_file(self, ctx):
+    async def test_cached_link_answers_with_placeholders_for_inline_picker(self, ctx, monkeypatch, caplog):
+        caplog.set_level("INFO", logger=inl.logger.name)
         inline_cache.put("https://youtu.be/abc", inl._key("video"), file_id="VID1", kind="video", title="T")
         q = FakeInlineQuery("https://youtu.be/abc")
         await inl.handle_inline_query(_update(inline_query=q), ctx)
         results, _ = q.answers[0]
-        assert isinstance(results[0], InlineQueryResultCachedVideo)
-        assert results[0].video_file_id == "VID1" and results[0].id.startswith("vc:")
+        assert all(isinstance(r, InlineQueryResultCachedPhoto) for r in results)
+        assert [r.id[:3] for r in results] == ["vp:", "ap:"]
+        assert len(ctx.prefetched) == 0, "cache hit must not start extraction"
+
+        monkeypatch.setattr(inl.download_manager, "download",
+                            lambda **k: pytest.fail("cached selection must not download"))
+        monkeypatch.setattr(inl.download_queue, "run", lambda *a, **k: pytest.fail("must not queue"))
+        monkeypatch.setattr(hd, "_send_media", lambda *a, **k: pytest.fail("must not upload"))
+        await inl.handle_chosen_inline_result(
+            _update(chosen_inline_result=_chosen(results[0].id)), ctx)
+        assert len(ctx.bot.media_edits) == 1
+        assert isinstance(ctx.bot.media_edits[0][1], InputMediaVideo)
+        assert ctx.bot.media_edits[0][1].media == "VID1"
+        assert "inline cache hit" in caplog.text
+        assert "inline cache miss" not in caplog.text
 
     async def test_private_link_gets_no_results(self, ctx, monkeypatch):
         def refuse(url):
@@ -193,11 +207,31 @@ class TestChosenResult:
         assert modes == ["audio"]
         assert isinstance(ctx.bot.media_edits[0][1], InputMediaAudio)
 
-    async def test_cached_choice_needs_no_work(self, ctx, monkeypatch):
+    async def test_unknown_stale_result_id_needs_no_work(self, ctx, monkeypatch):
         monkeypatch.setattr(inl.download_manager, "download",
                             lambda **k: pytest.fail("must not download"))
-        await inl.handle_chosen_inline_result(_update(chosen_inline_result=_chosen("vc:x")), ctx)
+        await inl.handle_chosen_inline_result(_update(chosen_inline_result=_chosen("unknown:x")), ctx)
         assert ctx.bot.captions == [] and ctx.bot.media_edits == []
+
+    async def test_refused_cached_file_is_forgotten_then_downloaded(self, ctx, monkeypatch):
+        url = "https://youtu.be/abc"
+        inline_cache.put(url, inl._key("video"), file_id="STALE", kind="video", title="T")
+        calls = []
+
+        async def reject_cached(*, inline_message_id=None, media=None, **kw):
+            raise BadRequest("Wrong file identifier/http url specified")
+
+        async def fail_after_cache_rejection(**kw):
+            calls.append(kw["url"])
+            return DownloadResult(success=False, error="upstream unavailable", mode="video")
+
+        monkeypatch.setattr(ctx.bot, "edit_message_media", reject_cached)
+        monkeypatch.setattr(inl.download_manager, "download", fail_after_cache_rejection)
+        await inl.handle_chosen_inline_result(
+            _update(chosen_inline_result=_chosen("vp:x")), ctx)
+        assert inline_cache.get(url, inl._key("video")) is None
+        assert calls == [url]
+        assert "upstream unavailable" in ctx.bot.captions[-1]
 
     async def test_too_big_offers_the_bot_instead(self, ctx, monkeypatch, tmp_path):
         monkeypatch.setattr(inl, "MAX_FILE_SIZE_BYTES", 1000)

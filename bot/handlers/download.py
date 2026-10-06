@@ -1089,7 +1089,14 @@ def _remember_upload(url: str, key: str | None, sent, title: str, result=None,
     """After a real upload: the next request for this link+quality is instant."""
     found = _sent_file(sent) if key and sent is not None else None
     if found and (result is None or inline_cache.good_enough(mode, quality, result)):
-        inline_cache.put(url, key, file_id=found[1], kind=found[0], title=title or "")
+        inline_cache.put(
+            url,
+            key,
+            file_id=found[1],
+            kind=found[0],
+            title=title or "",
+            performer=(getattr(result, "artist", None) or "") if found[0] == "audio" else "",
+        )
 
 
 _DELIVERED_UNCONFIRMED = object()
@@ -1107,13 +1114,28 @@ async def _send_cached(context, chat_id: int, hit: dict, caption: str, reply_mar
     field = hit.get("kind") if hit.get("kind") in ("video", "audio", "animation", "photo") else "document"
     send = getattr(context.bot, f"send_{field}")
     kw: dict = {field: hit["file_id"], "reply_markup": reply_markup}
+    if field == "video":
+        kw["supports_streaming"] = True
+    elif field == "audio":
+        # Legacy entries may lack presentation metadata; Telegram can still
+        # send the cached file_id, so only pass fields known to the cache.
+        if hit.get("title"):
+            kw["title"] = hit["title"][:64]
+        if hit.get("performer"):
+            kw["performer"] = hit["performer"][:64]
     if thread_id:
         kw["message_thread_id"] = thread_id
     if caption:
         kw.update(caption=caption[:1024], parse_mode=ParseMode.HTML)
     try:
-        return await send(chat_id, **kw)
+        sent = await send(chat_id, **kw)
+        logger.info("Cached file sent as %s: %s", field, redact.url(url) if url else "inline")
+        return sent
     except TimedOut:
+        logger.warning(
+            "Cached send timed out; delivery is unconfirmed, so skipping duplicate: %s",
+            redact.url(url) if url else "inline",
+        )
         return _DELIVERED_UNCONFIRMED
     except BadRequest as e:
         text = str(e).lower()

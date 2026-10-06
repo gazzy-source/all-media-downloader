@@ -48,6 +48,92 @@ def _capture_video(fx, monkeypatch):
 
 
 class TestInstantRepeats:
+    async def test_cached_video_uses_streaming_video_send_with_caption_and_markup(self, cache):
+        cache.put("https://youtu.be/present", "video@720", file_id="VID", kind="video")
+        calls = {}
+
+        async def send_video(chat_id, **kwargs):
+            calls.update(method="video", chat_id=chat_id, **kwargs)
+            return SimpleNamespace(message_id=8)
+
+        ctx = SimpleNamespace(bot=SimpleNamespace(send_video=send_video))
+        markup = object()
+        hit = cache.get("https://youtu.be/present", "video@720")
+        out = await hd._send_cached(ctx, 42, hit, "<b>Clip</b>", markup)
+
+        assert out.message_id == 8
+        assert calls["method"] == "video" and calls["video"] == "VID"
+        assert calls["supports_streaming"] is True
+        assert calls["caption"] == "<b>Clip</b>"
+        assert calls["parse_mode"] == "HTML"
+        assert calls["reply_markup"] is markup
+
+    async def test_cached_document_stays_a_document(self, cache):
+        cache.put("https://youtu.be/document", "video@720", file_id="DOC", kind="document")
+        calls = {}
+
+        async def send_document(chat_id, **kwargs):
+            calls.update(chat_id=chat_id, **kwargs)
+            return SimpleNamespace(message_id=9)
+
+        async def wrong_method(*args, **kwargs):
+            pytest.fail("cached document must not be reinterpreted as video")
+
+        ctx = SimpleNamespace(bot=SimpleNamespace(
+            send_document=send_document, send_video=wrong_method,
+        ))
+        hit = cache.get("https://youtu.be/document", "video@720")
+        await hd._send_cached(ctx, 42, hit, "caption")
+        assert calls["document"] == "DOC"
+        assert "supports_streaming" not in calls
+
+    async def test_cached_audio_preserves_title_and_performer(self, cache):
+        cache.put("https://youtu.be/audio", "audio@m4a", file_id="AUD", kind="audio",
+                  title="Track", performer="Artist")
+        calls = {}
+
+        async def send_audio(chat_id, **kwargs):
+            calls.update(kwargs)
+            return SimpleNamespace(message_id=10)
+
+        ctx = SimpleNamespace(bot=SimpleNamespace(send_audio=send_audio))
+        await hd._send_cached(ctx, 42, cache.get("https://youtu.be/audio", "audio@m4a"), "")
+        assert calls["audio"] == "AUD"
+        assert calls["title"] == "Track"
+        assert calls["performer"] == "Artist"
+
+    async def test_legacy_audio_entry_without_performer_remains_sendable(self):
+        calls = {}
+
+        async def send_audio(chat_id, **kwargs):
+            calls.update(kwargs)
+            return SimpleNamespace(message_id=11)
+
+        ctx = SimpleNamespace(bot=SimpleNamespace(send_audio=send_audio))
+        legacy_hit = {"file_id": "OLD-AUD", "kind": "audio", "title": "Old track"}
+        await hd._send_cached(ctx, 42, legacy_hit, "")
+        assert calls["audio"] == "OLD-AUD"
+        assert calls["title"] == "Old track"
+        assert "performer" not in calls
+
+    def test_audio_upload_caches_title_and_performer(self, cache):
+        sent = SimpleNamespace(audio=SimpleNamespace(file_id="A2"))
+        result = SimpleNamespace(artist="Artist")
+        hd._remember_upload("https://youtu.be/new-audio", "audio@m4a", sent,
+                            "Track", result, "audio", "")
+        entry = cache.get("https://youtu.be/new-audio", "audio@m4a")
+        assert entry["title"] == "Track"
+        assert entry["performer"] == "Artist"
+
+    def test_document_result_is_remembered_as_document(self, cache):
+        sent = SimpleNamespace(document=SimpleNamespace(file_id="DOC2"))
+        result = SimpleNamespace(actual_height=720, artist=None)
+        hd._remember_upload("https://youtu.be/fallback", "video@720", sent,
+                            "Fallback video", result, "video", "720")
+        entry = cache.get("https://youtu.be/fallback", "video@720")
+        assert entry["kind"] == "document"
+        assert entry["file_id"] == "DOC2"
+
     async def test_dm_serves_a_cached_file_without_downloading(self, fx, cache, monkeypatch):
         cache.put("https://youtu.be/r", "video@720", file_id="FID", kind="video", title="Song")
 
@@ -104,6 +190,32 @@ class TestInstantRepeats:
         await hd.execute_download(q, fx.ctx, s)
         assert started == [1]
         assert cache.get("https://youtu.be/b", "video@720") is None
+
+    async def test_cached_send_timeout_does_not_trigger_a_duplicate_download(
+        self, fx, cache, monkeypatch
+    ):
+        from telegram.error import TimedOut
+
+        cache.put("https://youtu.be/timeout", "video@720", file_id="MAYBE-DELIVERED",
+                  kind="video")
+        sends = []
+
+        async def ambiguous_send(chat_id, **kwargs):
+            sends.append(kwargs)
+            raise TimedOut("response timed out after request")
+
+        async def must_not_download(**kwargs):
+            pytest.fail("ambiguous cached delivery must not send a duplicate")
+
+        monkeypatch.setattr(fx.ctx.bot, "send_video", ambiguous_send)
+        monkeypatch.setattr(hd.download_manager, "download", must_not_download)
+        monkeypatch.setattr(hd, "record_download", lambda *a, **k: None)
+        session, query = _session(fx, "sTimeout", "https://youtu.be/timeout")
+        await hd.execute_download(query, fx.ctx, session)
+
+        assert len(sends) == 1
+        assert query.message.deleted
+        assert cache.get("https://youtu.be/timeout", "video@720") is not None
 
     async def test_group_serves_cached_file_instantly(self, fx, cache, monkeypatch):
         cache.put("https://youtu.be/g", f"video@{hd.AUTO_QUALITY}", file_id="GF", kind="video")

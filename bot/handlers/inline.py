@@ -744,7 +744,14 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
         # file_id would make every later inline answer for this link fail as
         # a whole) — and only if it IS the promised quality, not a fallback.
         if inline_cache.good_enough(mode, INLINE_QUALITY, result):
-            inline_cache.put(url, _key(mode), file_id=file_id, kind=kind, title=title)
+            inline_cache.put(
+                url,
+                _key(mode),
+                file_id=file_id,
+                kind=kind,
+                title=title,
+                performer=(getattr(result, "artist", None) or "") if kind == "audio" else "",
+            )
         if STORAGE_CHAT_ID is None:
             await _quiet_delete(context, chat, sent.message_id)
         record_download(user_id, url, title, platform, mode, INLINE_QUALITY, True, file_size=size)

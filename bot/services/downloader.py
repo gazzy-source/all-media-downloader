@@ -52,6 +52,7 @@ from bot.utils.safe_fetch import UnresolvableURLError, UnsafeURLError, check_pub
 from bot.utils import redact
 from bot.utils.deadline import DeadlineExceeded, deadline
 from bot.utils.warp import rotate_warp_ip
+from bot.services.yt_telemetry import classify_failure, emit
 from bot.utils.helpers import (
     IMAGE_EXTS,
     VIDEO_EXTS,
@@ -544,20 +545,7 @@ def _yt_strategy_label(strategy: dict[str, Any], opts: dict[str, Any]) -> str:
 
 def _yt_failure_class(message: str) -> str:
     """Classify failures without logging URLs, tokens, or raw extractor text."""
-    low = (message or "").lower()
-    if _is_youtube_bot_wall(low):
-        return "bot_wall"
-    if any(x in low for x in ("socks5error", "proxyerror", "proxy error", "connection refused")):
-        return "proxy_transport"
-    if "http error 403" in low or "unable to download video data" in low:
-        return "media_403"
-    if "private video" in low or "video unavailable" in low or "has been removed" in low:
-        return "content_unavailable"
-    if "age" in low and ("confirm" in low or "restricted" in low):
-        return "age_restricted"
-    if any(x in low for x in ("sslerror", "tls", "connection was reset", "recv failure")):
-        return "transport"
-    return "extractor_error"
+    return classify_failure(message)
 
 
 def probe_youtube_media_bytes(info: dict[str, Any], byte_count: int = 1024) -> int:
@@ -1243,13 +1231,15 @@ def _meta_cache_put(url: str, info: dict[str, Any]) -> None:
         _META_CACHE[key] = (time.time(), _slim(info))
 
 
-def _extract_info_sync(url: str) -> dict[str, Any]:
+def _extract_info_sync(url: str, job_id: str = "") -> dict[str, Any]:
     """
     Metadata-only extract for the DM button wizard.
     Cached briefly; cookies + lean strategies on YouTube; single fast pass elsewhere.
     """
     cached = _meta_cache_get(url)
     if cached is not None:
+        if _platform_flags(urlparse(url).netloc.lower())["yt"]:
+            emit(job_id, "metadata", outcome="cache_hit")
         return cached
 
     host = urlparse(url).netloc.lower()
@@ -1350,6 +1340,7 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
         bot_wall_failures = 0
         # Shared across the ladder: a dead relay must not sleep at every rung.
         meta_proxy_retries = 0
+        attempt_no = 0
         # Self-imposed deadline, slightly inside the caller's asyncio cap.
         # asyncio.wait_for cannot cancel a thread that is already running, so
         # without this an extraction that blew the cap kept its worker busy and
@@ -1382,9 +1373,11 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
             if strat.get("drop_impersonate"):
                 opts.pop("impersonate", None)
             attempt_started = time.monotonic()
+            attempt_no += 1
             if is_yt:
                 logger.info(
-                    "YT attempt phase=metadata strategy=%s proxy=%s pot=%s cookies=%s",
+                    "YT attempt phase=metadata attempt=%s strategy=%s proxy=%s pot=%s cookies=%s",
+                    attempt_no,
                     _yt_strategy_label(strat, opts),
                     "warp" if opts.get("proxy") else "off",
                     "yes" if "youtubepot-bgutilhttp" in (opts.get("extractor_args") or {}) else "no",
@@ -1392,9 +1385,18 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 )
             try:
                 info = _run(opts)
+                if is_yt:
+                    winner = _yt_strategy_label(strat, opts)
+                    emit(job_id, "metadata", attempt=attempt_no, strategy=winner,
+                         outcome="success", metadata="success", winner=winner,
+                         formats=len(info.get("formats") or []),
+                         elapsed_ms=int((time.monotonic() - attempt_started) * 1000),
+                         route="warp" if opts.get("proxy") else "off",
+                         pot="yes" if "youtubepot-bgutilhttp" in (opts.get("extractor_args") or {}) else "no",
+                         cookies="yes" if opts.get("cookiefile") else "no")
                 logger.info(
-                    "  meta strategy %s ok in %.1fs",
-                    orig_indices[si],
+                    "  meta winner=%s ok in %.1fs",
+                    _yt_strategy_label(strat, opts),
                     time.monotonic() - attempt_started,
                 )
                 _remember_yt_strategy(orig_indices[si], download=False)
@@ -1404,6 +1406,13 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 last_err = e
                 err = str(e).lower()
                 if is_yt:
+                    emit(job_id, "metadata", attempt=attempt_no,
+                         strategy=_yt_strategy_label(strat, opts), outcome="failure",
+                         **{"class": classify_failure(err)},
+                         elapsed_ms=int((time.monotonic() - attempt_started) * 1000),
+                         route="warp" if opts.get("proxy") else "off",
+                         pot="yes" if "youtubepot-bgutilhttp" in (opts.get("extractor_args") or {}) else "no",
+                         cookies="yes" if opts.get("cookiefile") else "no")
                     logger.warning(
                         "YT attempt failed phase=metadata strategy=%s class=%s elapsed=%.1fs",
                         _yt_strategy_label(strat, opts),
@@ -1463,7 +1472,7 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                     and _platform_flags(urlparse(url).netloc.lower())["yt"]
                     and opts.get("proxy")
                     and not any(s.get("_warp_retry") for s in strats)
-                    and rotate_warp_ip()
+                    and rotate_warp_ip(job_id=job_id, phase="metadata", reason="bot_wall")
                 ):
                     strats.insert(si + 1, {**strat, "_warp_retry": True})
                     orig_indices.insert(si + 1, orig_indices[si])
@@ -1665,7 +1674,8 @@ class DownloadManager:
         raw = _meta_cache_get(url, max_age=DOWNLOAD_REUSE_TTL)
         return build_media_info(url, raw) if raw is not None else None
 
-    async def extract_info(self, url: str, limit: float | None = None) -> MediaInfo:
+    async def extract_info(self, url: str, limit: float | None = None,
+                           job_id: str = "") -> MediaInfo:
         loop = asyncio.get_running_loop()
         # Timed in three parts so a slow "Analyzing…" can be attributed rather
         # than guessed at: queue = waiting for a pool worker (starvation),
@@ -1682,7 +1692,7 @@ class DownloadManager:
                 # The handler stops waiting at EXTRACT_TIMEOUT; this stops the
                 # THREAD soon after, so a dripping server can't keep a worker.
                 with deadline(limit or EXTRACT_TIMEOUT + 10):
-                    return _extract_info_sync(u)
+                    return _extract_info_sync(u, job_id=job_id) if job_id else _extract_info_sync(u)
             finally:
                 with _META_INFLIGHT_LOCK:
                     _META_INFLIGHT -= 1
@@ -1703,6 +1713,8 @@ class DownloadManager:
             flight.fut.add_done_callback(_landed)
         else:
             started = flight.started
+            if _platform_flags(urlparse(url).netloc.lower())["yt"]:
+                emit(job_id, "metadata", outcome="singleflight_join")
         flight.waiters += 1
         try:
             # shield: one caller's timeout must not cancel the shared run.
@@ -1731,6 +1743,9 @@ class DownloadManager:
             "analyze %.1fs (queue %.1fs + work %.1fs + build %.1fs) %s",
             total, wait, work, time.monotonic() - done, url[:90],
         )
+        if _platform_flags(urlparse(url).netloc.lower())["yt"]:
+            emit(job_id, "metadata", outcome="complete",
+                 metadata_ms=int(total * 1000), metadata="success")
         return result
 
     async def download(
@@ -1743,8 +1758,10 @@ class DownloadManager:
         title_hint: str = "media",
         progress_cb: ProgressCallback | None = None,
         cancel: threading.Event | None = None,
+        job_id: str = "",
     ) -> DownloadResult:
         """`cancel`, once set, stops the job at its next step or chunk."""
+        download_started = time.monotonic()
         self.waiting += 1
         try:
             # Only show "queued" when we would actually wait for a free slot
@@ -1776,6 +1793,7 @@ class DownloadManager:
                     progress_cb=progress_cb,
                     loop=loop,
                     cancel=cancel,
+                    job_id=job_id,
                 ),
             )
             # Auto: video request on image-only posts (Pinterest pins, etc.)
@@ -1804,8 +1822,17 @@ class DownloadManager:
                         progress_cb=progress_cb,
                         loop=loop,
                         cancel=cancel,
+                        job_id=job_id,
                     ),
                 )
+            elapsed_ms = int((time.monotonic() - download_started) * 1000)
+            if _platform_flags(urlparse(url).netloc.lower())["yt"]:
+                emit(job_id, "download", outcome="success" if result.success else "failure",
+                     **({} if result.success else {"class": classify_failure(result.error or "")}),
+                     download_ms=elapsed_ms,
+                     final_bytes=(result.file_size if result.success else 0),
+                     mode=mode, requested_quality=quality,
+                     actual_height=result.actual_height or "unknown")
             return result
         finally:
             self.active -= 1
@@ -1821,7 +1848,10 @@ class DownloadManager:
         started = time.monotonic()
         try:
             with deadline(limit, cancel=cancel):
-                result = self._download_sync(cancel=cancel, **kw)
+                sync_kw = kw if kw.get("job_id") else {
+                    key: value for key, value in kw.items() if key != "job_id"
+                }
+                result = self._download_sync(cancel=cancel, **sync_kw)
         except DeadlineExceeded as e:  # raised outside yt-dlp's own handlers
             cancelled = cancel is not None and cancel.is_set()
             return DownloadResult(
@@ -1870,6 +1900,7 @@ class DownloadManager:
         progress_cb: ProgressCallback | None,
         loop: asyncio.AbstractEventLoop,
         cancel: threading.Event | None = None,
+        job_id: str = "",
     ) -> DownloadResult:
         if cancel is not None and cancel.is_set():
             return DownloadResult(success=False, error=CANCELLED, mode=mode)
@@ -1892,6 +1923,9 @@ class DownloadManager:
         )
         job_cookies: list[Path] = []
         job_started = time.monotonic()
+        host = urlparse(url).netloc.lower()
+        is_youtube_job = _platform_flags(host)["yt"]
+        media_probe_state = {"success": False}
 
         last_pct = {"v": -1.0}
         last_tick = {"t": 0.0}
@@ -1912,6 +1946,12 @@ class DownloadManager:
             if status == "downloading":
                 total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
                 done = d.get("downloaded_bytes") or 0
+                if is_youtube_job and done > 0 and not media_probe_state["success"]:
+                    media_probe_state["success"] = True
+                    emit(job_id, "media_probe", outcome="success", bytes=done,
+                         evidence="first_media_bytes",
+                         strategy=media_probe_state.get("strategy", "unknown"),
+                         attempt=media_probe_state.get("attempt", "unknown"))
                 speed = d.get("speed")
                 speed_s = format_size(speed) + "/s" if speed else "—"
                 if not total:
@@ -1976,7 +2016,6 @@ class DownloadManager:
                 tripped["reason"] = reason
                 raise JobAborted(reason)
 
-        host = urlparse(url).netloc.lower()
         # Disposable jar for every download so concurrent jobs never corrupt cookies
         cookie_path = _cookie_jar_for_job()
         if cookie_path:
@@ -1990,7 +2029,7 @@ class DownloadManager:
 
         _emit(2, "Resolving…")
         opts = _base_opts(host=host, cookiefile=cookie_path)
-        hooks = [guard, hook] if progress_cb else [guard]
+        hooks = [guard, hook] if progress_cb or is_youtube_job else [guard]
         opts.update(
             {
                 "outtmpl": outtmpl,
@@ -2088,7 +2127,8 @@ class DownloadManager:
 
             info, prepared, title = self._extract_with_format_fallback(
                 opts, url, title_hint, job_cookies=job_cookies,
-                on_stage=_stage,
+                on_stage=_stage, job_id=job_id,
+                media_probe_state=media_probe_state,
             )
             if tripped:
                 # The guard fired but something downstream swallowed it: the
@@ -2211,6 +2251,8 @@ class DownloadManager:
         title_hint: str,
         job_cookies: list[Path] | None = None,
         on_stage: Callable[[float, str], None] | None = None,
+        job_id: str = "",
+        media_probe_state: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], str, str]:
         """
         Fast path first; fallbacks only on bot-check / format / 403 errors.
@@ -2245,7 +2287,8 @@ class DownloadManager:
             strategies = [{}, {"drop_impersonate": True}]
             orig_indices = [0, 1]
 
-        reused = self._download_from_analysis(opts, url, title_hint, primary)
+        reused = self._download_from_analysis(opts, url, title_hint, primary,
+                                              job_id=job_id)
         if reused is not None:
             return reused
 
@@ -2255,6 +2298,7 @@ class DownloadManager:
         proxy_retries = 0
         warp_rotated = False
         bot_wall_failures = 0
+        attempt_no = 0
         # No NEW attempt starts past this; an in-flight transfer still finishes.
         attempt_deadline = time.monotonic() + DOWNLOAD_ATTEMPT_BUDGET
         for si, strat in enumerate(strategies):
@@ -2297,7 +2341,8 @@ class DownloadManager:
 
             if is_yt:
                 logger.info(
-                    "YT attempt phase=download strategy=%s proxy=%s pot=%s cookies=%s",
+                    "YT attempt phase=download attempt=%s strategy=%s proxy=%s pot=%s cookies=%s",
+                    attempt_no,
                     _yt_strategy_label(strat, attempt_base),
                     "warp" if attempt_base.get("proxy") else "off",
                     "yes" if "youtubepot-bgutilhttp" in (attempt_base.get("extractor_args") or {}) else "no",
@@ -2329,6 +2374,17 @@ class DownloadManager:
                 attempt_opts = dict(attempt_base)
                 attempt_opts["format"] = fmt
                 attempt_started = time.monotonic()
+                if is_yt:
+                    attempt_no += 1
+                    if media_probe_state is not None:
+                        media_probe_state["strategy"] = _yt_strategy_label(strat, attempt_opts)
+                        media_probe_state["attempt"] = attempt_no
+                    emit(job_id, "download_strategy", attempt=attempt_no,
+                         strategy=_yt_strategy_label(strat, attempt_opts), outcome="attempt",
+                         route="warp" if attempt_opts.get("proxy") else "off",
+                         pot="yes" if "youtubepot-bgutilhttp" in (attempt_opts.get("extractor_args") or {}) else "no",
+                         cookies="yes" if attempt_opts.get("cookiefile") else "no",
+                         format_fallback="yes" if fi else "no")
                 try:
                     with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                         info = ydl.extract_info(url, download=True)
@@ -2337,6 +2393,14 @@ class DownloadManager:
                         prepared = ydl.prepare_filename(info)
                         title = str(info.get("title") or title_hint)[:200]
                         if is_yt:
+                            winner = _yt_strategy_label(strat, attempt_opts)
+                            emit(job_id, "download_strategy", attempt=attempt_no,
+                                 strategy=winner, outcome="success", winner=winner,
+                                 route="warp" if attempt_opts.get("proxy") else "off",
+                                 pot="yes" if "youtubepot-bgutilhttp" in (attempt_opts.get("extractor_args") or {}) else "no",
+                                 cookies="yes" if attempt_opts.get("cookiefile") else "no",
+                                 format_fallback="yes" if fi else "no",
+                                 elapsed_ms=int((time.monotonic() - attempt_started) * 1000))
                             _remember_yt_strategy(orig_indices[si], download=True)
                             if si or fi:
                                 logger.info(
@@ -2350,6 +2414,19 @@ class DownloadManager:
                     last_err = e
                     err = str(e).lower()
                     if is_yt:
+                        if (classify_failure(err) == "media_403"
+                                and not (media_probe_state or {}).get("success")):
+                            emit(job_id, "media_probe", outcome="failure",
+                                 **{"class": "media_403"},
+                                 strategy=_yt_strategy_label(strat, attempt_opts),
+                                 attempt=attempt_no)
+                        emit(job_id, "download_strategy", attempt=attempt_no,
+                             strategy=_yt_strategy_label(strat, attempt_opts), outcome="failure",
+                             **{"class": classify_failure(err)},
+                             route="warp" if attempt_opts.get("proxy") else "off",
+                             pot="yes" if "youtubepot-bgutilhttp" in (attempt_opts.get("extractor_args") or {}) else "no",
+                             cookies="yes" if attempt_opts.get("cookiefile") else "no",
+                             elapsed_ms=int((time.monotonic() - attempt_started) * 1000))
                         logger.warning(
                             "YT attempt failed phase=download strategy=%s class=%s elapsed=%.1fs",
                             _yt_strategy_label(strat, attempt_opts),
@@ -2439,7 +2516,7 @@ class DownloadManager:
                         # Rotating drops every proxied socket: never while
                         # someone else's download or analysis is running.
                         and _rotation_harmless(1)
-                        and rotate_warp_ip()
+                        and rotate_warp_ip(job_id=job_id, phase="download", reason="bot_wall")
                     ):
                         warp_rotated = True
                         continue  # same strategy, same format, new exit IP
@@ -2473,7 +2550,8 @@ class DownloadManager:
         raise RuntimeError("Download failed with all format selectors.")
 
     def _download_from_analysis(
-        self, opts: dict[str, Any], url: str, title_hint: str, primary: str
+        self, opts: dict[str, Any], url: str, title_hint: str, primary: str,
+        job_id: str = "",
     ) -> tuple[dict[str, Any], str, str] | None:
         """
         Download from the analysis pass's extraction instead of repeating it.
@@ -2509,6 +2587,10 @@ class DownloadManager:
                 "download reused the analysis extraction (%.1fs): %s",
                 time.monotonic() - started, url[:80],
             )
+            if _platform_flags(urlparse(url).netloc.lower())["yt"]:
+                emit(job_id, "download_strategy", attempt=1,
+                     strategy="analysis_reuse", winner="analysis_reuse",
+                     outcome="success", elapsed_ms=int((time.monotonic() - started) * 1000))
             return info, prepared, str(info.get("title") or title_hint)[:200]
         except (JobRefused, JobAborted):
             # The answer would be the same after a fresh extraction — and for

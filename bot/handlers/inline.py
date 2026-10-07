@@ -71,6 +71,7 @@ from bot.utils.texts import (
     upload_failed_text,
 )
 from bot.services.url_tokens import put_url
+from bot.services.yt_telemetry import classify_failure, emit, emit_terminal, new_job_id
 from bot.utils.helpers import extract_urls, format_size, platform_from_url
 from bot.utils.progress_view import ProgressView
 from bot.utils.safe_fetch import (
@@ -528,6 +529,7 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
     else:
         return  # unknown/stale result id; placeholders use vp/ap or sv/sa
     user_id, imid = ch.from_user.id, ch.inline_message_id
+    telemetry_id = new_job_id() if "youtube" in platform_from_url(url).lower() else ""
     me = context.bot.username or ""
     give_up = _open_bot_markup(me, f"dl_{put_url(url, user_id)}")
     last = {"t": 0.0}
@@ -605,30 +607,37 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
 
     try:
         await _deliver(context, job, mode, url, user_id, imid, title, started,
-                       status, finish, state)
+                       status, finish, state, telemetry_id)
     finally:
         jobs.drop(job)
 
 
 async def _deliver(context, job, mode, url, user_id, imid, title, started,
-                   status, finish, state) -> None:
+                   status, finish, state, telemetry_id: str = "") -> None:
     allowed, retry = rate_limiter.allow(user_id)
     if not allowed and user_id not in ADMIN_IDS:
+        emit_terminal(telemetry_id, "failure", **{"class": "other"})
         await finish(rate_limit_text(retry, user_id))
         return
     if not await _is_public(url):
+        emit_terminal(telemetry_id, "failure", **{"class": "private"})
         await finish(f"🚫 {_esc(PRIVATE_URL_ERROR)}")
         return
 
     if job.cancelled:
+        emit_terminal(telemetry_id, "cancelled", **{"class": "cancelled"})
         return
     hit = inline_cache.get(url, _key(mode))
     if hit:  # fetched before or by someone else while this user was choosing
+        emit(telemetry_id, "cache", outcome="hit", kind=hit.get("kind", "unknown"),
+             cache_hit="yes", delivery="cached_swap", avoided_download="yes")
         logger.info("inline cache hit — swapping cached %s", mode)
         if await _swap_in(context, imid, hit["kind"], hit["file_id"], hit.get("title", "")):
+            emit_terminal(telemetry_id, "success", delivery="cached")
             return
         inline_cache.forget(url, _key(mode))  # Telegram refused it: fetch afresh below
     logger.info("inline cache miss — downloading %s", mode)
+    emit(telemetry_id, "cache", outcome="miss", cache_hit="no", delivery="fresh_download")
     if job.cancelled:
         return
 
@@ -654,15 +663,19 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
     platform = platform_from_url(url)
     try:
         try:
-            result = await jobs.run_queued(
-                job, download_queue,
-                lambda: download_manager.download(
-                    # m4a: YouTube's own AAC stream, remuxed — no minute-long MP3
-                    # re-encode on a small VPS. Telegram plays it as audio natively.
+            queue_entered = time.monotonic()
+            emit(telemetry_id, "queue", outcome="queue_enter")
+            async def _queued_download():
+                emit(telemetry_id, "queue", outcome="queue_start",
+                     queue_wait_ms=int((time.monotonic() - queue_entered) * 1000))
+                return await download_manager.download(
                     url=url, mode=mode, quality=INLINE_QUALITY, audio_format="m4a",
                     title_hint=title or "media", progress_cb=on_progress,
-                    cancel=job.event,
-                ),
+                    cancel=job.event, job_id=telemetry_id,
+                )
+            result = await jobs.run_queued(
+                job, download_queue,
+                _queued_download,
                 on_position=lambda n: on_progress(0, f"Queued — you're #{n} in line"),
                 priority=user_prefs.is_premium(user_id),
             )
@@ -673,6 +686,7 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
         if job.cancelled:
             return  # the card already says "Cancelled"
         if not result.success or not result.primary:
+            emit_terminal(telemetry_id, "failure", **{"class": classify_failure(result.error or "")})
             logger.info("inline %s failed after %.1fs [%s]: %s — %s", mode,
                         time.monotonic() - started, view.phases(), redact.url(url),
                         (result.error or "")[:120])
@@ -682,6 +696,16 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
             return
         size = result.file_size or result.primary.stat().st_size
         if size > MAX_FILE_SIZE_BYTES:
+            from bot.services.downloader import recommend_fitting_quality
+            cached_info = download_manager.cached_media_info(url) if mode == "video" else None
+            rec = recommend_fitting_quality(cached_info.available_heights,
+                                            cached_info.estimated_sizes,
+                                            INLINE_QUALITY, MAX_FILE_SIZE_BYTES) if cached_info else None
+            emit(telemetry_id, "size_guard", outcome="rejected", actual_bytes=size,
+                 limit_bytes=MAX_FILE_SIZE_BYTES,
+                 recommendation=rec.quality if rec else "none",
+                 recommended_estimated_bytes=rec.estimated_bytes if rec else "none")
+            emit_terminal(telemetry_id, "failure", **{"class": "size_limit"})
             record_download(user_id, url, result.title or "", platform, mode, INLINE_QUALITY,
                             False, file_size=size, error="File too large")
             advice = "Tap <b>Open bot</b> to pick a lower quality or 🎵 Audio."
@@ -698,6 +722,7 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
             return
         chat = _storage_chat()
         if chat is None:
+            emit_terminal(telemetry_id, "failure", **{"class": "other"})
             await finish("❌ Inline mode isn't set up on this server yet.")
             return
         if job.cancelled:
@@ -711,18 +736,22 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
             sent = await download_handlers._send_media(
                 context, chat, result.primary, result, caption="", silent=True,
                 cancel=job.event, on_reserved=lambda: setattr(job, "cancellable", False),
+                job_id=telemetry_id,
             )
         except UploadCancelled:
+            emit_terminal(telemetry_id, "cancelled", **{"class": "cancelled"})
             return  # the card already says "Cancelled"
         found = _file_of(sent)
         if not found:
             state["done"] = False
+            emit_terminal(telemetry_id, "failure", **{"class": "upload_error"})
             await finish(upload_failed_text("inline storage upload returned no file"))
             return
         kind, file_id = found
         title = (result.title or title or "")[:200]
         if not await _swap_in(context, imid, kind, file_id, title):
             state["done"] = False
+            emit_terminal(telemetry_id, "failure", **{"class": "telegram_refused"})
             await finish("❌ Telegram refused this file here. Tap <b>Open bot</b> to get it.")
             return
         # Cached only once Telegram has accepted it in a message (an invalid
@@ -740,11 +769,13 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
         if STORAGE_CHAT_ID is None:
             await _quiet_delete(context, chat, sent.message_id)
         record_download(user_id, url, title, platform, mode, INLINE_QUALITY, True, file_size=size)
+        emit_terminal(telemetry_id, "success", total_ms=int((time.monotonic() - started) * 1000))
         logger.info("inline %s delivered in %.1fs (%s) [%s]: %s", mode,
                     time.monotonic() - started, format_size(size), view.phases(),
                     redact.url(url))
     except Exception:
         logger.exception("inline download failed for %s", redact.url(url))
+        emit_terminal(telemetry_id, "failure", **{"class": "unknown"})
         if job.cancelled:
             return
         state["done"] = False

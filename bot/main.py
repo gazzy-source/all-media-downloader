@@ -269,17 +269,22 @@ async def _warm_youtube_pipeline() -> None:
     if not WARMUP_ON_START:
         return
     from bot.services.downloader import download_manager
+    from bot.services.yt_telemetry import classify_failure, emit, new_job_id
 
     started = time.time()
+    telemetry_id = "warmup-" + new_job_id()
     try:
         info = await asyncio.wait_for(
             download_manager.extract_info(WARMUP_URL, limit=120), timeout=120
         )
         from bot.services.downloader import probe_youtube_media_bytes
 
-        await asyncio.wait_for(
+        probe_started = time.monotonic()
+        byte_count = await asyncio.wait_for(
             asyncio.to_thread(probe_youtube_media_bytes, info.raw), timeout=15
         )
+        emit(telemetry_id, "media_probe", outcome="success", bytes=byte_count,
+             elapsed_ms=int((time.monotonic() - probe_started) * 1000), source="warmup")
         logger.info(
             "YouTube warm-up passed metadata and media-byte probe in %.1fs",
             time.time() - started,
@@ -288,6 +293,8 @@ async def _warm_youtube_pipeline() -> None:
     except asyncio.CancelledError:
         raise
     except Exception as e:
+        emit(telemetry_id, "media_probe", outcome="failure",
+             **{"class": classify_failure(str(e))}, source="warmup")
         heartbeat.warmup_result(False, f"{type(e).__name__}: {e}")
         # The canary for YouTube: users hit the same wall until it recovers.
         logger.warning(

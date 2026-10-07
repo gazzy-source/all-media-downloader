@@ -17,6 +17,7 @@ class DownloadSession:
     user_id: int
     chat_id: int
     url: str
+    telemetry_id: str = ""
     created_at: float = field(default_factory=time.time)
 
     # Filled after info extraction

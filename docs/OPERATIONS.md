@@ -57,3 +57,20 @@ Prefer a reviewed revert commit and deploy it through the same process. For an u
 - Previous known-good revision remains deployable.
 
 Treat cumulative counters as deltas between timestamped snapshots, not as current rates. The historical 24-hour comparison showed lower average swap/PSI/disk activity in the post-change period, but CPU steal also changed and the experiment did not establish causality. Do not infer current health from that old measurement.
+
+## YouTube reliability events
+
+The bot emits compact `YT_EVENT` key/value records to the existing journal. A locally generated opaque `job` ID joins metadata strategy attempts, the selected metadata winner, fair-queue wait, actual download strategy/winner, size guard, upload/cache outcome and one terminal event. `warp_reconnect` records the triggering phase/reason, elapsed time, reconnect outcome and short egress fingerprints; raw IPs are never included. Strategy events record proxy route as `warp`/`off`, PO-token presence, cookie presence, outcome/class and elapsed milliseconds. They never record URLs, titles, user IDs, cookies, token values, file IDs, proxy credentials or signed media URLs.
+
+Warm-up media-byte probes are recorded as `phase=media_probe`; ordinary jobs distinguish successful metadata from actual download strategy and byte-transfer outcomes. There is no extra per-request probe, so `media_probe` counts describe the warm-up canary only. This avoids adding a second network request to every user job.
+
+Export and summarize an observation window with the standard library script:
+
+```bash
+journalctl -u all-media-downloader.service --since "24 hours ago" --no-pager \
+  | python scripts/youtube_reliability_report.py
+```
+
+Or pass a saved journal export as the script's positional file argument. Input is bounded to 200,000 lines by default (`--max-lines` changes the cap). The report counts only terminal events for job success/failure, uses nearest-rank p50/p95, and labels latency samples below five as insufficient. WARP first-retry correlation is available when reconnect and later strategy events share a job ID. Events without a terminal record (for example, abrupt process termination) do not count as completed jobs.
+
+Failure class values include `bot_wall`, `media_403`, `proxy_refused`, `timeout`, `members_only`, `private`, `age_restricted`, `geo_restricted`, `cancelled`, `transport`, and `metadata_error`; upload and size-limit terminal events are `upload_error` and `size_limit`. `unknown`/`other` is preferable to asserting a diagnosis without evidence. These are operational categories, not permanent descriptions of YouTube behavior. Every report describes only its selected observation window; do not extrapolate short or low-volume samples into a permanent reliability claim.

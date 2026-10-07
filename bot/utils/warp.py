@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import shutil
 import subprocess
@@ -28,10 +29,41 @@ def _warp_cli(*args: str, timeout: float = 15) -> str:
     return out.stdout
 
 
+def _proxy_egress_ip() -> str | None:
+    """Return the configured proxy's public egress IP without logging it."""
+    curl = shutil.which("curl")
+    if not curl or not PROXY or any(c in PROXY for c in "\r\n"):
+        return None
+    escaped = PROXY.replace("\\", "\\\\").replace('"', '\\"')
+    config = f'proxy = "{escaped}"\n'
+    try:
+        result = subprocess.run(
+            [
+                curl,
+                "--config",
+                "-",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "8",
+                "https://api.ipify.org",
+            ],
+            input=config,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        return str(ipaddress.ip_address(result.stdout.strip()))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        # Never put a proxy URL, credentials, response body, or IP in logs.
+        return None
+
+
 def rotate_warp_ip() -> bool:
     """
-    Reconnect WARP for a fresh exit IP. Returns True when the caller should
-    retry — a rotation just happened, by this thread or a concurrent one.
+    Reconnect WARP and return True only when the configured egress changes.
 
     Blocking (~2s); call it from a worker thread only. Rate limited by
     WARP_ROTATE_COOLDOWN so a video that is blocked for real can't make the
@@ -49,6 +81,12 @@ def rotate_warp_ip() -> bool:
         since = time.monotonic() - _LAST_ROTATION
         if _LAST_ROTATION and since < WARP_ROTATE_COOLDOWN:
             return False
+
+        before = _proxy_egress_ip()
+        if before is None:
+            logger.warning("WARP egress probe failed; skipping reconnect and retry")
+            return False
+
         _LAST_ROTATION = time.monotonic()
         try:
             _warp_cli("disconnect")
@@ -56,7 +94,18 @@ def rotate_warp_ip() -> bool:
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 if "Connected" in _warp_cli("status", timeout=5):
-                    logger.warning("Rotated WARP exit IP after a YouTube bot check")
+                    after = _proxy_egress_ip()
+                    if after is None:
+                        logger.warning(
+                            "WARP reconnected; egress verification failed; skipping retry"
+                        )
+                        return False
+                    if before == after:
+                        logger.warning(
+                            "WARP reconnected; egress unchanged; skipping retry"
+                        )
+                        return False
+                    logger.warning("WARP reconnected; egress changed")
                     _LAST_SUCCESS = time.monotonic()
                     return True
                 time.sleep(0.5)

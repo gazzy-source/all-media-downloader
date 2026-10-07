@@ -167,6 +167,7 @@ class TestWarpRotation:
         monkeypatch.setattr(warp, "_LAST_ROTATION", 0.0)
         monkeypatch.setattr(warp, "_LAST_SUCCESS", 0.0)
         monkeypatch.setattr(warp.shutil, "which", lambda n: "/usr/bin/warp-cli")
+        monkeypatch.setattr(warp, "_proxy_egress_ip", lambda: "192.0.2.10")
 
         def fake(*args, timeout=15):
             calls.append(args[0])
@@ -181,6 +182,10 @@ class TestWarpRotation:
     def test_rotates_then_respects_cooldown(self, monkeypatch):
         calls: list[str] = []
         self._arm(monkeypatch, calls)
+        # The reconnect must be judged by the actual proxy egress, not the
+        # local warp-cli Connected state.
+        egress = iter(("192.0.2.10", "192.0.2.11"))
+        monkeypatch.setattr(warp, "_proxy_egress_ip", lambda: next(egress))
         assert warp.rotate_warp_ip() is True
         assert calls[:2] == ["disconnect", "connect"]
         # A second job within 10s rides the fresh IP without another rotation.
@@ -191,6 +196,37 @@ class TestWarpRotation:
         monkeypatch.setattr(warp, "_LAST_SUCCESS", warp.time.monotonic() - 60)
         assert warp.rotate_warp_ip() is False
         assert calls.count("disconnect") == 1
+
+    def test_reconnect_with_same_egress_is_not_a_rotation(self, monkeypatch, caplog):
+        calls: list[str] = []
+        self._arm(monkeypatch, calls)
+        monkeypatch.setattr(warp, "_proxy_egress_ip", lambda: "192.0.2.10")
+
+        assert warp.rotate_warp_ip() is False
+        assert calls[:2] == ["disconnect", "connect"]
+        assert "egress unchanged" in caplog.text
+        assert warp._LAST_SUCCESS == 0.0
+
+    def test_egress_probe_failure_skips_reconnect(self, monkeypatch, caplog):
+        calls: list[str] = []
+        self._arm(monkeypatch, calls)
+        monkeypatch.setattr(warp, "_proxy_egress_ip", lambda: None)
+
+        assert warp.rotate_warp_ip() is False
+        assert calls == []
+        assert "egress probe failed" in caplog.text
+
+    def test_post_reconnect_probe_failure_does_not_claim_rotation(
+        self, monkeypatch, caplog
+    ):
+        calls: list[str] = []
+        self._arm(monkeypatch, calls)
+        egress = iter(("192.0.2.10", None))
+        monkeypatch.setattr(warp, "_proxy_egress_ip", lambda: next(egress))
+
+        assert warp.rotate_warp_ip() is False
+        assert "egress verification failed" in caplog.text
+        assert warp._LAST_SUCCESS == 0.0
 
     def test_cli_failure_is_not_fatal(self, monkeypatch):
         calls: list[str] = []

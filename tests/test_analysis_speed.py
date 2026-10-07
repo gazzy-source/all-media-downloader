@@ -12,6 +12,7 @@ as a hang. Two separate defects behind that one screenshot:
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -61,14 +62,32 @@ class TestStartupWarmup:
 
         async def _fake(url, limit=None):
             seen.append(url)
+            return SimpleNamespace(raw={})
 
         monkeypatch.setattr(_main, "WARMUP_ON_START", True)
         monkeypatch.setattr(_main, "WARMUP_URL", "https://example.com/v")
         import bot.services.downloader as dl
 
         monkeypatch.setattr(dl.download_manager, "extract_info", _fake)
+        monkeypatch.setattr(dl, "probe_youtube_media_bytes", lambda raw: 1024)
         await _main._warm_youtube_pipeline()
         assert seen == ["https://example.com/v"]
+
+    async def test_warmup_media_probe_failure_is_recorded(self, _main, monkeypatch):
+        async def _fake(url, limit=None):
+            return SimpleNamespace(raw={})
+
+        monkeypatch.setattr(_main, "WARMUP_ON_START", True)
+        import bot.services.downloader as dl
+
+        monkeypatch.setattr(dl.download_manager, "extract_info", _fake)
+
+        def _failed_probe(raw):
+            raise RuntimeError("media probe rejected")
+
+        monkeypatch.setattr(dl, "probe_youtube_media_bytes", _failed_probe)
+        await _main._warm_youtube_pipeline()
+        assert _main.heartbeat.state["warmup_fail_streak"] >= 1
 
     async def test_warmup_failure_is_swallowed(self, _main, monkeypatch):
         """A dead warmup link must not stop the bot from starting."""

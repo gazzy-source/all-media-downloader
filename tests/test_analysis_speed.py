@@ -101,7 +101,8 @@ class TestStartupWarmup:
         monkeypatch.setattr(dl.download_manager, "extract_info", _boom)
         await _main._warm_youtube_pipeline()  # must not raise
 
-    async def test_warmup_timeout_is_swallowed(self, _main, monkeypatch):
+    async def test_warmup_timeout_is_swallowed_and_classified(self, _main, monkeypatch, caplog):
+        caplog.set_level("INFO", logger="bot.services.yt_telemetry")
         async def _hang(url, limit=None):
             await asyncio.sleep(3600)
 
@@ -117,6 +118,8 @@ class TestStartupWarmup:
 
         monkeypatch.setattr(asyncio, "wait_for", _quick)
         await _main._warm_youtube_pipeline()  # must not raise
+        assert "phase=media_probe outcome=failure class=timeout" in caplog.text
+        assert "error_type=TimeoutError" in caplog.text
 
     async def test_disabled_warmup_touches_nothing(self, _main, monkeypatch):
         async def _never(url):

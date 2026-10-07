@@ -294,7 +294,8 @@ async def _warm_youtube_pipeline() -> None:
         raise
     except Exception as e:
         emit(telemetry_id, "media_probe", outcome="failure",
-             **{"class": classify_failure(str(e))}, source="warmup")
+             **{"class": classify_failure(f"{type(e).__name__}: {e}")},
+             error_type=type(e).__name__, source="warmup")
         heartbeat.warmup_result(False, f"{type(e).__name__}: {e}")
         # The canary for YouTube: users hit the same wall until it recovers.
         logger.warning(

@@ -33,6 +33,7 @@ def test_failure_classification_is_shared_and_conservative():
         "Sign in to confirm your age": "age_restricted",
         "Private video": "private",
         "Operation timed out": "timeout",
+        "TimeoutError": "timeout",
         "some unknown extractor failure": "metadata_error",
     }
     assert {text: telemetry.classify_failure(text) for text in cases} == cases

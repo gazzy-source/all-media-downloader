@@ -69,7 +69,8 @@ def classify_failure(message: str) -> str:
         return "proxy_refused"
     if "timed out" in low or "timeout" in low:
         return "timeout"
-    if "http error 403" in low or "unable to download video data" in low:
+    if ("http error 403" in low or "http_403" in low
+            or "unable to download video data" in low):
         return "media_403"
     if "members-only" in low or "members only" in low:
         return "members_only"

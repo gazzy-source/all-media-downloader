@@ -63,6 +63,38 @@ def fake_ydl(monkeypatch):
 
 
 class TestExtractInfoSync:
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Sign in to confirm you're not a bot",
+            "Sign in to confirm you are not a bot",
+            "Please sign in to confirm you're not a bot",
+        ],
+    )
+    def test_explicit_youtube_bot_wall_classification(self, message):
+        assert dl._is_youtube_bot_wall(message)
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Sign in to confirm your age",
+            "This video is private",
+            "This video is only available to members",
+            "This video is not available in your country",
+            "Video has been removed",
+            "HTTP Error 403: Forbidden",
+            "Socks5Error: Connection refused",
+            "TLS handshake failed",
+        ],
+    )
+    def test_unrelated_errors_are_not_bot_walls(self, message):
+        assert not dl._is_youtube_bot_wall(message)
+
+    def test_failure_classification_does_not_collapse_transport_into_bot_wall(self):
+        assert dl._yt_failure_class("Socks5Error: Connection refused") == "proxy_transport"
+        assert dl._yt_failure_class("HTTP Error 403: Forbidden") == "media_403"
+        assert dl._yt_failure_class("Sign in to confirm you're not a bot") == "bot_wall"
+
     def test_visionos_first_then_default_rotation(self, fake_ydl):
         info = dl._extract_info_sync("https://www.youtube.com/watch?v=abc")
         assert info["title"] == "ok"
@@ -108,6 +140,7 @@ class TestExtractInfoSync:
 
     def test_youtube_bot_wall_stops_after_two_attempts(self, fake_ydl, monkeypatch):
         calls = []
+        rotations = []
 
         def bot_wall(self, url, download=False):
             calls.append(FakeYDL.opts_client())
@@ -116,11 +149,31 @@ class TestExtractInfoSync:
             )
 
         monkeypatch.setattr(dl, "PROXY", "")
-        monkeypatch.setattr(dl, "rotate_warp_ip", lambda: False)
+        monkeypatch.setattr(dl, "rotate_warp_ip", lambda: rotations.append(True) or False)
         monkeypatch.setattr(FakeYDL, "extract_info", bot_wall)
         with pytest.raises(dl.yt_dlp.utils.DownloadError):
             dl._extract_info_sync("https://www.youtube.com/watch?v=abc")
         assert len(calls) == 2, "do not burn the remaining clients after repeated IP-level denial"
+        assert rotations == [], "direct requests must not trigger a global WARP reconnect"
+
+    def test_bot_wall_retries_once_after_verified_warp_change(self, fake_ydl, monkeypatch):
+        calls = []
+        rotations = []
+
+        def bot_wall(self, url, download=False):
+            calls.append(FakeYDL.opts_client())
+            raise dl.yt_dlp.utils.DownloadError("Sign in to confirm you're not a bot")
+
+        monkeypatch.setattr(dl, "PROXY", "socks5://127.0.0.1:40000")
+        monkeypatch.setattr(dl, "PROXY_HOSTS", ("youtube.com",))
+        monkeypatch.setattr(
+            dl, "rotate_warp_ip", lambda: rotations.append(True) or True
+        )
+        monkeypatch.setattr(FakeYDL, "extract_info", bot_wall)
+        with pytest.raises(dl.yt_dlp.utils.DownloadError):
+            dl._extract_info_sync("https://www.youtube.com/watch?v=abc")
+        assert rotations == [True]
+        assert len(calls) == 2
 
     def test_meta_cache_hit_avoids_extract(self, fake_ydl, monkeypatch):
         url = "https://www.youtube.com/watch?v=cached"
@@ -144,6 +197,85 @@ class TestExtractInfoSync:
         assert "youtubepot-bgutilhttp" not in fake_ydl.last_opts.get(
             "extractor_args", {}
         )
+
+    def test_youtube_uses_proxy_for_the_complete_ytdlp_request(self, fake_ydl, monkeypatch):
+        monkeypatch.setattr(dl, "PROXY", "socks5://127.0.0.1:40000")
+        monkeypatch.setattr(dl, "PROXY_HOSTS", ["youtube.com", "youtu.be"])
+        dl._extract_info_sync("https://www.youtube.com/watch?v=abc")
+        assert fake_ydl.last_opts["proxy"] == "socks5://127.0.0.1:40000"
+
+    def test_media_probe_is_a_bounded_range_and_uses_youtube_proxy(self, monkeypatch):
+        captured = {}
+
+        class ProbeYDL:
+            def __init__(self, opts):
+                captured["opts"] = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def urlopen(self, request):
+                captured["range"] = request.get_header("Range")
+                return type(
+                    "Response",
+                    (),
+                    {"read": lambda self, n: b"x" * n, "close": lambda self: None},
+                )()
+
+        monkeypatch.setattr(dl.yt_dlp, "YoutubeDL", ProbeYDL)
+        monkeypatch.setattr(dl, "PROXY", "socks5://127.0.0.1:40000")
+        monkeypatch.setattr(dl, "PROXY_HOSTS", ("youtube.com",))
+        count = dl.probe_youtube_media_bytes(
+            {
+                "formats": [
+                    {
+                        "url": "https://media.invalid/signed?secret=not-logged",
+                        "protocol": "https",
+                        "vcodec": "avc1",
+                        "acodec": "mp4a",
+                    }
+                ]
+            }
+        )
+        assert count == 1024
+        assert captured["range"] == "bytes=0-1023"
+        assert captured["opts"]["proxy"] == "socks5://127.0.0.1:40000"
+
+    def test_media_probe_sanitizes_signed_url_from_errors(self, monkeypatch):
+        signed_url = "https://media.invalid/file?signature=private"
+
+        class BrokenYDL:
+            def __init__(self, opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def urlopen(self, request):
+                raise OSError(f"request failed for {signed_url}")
+
+        monkeypatch.setattr(dl.yt_dlp, "YoutubeDL", BrokenYDL)
+        with pytest.raises(RuntimeError) as exc:
+            dl.probe_youtube_media_bytes(
+                {
+                    "formats": [
+                        {
+                            "url": signed_url,
+                            "protocol": "https",
+                            "vcodec": "avc1",
+                            "acodec": "mp4a",
+                        }
+                    ]
+                }
+            )
+        assert signed_url not in str(exc.value)
+        assert "OSError" in str(exc.value)
 
     def test_job_cookies_cleaned_up(self, fake_ydl, monkeypatch, tmp_path):
         jar = tmp_path / "cookies.job_test123.txt"

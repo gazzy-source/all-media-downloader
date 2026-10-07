@@ -203,12 +203,10 @@ WARMUP_URL: str = (
 PROXY_BLIP_RETRIES: int = int(os.getenv("PROXY_BLIP_RETRIES", "2"))
 PROXY_BLIP_BACKOFF: float = float(os.getenv("PROXY_BLIP_BACKOFF", "1.5"))
 
-# When YouTube answers "Sign in to confirm you're not a bot" through the proxy,
-# the WARP exit IP itself has been flagged — every strategy shares it, so the
-# whole ladder fails in seconds (production: 19 of ~80 warmups, plus real user
-# links, over 2026-09-29..10-01). A `warp-cli disconnect && connect` hands out
-# a fresh exit IP in ~2s. 1 = rotate WARP and retry once (needs warp-cli on
-# PATH and PROXY pointing at WARP); 0 = off, the default.
+# On an explicit YouTube bot wall, an enabled rotation attempts a WARP
+# reconnect. The downloader retries only if the configured proxy egress IP
+# changes; a successful local reconnect alone is not evidence of a new route.
+# 1 = enable this guarded attempt; 0 = off, the default.
 WARP_ROTATE_ON_BOTCHECK: bool = os.getenv(
     "WARP_ROTATE_ON_BOTCHECK", "0"
 ).strip().lower() in ("1", "true", "yes", "on")

@@ -262,9 +262,9 @@ async def _warm_youtube_pipeline() -> None:
     link after a restart versus ~3s once warm, and the user watching that
     reasonably read it as the bot hanging.
 
-    Strictly best effort: metadata only, never fatal, and it holds nothing the
-    request path needs. A failure here says nothing about the bot's health —
-    the link may simply be gone — so it logs at debug and moves on.
+    Best effort and never fatal to startup. YouTube warm-up checks both
+    metadata and a 1 KiB media range, so metadata-only success cannot hide a
+    broken token, route, or media URL. Failures update the warm-up signal.
     """
     if not WARMUP_ON_START:
         return
@@ -272,10 +272,18 @@ async def _warm_youtube_pipeline() -> None:
 
     started = time.time()
     try:
-        await asyncio.wait_for(
+        info = await asyncio.wait_for(
             download_manager.extract_info(WARMUP_URL, limit=120), timeout=120
         )
-        logger.info("Warmed the YouTube pipeline in %.1fs", time.time() - started)
+        from bot.services.downloader import probe_youtube_media_bytes
+
+        await asyncio.wait_for(
+            asyncio.to_thread(probe_youtube_media_bytes, info.raw), timeout=15
+        )
+        logger.info(
+            "YouTube warm-up passed metadata and media-byte probe in %.1fs",
+            time.time() - started,
+        )
         heartbeat.warmup_result(True)
     except asyncio.CancelledError:
         raise

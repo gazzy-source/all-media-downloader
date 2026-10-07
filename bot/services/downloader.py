@@ -532,6 +532,74 @@ def _is_youtube_bot_wall(message: str) -> bool:
     ) or "confirm you're not a bot" in low or "confirm you are not a bot" in low
 
 
+def _yt_strategy_label(strategy: dict[str, Any], opts: dict[str, Any]) -> str:
+    """Safe, low-cardinality strategy description for operational logs."""
+    yt_args = (opts.get("extractor_args") or {}).get("youtube") or {}
+    clients = yt_args.get("player_client") or []
+    client = "+".join(str(c) for c in clients) if clients else "default"
+    if strategy.get("_warp_retry"):
+        client += "+warp-retry"
+    return client
+
+
+def _yt_failure_class(message: str) -> str:
+    """Classify failures without logging URLs, tokens, or raw extractor text."""
+    low = (message or "").lower()
+    if _is_youtube_bot_wall(low):
+        return "bot_wall"
+    if any(x in low for x in ("socks5error", "proxyerror", "proxy error", "connection refused")):
+        return "proxy_transport"
+    if "http error 403" in low or "unable to download video data" in low:
+        return "media_403"
+    if "private video" in low or "video unavailable" in low or "has been removed" in low:
+        return "content_unavailable"
+    if "age" in low and ("confirm" in low or "restricted" in low):
+        return "age_restricted"
+    if any(x in low for x in ("sslerror", "tls", "connection was reset", "recv failure")):
+        return "transport"
+    return "extractor_error"
+
+
+def probe_youtube_media_bytes(info: dict[str, Any], byte_count: int = 1024) -> int:
+    """Read a tiny range from an extracted YouTube format using yt-dlp's proxy.
+
+    This checks that metadata URLs are usable without downloading the media.
+    The URL and response are intentionally never logged or returned.
+    """
+    import urllib.request
+
+    formats = [
+        fmt for fmt in (info.get("formats") or [])
+        if fmt.get("url") and str(fmt.get("protocol") or "").startswith("http")
+        and fmt.get("vcodec") != "none"
+    ]
+    if not formats:
+        raise RuntimeError("YouTube metadata had no directly probeable video format")
+    # Prefer a progressive/single-file format so this stays one bounded request.
+    formats.sort(key=lambda fmt: bool(fmt.get("acodec") == "none"))
+    fmt = formats[0]
+    headers = dict(info.get("http_headers") or {})
+    headers.update(fmt.get("http_headers") or {})
+    headers["Range"] = f"bytes=0-{max(0, byte_count - 1)}"
+    request = urllib.request.Request(str(fmt["url"]), headers=headers)
+    opts = _base_opts(host="www.youtube.com")
+    opts["socket_timeout"] = 8
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            response = ydl.urlopen(request)
+            try:
+                payload = response.read(byte_count)
+            finally:
+                response.close()
+    except Exception as exc:
+        status = getattr(exc, "status", None) or getattr(exc, "code", None)
+        category = f"http_{status}" if status else type(exc).__name__
+        raise RuntimeError(f"YouTube media range probe failed ({category})") from None
+    if not payload:
+        raise RuntimeError("YouTube media range probe returned no bytes")
+    return len(payload)
+
+
 def _base_opts(
     *,
     host: str = "",
@@ -1314,6 +1382,14 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
             if strat.get("drop_impersonate"):
                 opts.pop("impersonate", None)
             attempt_started = time.monotonic()
+            if is_yt:
+                logger.info(
+                    "YT attempt phase=metadata strategy=%s proxy=%s pot=%s cookies=%s",
+                    _yt_strategy_label(strat, opts),
+                    "warp" if opts.get("proxy") else "off",
+                    "yes" if "youtubepot-bgutilhttp" in (opts.get("extractor_args") or {}) else "no",
+                    "yes" if opts.get("cookiefile") else "no",
+                )
             try:
                 info = _run(opts)
                 logger.info(
@@ -1327,6 +1403,13 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
             except yt_dlp.utils.DownloadError as e:
                 last_err = e
                 err = str(e).lower()
+                if is_yt:
+                    logger.warning(
+                        "YT attempt failed phase=metadata strategy=%s class=%s elapsed=%.1fs",
+                        _yt_strategy_label(strat, opts),
+                        _yt_failure_class(err),
+                        time.monotonic() - attempt_started,
+                    )
                 if _is_youtube_bot_wall(err):
                     bot_wall_failures += 1
                     if bot_wall_failures >= 2:
@@ -1388,12 +1471,13 @@ def _extract_info_sync(url: str) -> dict[str, Any]:
                 # Any other client-specific failure (bot wall, page reload,
                 # throttling, transient 5xx) is worth a retry with the next
                 # strategy — different clients genuinely fail differently.
-                logger.warning(
-                    "extract_info attempt %s failed after %.1fs: %s",
-                    si,
-                    time.monotonic() - attempt_started,
-                    str(e).split("\n")[-1][:120],
-                )
+                if not is_yt:
+                    logger.warning(
+                        "extract_info attempt %s failed after %.1fs: %s",
+                        si,
+                        time.monotonic() - attempt_started,
+                        str(e).split("\n")[-1][:120],
+                    )
                 continue
         if last_err:
             raise last_err
@@ -2211,6 +2295,15 @@ class DownloadManager:
             if strat.get("drop_impersonate"):
                 attempt_base.pop("impersonate", None)
 
+            if is_yt:
+                logger.info(
+                    "YT attempt phase=download strategy=%s proxy=%s pot=%s cookies=%s",
+                    _yt_strategy_label(strat, attempt_base),
+                    "warp" if attempt_base.get("proxy") else "off",
+                    "yes" if "youtubepot-bgutilhttp" in (attempt_base.get("extractor_args") or {}) else "no",
+                    "yes" if attempt_base.get("cookiefile") else "no",
+                )
+
             if on_stage is not None:
                 # yt-dlp only drives progress_hooks once bytes are moving, so
                 # extraction — 5s on a good day, far longer when strategies
@@ -2235,6 +2328,7 @@ class DownloadManager:
                 fmt = formats_to_try[fi]
                 attempt_opts = dict(attempt_base)
                 attempt_opts["format"] = fmt
+                attempt_started = time.monotonic()
                 try:
                     with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                         info = ydl.extract_info(url, download=True)
@@ -2255,6 +2349,13 @@ class DownloadManager:
                 except yt_dlp.utils.DownloadError as e:
                     last_err = e
                     err = str(e).lower()
+                    if is_yt:
+                        logger.warning(
+                            "YT attempt failed phase=download strategy=%s class=%s elapsed=%.1fs",
+                            _yt_strategy_label(strat, attempt_opts),
+                            _yt_failure_class(err),
+                            time.monotonic() - attempt_started,
+                        )
                     if _is_youtube_bot_wall(err):
                         bot_wall_failures += 1
                         if bot_wall_failures >= 2:
@@ -2357,12 +2458,13 @@ class DownloadManager:
                         fi += 1
                         continue
                     if bot_check or format_issue or stream_fail or transport_fail:
-                        logger.warning(
-                            "Attempt failed (si=%s fi=%s): %s",
-                            si,
-                            fi,
-                            str(e).split("\n")[-1][:120],
-                        )
+                        if not is_yt:
+                            logger.warning(
+                                "Attempt failed (si=%s fi=%s): %s",
+                                si,
+                                fi,
+                                str(e).split("\n")[-1][:120],
+                            )
                         break  # next strategy
                     raise
                 fi += 1

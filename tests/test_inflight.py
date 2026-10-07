@@ -137,9 +137,17 @@ class TestFailurePathsClearTheRegistry:
                        if isinstance(n, ast.Call)
                        and getattr(n.func, "id", "") == "inflight_remove"}
             lines = src.split("\n")
+            parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
             unguarded = []
             for node in ast.walk(fn):
                 if not isinstance(node, ast.Return) or node.lineno <= add_line:
+                    continue
+                parent = parents.get(node)
+                while parent is not None and parent is not fn:
+                    if isinstance(parent, (ast.AsyncFunctionDef, ast.FunctionDef, ast.Lambda)):
+                        break  # A nested callback return does not exit the outer handler.
+                    parent = parents.get(parent)
+                if parent is not fn:
                     continue
                 # the remove must be one of the few lines immediately before
                 if not any(r in range(node.lineno - 3, node.lineno) for r in removes):

@@ -63,6 +63,13 @@ def fake_ydl(monkeypatch):
 
 
 class TestExtractInfoSync:
+    def test_metadata_success_records_explicit_winner(self, fake_ydl, caplog):
+        import logging
+        caplog.set_level(logging.INFO)
+        dl._extract_info_sync("https://www.youtube.com/watch?v=winner", job_id="winner123")
+        assert "winner=visionos" in caplog.text
+        assert "phase=metadata" in caplog.text and "outcome=success" in caplog.text
+
     @pytest.mark.parametrize(
         "message",
         [
@@ -91,7 +98,7 @@ class TestExtractInfoSync:
         assert not dl._is_youtube_bot_wall(message)
 
     def test_failure_classification_does_not_collapse_transport_into_bot_wall(self):
-        assert dl._yt_failure_class("Socks5Error: Connection refused") == "proxy_transport"
+        assert dl._yt_failure_class("Socks5Error: Connection refused") == "proxy_refused"
         assert dl._yt_failure_class("HTTP Error 403: Forbidden") == "media_403"
         assert dl._yt_failure_class("Sign in to confirm you're not a bot") == "bot_wall"
 
@@ -149,7 +156,7 @@ class TestExtractInfoSync:
             )
 
         monkeypatch.setattr(dl, "PROXY", "")
-        monkeypatch.setattr(dl, "rotate_warp_ip", lambda: rotations.append(True) or False)
+        monkeypatch.setattr(dl, "rotate_warp_ip", lambda **kwargs: rotations.append(True) or False)
         monkeypatch.setattr(FakeYDL, "extract_info", bot_wall)
         with pytest.raises(dl.yt_dlp.utils.DownloadError):
             dl._extract_info_sync("https://www.youtube.com/watch?v=abc")
@@ -167,7 +174,7 @@ class TestExtractInfoSync:
         monkeypatch.setattr(dl, "PROXY", "socks5://127.0.0.1:40000")
         monkeypatch.setattr(dl, "PROXY_HOSTS", ("youtube.com",))
         monkeypatch.setattr(
-            dl, "rotate_warp_ip", lambda: rotations.append(True) or True
+            dl, "rotate_warp_ip", lambda **kwargs: rotations.append(True) or True
         )
         monkeypatch.setattr(FakeYDL, "extract_info", bot_wall)
         with pytest.raises(dl.yt_dlp.utils.DownloadError):
@@ -298,14 +305,16 @@ class TestDownloadStrategyFallback:
     """_extract_with_format_fallback: the path that actually fetches bytes."""
 
     @staticmethod
-    def _run(url, fail_on, opts=None):
+    def _run(url, fail_on, opts=None, job_id=""):
         FakeYDL.fail_on = fail_on
         mgr = dl.DownloadManager.__new__(dl.DownloadManager)
         base = {"format": "b[height<=1080]/bv*+ba/b", "http_headers": {}}
         base.update(opts or {})
-        return mgr._extract_with_format_fallback(base, url, "t")
+        return mgr._extract_with_format_fallback(base, url, "t", job_id=job_id)
 
-    def test_yt_403_falls_through_to_android(self, fake_ydl, monkeypatch):
+    def test_yt_403_falls_through_to_android(self, fake_ydl, monkeypatch, caplog):
+        import logging
+        caplog.set_level(logging.INFO)
         """Regression: SABR 403s on the default rotation must not fail the job."""
         monkeypatch.setattr(dl, "_YT_WINNER_DL", 0)
 
@@ -319,11 +328,20 @@ class TestDownloadStrategyFallback:
 
         monkeypatch.setattr(FakeYDL, "extract_info", boom)
         info, prepared, title = self._run(
-            "https://www.youtube.com/watch?v=abc", set()
+            "https://www.youtube.com/watch?v=abc", set(), job_id="media4031"
         )
         assert info["title"] == "ok"
         assert fake_ydl.opts_client() == "android"
         assert dl._YT_WINNER_DL == 2, "android (base idx 2) must become the sticky download winner"
+        assert "phase=media_probe outcome=failure class=media_403" in caplog.text
+
+    def test_download_success_records_explicit_winner(self, fake_ydl, caplog):
+        import logging
+        caplog.set_level(logging.INFO)
+        self._run("https://www.youtube.com/watch?v=winner", set(),
+                  opts={"format": "b[height<=1080]/bv*+ba/b"}, job_id="dlwinner1")
+        assert "phase=download_strategy" in caplog.text
+        assert "winner=visionos" in caplog.text
 
     def test_generic_host_retries_without_impersonation(self, fake_ydl, monkeypatch):
         """A curl_cffi TLS failure must not be fatal on a one-strategy host."""
@@ -369,7 +387,7 @@ class TestDownloadStrategyFallback:
             )
 
         monkeypatch.setattr(dl, "PROXY", "")
-        monkeypatch.setattr(dl, "rotate_warp_ip", lambda: False)
+        monkeypatch.setattr(dl, "rotate_warp_ip", lambda **kwargs: False)
         monkeypatch.setattr(FakeYDL, "extract_info", bot_wall)
         with pytest.raises(dl.yt_dlp.utils.DownloadError):
             self._run("https://www.youtube.com/watch?v=abc", set())

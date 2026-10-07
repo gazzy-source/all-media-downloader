@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import hashlib
 import logging
 import shutil
 import subprocess
@@ -10,6 +11,7 @@ import threading
 import time
 
 from bot.config import PROXY, WARP_ROTATE_COOLDOWN, WARP_ROTATE_ON_BOTCHECK
+from bot.services.yt_telemetry import emit
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +63,12 @@ def _proxy_egress_ip() -> str | None:
         return None
 
 
-def rotate_warp_ip() -> bool:
+def _safe_egress_hash(value: str | None) -> str:
+    """Opaque equality fingerprint; raw egress addresses are never logged."""
+    return hashlib.sha256(value.encode("ascii")).hexdigest()[:12] if value else "unknown"
+
+
+def rotate_warp_ip(*, job_id: str = "", phase: str = "metadata", reason: str = "bot_wall") -> bool:
     """
     Reconnect WARP and return True only when the configured egress changes.
 
@@ -70,22 +77,35 @@ def rotate_warp_ip() -> bool:
     bot flap the tunnel under every other in-flight download.
     """
     global _LAST_ROTATION, _LAST_SUCCESS
+    started = time.monotonic()
+    before_hash = "unknown"
+
+    def finish(ok: bool, *, after: str | None = None, outcome: str | None = None) -> bool:
+        after_hash = _safe_egress_hash(after)
+        changed = ("unknown" if before_hash == "unknown" or after is None else
+                   "yes" if before_hash != after_hash else "no")
+        emit(job_id, "warp_reconnect", trigger_phase=phase, reason=reason,
+             egress_before=before_hash, egress_after=after_hash,
+             egress_changed=changed, outcome=outcome or ("connected" if ok else "failed"),
+             elapsed_ms=int((time.monotonic() - started) * 1000))
+        return ok
     if not (WARP_ROTATE_ON_BOTCHECK and PROXY):
-        return False
+        return finish(False, outcome="skipped")
     if shutil.which("warp-cli") is None:
-        return False
+        return finish(False)
     with _LOCK:
         if _LAST_SUCCESS and time.monotonic() - _LAST_SUCCESS < 10:
             # Another job rotated moments ago — its fresh IP is ours too.
-            return True
+            return finish(True, outcome="connected")
         since = time.monotonic() - _LAST_ROTATION
         if _LAST_ROTATION and since < WARP_ROTATE_COOLDOWN:
-            return False
+            return finish(False, outcome="skipped")
 
         before = _proxy_egress_ip()
         if before is None:
             logger.warning("WARP egress probe failed; skipping reconnect and retry")
-            return False
+            return finish(False)
+        before_hash = _safe_egress_hash(before)
 
         _LAST_ROTATION = time.monotonic()
         try:
@@ -99,15 +119,15 @@ def rotate_warp_ip() -> bool:
                         logger.warning(
                             "WARP reconnected; egress verification failed; skipping retry"
                         )
-                        return False
+                        return finish(False)
                     if before == after:
                         logger.warning(
                             "WARP reconnected; egress unchanged; skipping retry"
                         )
-                        return False
+                        return finish(False, after=after, outcome="connected")
                     logger.warning("WARP reconnected; egress changed")
                     _LAST_SUCCESS = time.monotonic()
-                    return True
+                    return finish(True, after=after, outcome="connected")
                 time.sleep(0.5)
             logger.error("WARP did not reconnect within 15s after rotation")
         except (OSError, subprocess.SubprocessError) as e:
@@ -118,4 +138,4 @@ def rotate_warp_ip() -> bool:
             _warp_cli("connect")
         except (OSError, subprocess.SubprocessError) as e:
             logger.error("WARP reconnect after a failed rotation also failed: %s", e)
-        return False
+        return finish(False)

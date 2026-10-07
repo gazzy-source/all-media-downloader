@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from pathlib import Path
@@ -49,6 +50,7 @@ from bot.services.inflight import add as inflight_add, remove as inflight_remove
 from bot.services.media_detect import detect_mode
 from bot.services.rate_limit import rate_limiter
 from bot.services.session import DownloadSession, sessions
+from bot.services.yt_telemetry import classify_failure, emit, emit_terminal, new_job_id
 from bot.utils.safe_fetch import UnresolvableURLError, UnsafeURLError, check_public_url
 from bot.utils.helpers import (
     extract_urls,
@@ -59,6 +61,17 @@ from bot.utils.helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _extract_with_job_id(url: str, job_id: str):
+    """Pass telemetry context when supported; keeps lightweight test doubles valid."""
+    fn = download_manager.extract_info
+    try:
+        params = inspect.signature(fn).parameters.values()
+        supports_job_id = any(p.name == "job_id" or p.kind == p.VAR_KEYWORD for p in params)
+    except (TypeError, ValueError):
+        supports_job_id = False
+    return await fn(url, job_id=job_id) if supports_job_id else await fn(url)
 
 
 def _is_group_chat(update: Update) -> bool:
@@ -235,6 +248,7 @@ async def auto_download_flow(
     if not chat or not msg or actor is None:
         return False
     platform = platform_from_url(url)
+    telemetry_id = new_job_id() if "youtube" in platform.lower() else ""
 
     allowed, retry = rate_limiter.allow(actor)
     if not allowed and actor not in ADMIN_IDS:
@@ -289,6 +303,8 @@ async def auto_download_flow(
     repeat = inline_cache.repeat_key(mode, quality, "mp3")
     hit = inline_cache.get(url, repeat) if repeat else None
     if hit:
+        emit(telemetry_id, "cache", outcome="hit", kind=hit.get("kind", "unknown"),
+             cache_hit="yes", delivery="cached_swap", avoided_download="yes")
         is_chan = chat.type == "channel"
         title = _esc((hit.get("title") or "Media")[:100])
         sent = await _send_cached(
@@ -303,7 +319,9 @@ async def auto_download_flow(
                     and _is_link_only_post(msg)):
                 await _try_delete(context, chat.id, msg.message_id)
             record_download(actor, url, hit.get("title") or "", platform, mode, quality, True)
+            emit_terminal(telemetry_id, "success", delivery="cached")
             return True
+    emit(telemetry_id, "cache", outcome="miss", cache_hit="no", delivery="fresh_download")
 
     view = ProgressView()
     head = f"⚡ <b>{kind}</b> · {_esc(platform)}"
@@ -327,23 +345,27 @@ async def auto_download_flow(
     inflight_add(chat.id, status.message_id)
     try:
         await context.bot.send_chat_action(chat.id, ChatAction.UPLOAD_DOCUMENT)
+        queue_entered = time.monotonic()
+        emit(telemetry_id, "queue", outcome="queue_enter")
+        async def _queued_download():
+            emit(telemetry_id, "queue", outcome="queue_start",
+                 queue_wait_ms=int((time.monotonic() - queue_entered) * 1000))
+            return await download_manager.download(
+                url=url, mode=mode, quality=quality, title_hint="media",
+                progress_cb=on_progress, cancel=job.event, job_id=telemetry_id,
+            )
         result = await jobs.run_queued(
             job, download_queue,
-            lambda: download_manager.download(
-                url=url,
-                mode=mode,
-                quality=quality,
-                title_hint="media",
-                progress_cb=on_progress,
-                cancel=job.event,
-            ),
+            _queued_download,
             on_position=lambda n: on_progress(0, f"Queued — you're #{n} in line"),
             priority=user_prefs.is_premium(actor),
         )
     except asyncio.CancelledError:
         jobs.drop(job)
         if not job.cancelled:
+            emit_terminal(telemetry_id, "failure", **{"class": "shutdown"})
             raise
+        emit_terminal(telemetry_id, "cancelled", **{"class": "cancelled"})
         if not jobs.SHUTTING_DOWN:  # on shutdown: keep it for the restart notice
             inflight_remove(chat.id, status.message_id)
         return False
@@ -351,6 +373,7 @@ async def auto_download_flow(
         jobs.drop(job)
         ticker.cancel()
         logger.exception("auto download crashed")
+        emit_terminal(telemetry_id, "failure", **{"class": classify_failure(str(e))})
         record_download(actor, url, "", platform, mode, quality, False, error=str(e))
         try:
             await status.edit_text(
@@ -368,11 +391,13 @@ async def auto_download_flow(
     if job.cancelled or not (result.success and result.primary):
         jobs.drop(job)  # nothing will be sent; otherwise kept cancellable until sending
     if job.cancelled:  # its message is already gone (or we are shutting down)
+        emit_terminal(telemetry_id, "cancelled", **{"class": "cancelled"})
         if not jobs.SHUTTING_DOWN:
             inflight_remove(chat.id, status.message_id)
         download_manager.cleanup_result_files(result)
         return False
     if not result.success or not result.primary:
+        emit_terminal(telemetry_id, "failure", **{"class": classify_failure(result.error or "")})
         record_download(
             actor,
             url,
@@ -425,6 +450,18 @@ async def auto_download_flow(
 
     try:
         if size > MAX_FILE_SIZE_BYTES:
+            cached_info = download_manager.cached_media_info(url) if mode == "video" else None
+            recommendation, recommended_bytes = "none", "none"
+            if cached_info:
+                from bot.services.downloader import recommend_fitting_quality
+                rec = recommend_fitting_quality(cached_info.available_heights,
+                                                cached_info.estimated_sizes,
+                                                quality, MAX_FILE_SIZE_BYTES)
+                if rec:
+                    recommendation, recommended_bytes = rec.quality, rec.estimated_bytes
+            emit(telemetry_id, "size_guard", outcome="rejected", actual_bytes=size,
+                 limit_bytes=MAX_FILE_SIZE_BYTES, recommendation=recommendation,
+                 recommended_estimated_bytes=recommended_bytes)
             if is_channel:
                 try:
                     await status.delete()
@@ -447,6 +484,7 @@ async def auto_download_flow(
                 actor, url, result.title or "", platform, mode, quality, False,
                 file_size=size, error="File too large",
             )
+            emit_terminal(telemetry_id, "failure", **{"class": "size_limit"})
             inflight_remove(chat.id, status.message_id)
             return False
 
@@ -467,6 +505,7 @@ async def auto_download_flow(
                 context, chat.id, path, result, caption, reply_markup=actions,
                 thread_id=_thread_of(msg),
                 cancel=job.event, on_reserved=lambda: setattr(job, "cancellable", False),
+                job_id=telemetry_id,
             )
             _remember_upload(url, repeat, sent, result.title or "", result, mode, quality)
         record_download(
@@ -474,6 +513,7 @@ async def auto_download_flow(
             file_size=size,
         )
         delivered = True
+        emit_terminal(telemetry_id, "success", total_ms=int(view.elapsed() * 1000))
         try:
             await status.delete()
         except TelegramError:
@@ -483,9 +523,11 @@ async def auto_download_flow(
                 except TelegramError:
                     pass
     except UploadCancelled:
+        emit_terminal(telemetry_id, "cancelled", **{"class": "cancelled"})
         pass  # cancelled while waiting to send: its message is already gone
     except TelegramError as e:
         logger.exception("auto upload failed")
+        emit_terminal(telemetry_id, "failure", **{"class": "upload_error"})
         record_download(
             actor, url, result.title or "", platform, mode, quality, False,
             file_size=size, error=str(e),
@@ -527,6 +569,7 @@ async def start_url_flow(
     if await _refuse_private_url(msg, url):
         return
 
+    telemetry_id = new_job_id() if "youtube" in platform_from_url(url).lower() else ""
     status = await msg.reply_text("🔍 <b>Reading link…</b>", parse_mode=ParseMode.HTML)
     # Analysis can take tens of seconds on a slow platform. A restart in
     # that window used to leave this message frozen on Analyzing forever,
@@ -558,9 +601,10 @@ async def start_url_flow(
         # Bounded: a flaky connection used to leave this running for minutes
         # (254s seen in production) with the user simply waiting.
         info = await asyncio.wait_for(
-            download_manager.extract_info(url), timeout=EXTRACT_TIMEOUT
+            _extract_with_job_id(url, telemetry_id), timeout=EXTRACT_TIMEOUT
         )
     except asyncio.TimeoutError:
+        emit_terminal(telemetry_id, "failure", **{"class": "timeout"})
         logger.warning("extract_info timed out after %ss: %s", EXTRACT_TIMEOUT, redact.url(url))
         body = (
             "⏱ <b>Took too long to read this link</b>\n\n"
@@ -577,6 +621,7 @@ async def start_url_flow(
         rate_limiter.refund(user.id)
         return
     except Exception as e:
+        emit_terminal(telemetry_id, "failure", **{"class": classify_failure(str(e))})
         logger.exception("extract_info failed")
         rate_limiter.refund(user.id)
         from bot.services.downloader import DownloadManager
@@ -609,6 +654,7 @@ async def start_url_flow(
         inflight_remove(chat.id, status.message_id)
 
     if info.is_live:
+        emit_terminal(telemetry_id, "failure", **{"class": "other"})
         await status.edit_text(
             "🔴 This looks like a <b>live stream</b>. Live recording is limited.\n"
             "Try again after the stream ends, or send a VOD/clip link.",
@@ -622,6 +668,7 @@ async def start_url_flow(
         user_id=user.id,
         chat_id=chat.id,
         url=url,
+        telemetry_id=telemetry_id,
         title=info.title,
         platform=info.platform,
         duration=info.duration,
@@ -1284,6 +1331,9 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
     # the largest one alone can be a codec yt-dlp would never pick.
     floor = (session.min_sizes or {}).get(quality) or est
     if est and floor and floor > MAX_FILE_SIZE_BYTES:
+        emit(session.telemetry_id, "size_guard", outcome="precheck_rejected",
+             estimated_bytes=floor, limit_bytes=MAX_FILE_SIZE_BYTES,
+             recommendation="none")
         tip = oversized_video_advice(
             session.available_heights,
             session.estimated_sizes or {},
@@ -1306,6 +1356,8 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
     repeat = inline_cache.repeat_key(mode, quality, session.audio_format)
     hit = inline_cache.get(session.url, repeat) if repeat else None
     if hit:
+        emit(session.telemetry_id, "cache", outcome="hit", kind=hit.get("kind", "unknown"),
+             cache_hit="yes", delivery="cached_swap", avoided_download="yes")
         # Fetched before (by anyone, inline or not) at this exact quality:
         # Telegram already has the file, so this is instant.
         title = _esc((hit.get("title") or session.title or "Media")[:100])
@@ -1318,12 +1370,14 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         if sent is not None:
             record_download(session.user_id, session.url, session.title, session.platform,
                             mode, quality, True)
+            emit_terminal(session.telemetry_id, "success", delivery="cached")
             sessions.remove(session.session_id)
             try:
                 await query.message.delete()
             except TelegramError:
                 pass
             return
+    emit(session.telemetry_id, "cache", outcome="miss", cache_hit="no", delivery="fresh_download")
 
     inflight_add(chat_id, query.message.message_id)
     # Registered only now: every return above would otherwise leak the job.
@@ -1337,29 +1391,33 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         pass
     try:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
+        queue_entered = time.monotonic()
+        emit(session.telemetry_id, "queue", outcome="queue_enter")
+        async def _queued_download():
+            emit(session.telemetry_id, "queue", outcome="queue_start",
+                 queue_wait_ms=int((time.monotonic() - queue_entered) * 1000))
+            return await download_manager.download(
+                url=session.url, mode=mode, quality=quality,
+                subtitle_lang=session.subtitle_lang, audio_format=session.audio_format,
+                title_hint=session.title or "media", progress_cb=on_progress,
+                cancel=job.event, job_id=session.telemetry_id,
+            )
         result = await jobs.run_queued(
             job, download_queue,
-            lambda: download_manager.download(
-                url=session.url,
-                mode=mode,
-                quality=quality,
-                subtitle_lang=session.subtitle_lang,
-                audio_format=session.audio_format,
-                title_hint=session.title or "media",
-                progress_cb=on_progress,
-                cancel=job.event,
-            ),
+            _queued_download,
             on_position=lambda n: on_progress(0, f"Queued — you're #{n} in line"),
             priority=user_prefs.is_premium(session.user_id),
         )
     except asyncio.CancelledError:
         if not job.cancelled:
+            emit_terminal(session.telemetry_id, "failure", **{"class": "shutdown"})
             raise
         result = None
     except Exception as e:
         jobs.drop(job)
         ticker.cancel()
         logger.exception("download crashed")
+        emit_terminal(session.telemetry_id, "failure", **{"class": classify_failure(str(e))})
         record_download(
             session.user_id,
             session.url,
@@ -1386,6 +1444,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
     if job.cancelled or not (result.success and result.primary):
         jobs.drop(job)  # nothing will be sent; otherwise kept cancellable until sending
     if job.cancelled:
+        emit_terminal(session.telemetry_id, "cancelled", **{"class": "cancelled"})
         # The message is already gone — or the bot is stopping, in which case
         # it stays registered and the restart tells the user "Interrupted".
         if not jobs.SHUTTING_DOWN:
@@ -1395,6 +1454,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
             download_manager.cleanup_result_files(result)
         return
     if not result.success or not result.primary:
+        emit_terminal(session.telemetry_id, "failure", **{"class": classify_failure(result.error or "")})
         record_download(
             session.user_id,
             session.url,
@@ -1445,6 +1505,15 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
 
     try:
         if size > MAX_FILE_SIZE_BYTES:
+            from bot.services.downloader import recommend_fitting_quality
+            rec = recommend_fitting_quality(session.available_heights,
+                                            session.estimated_sizes or {}, quality,
+                                            MAX_FILE_SIZE_BYTES) if mode == "video" else None
+            emit(session.telemetry_id, "size_guard", outcome="rejected",
+                 actual_bytes=size, limit_bytes=MAX_FILE_SIZE_BYTES,
+                 recommendation=rec.quality if rec else "none",
+                 recommended_estimated_bytes=rec.estimated_bytes if rec else "none")
+            emit_terminal(session.telemetry_id, "failure", **{"class": "size_limit"})
             advice = (
                 oversized_video_advice(
                     session.available_heights,
@@ -1483,6 +1552,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
             sent = await _send_media(
                 context, chat_id, path, result, caption, reply_markup=actions,
                 cancel=job.event, on_reserved=lambda: setattr(job, "cancellable", False),
+                job_id=session.telemetry_id,
             )
             _remember_upload(session.url, repeat, sent, result.title or session.title,
                              result, mode, quality)
@@ -1509,6 +1579,8 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
                 True,
                 file_size=size,
             )
+            emit_terminal(session.telemetry_id, "success",
+                          total_ms=int(view.elapsed() * 1000))
             # Remove progress/status message so chat isn't cluttered with a 2nd "Done"
             try:
                 await query.message.delete()
@@ -1521,9 +1593,11 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
                 except TelegramError:
                     pass
     except UploadCancelled:
+        emit_terminal(session.telemetry_id, "cancelled", **{"class": "cancelled"})
         pass  # cancelled while waiting to send: its messages are already gone
     except TelegramError as e:
         logger.exception("send media failed")
+        emit_terminal(session.telemetry_id, "failure", **{"class": "upload_error"})
         record_download(
             session.user_id,
             session.url,
@@ -1611,6 +1685,7 @@ async def _send_media(
     thread_id: int | None = None,
     cancel=None,
     on_reserved=None,
+    job_id: str = "",
 ):
     """
     Upload media with long timeouts and retries on TimedOut.
@@ -1627,13 +1702,31 @@ async def _send_media(
     if len(caption) > 1024:
         caption = caption[:1000] + "…"
 
-    async with upload_gate.reserve(path.stat().st_size, cancel):
+    upload_bytes = path.stat().st_size
+    wait_started = time.monotonic()
+    async with upload_gate.reserve(upload_bytes, cancel):
+        upload_wait_ms = int((time.monotonic() - wait_started) * 1000)
+        send_started = time.monotonic()
+        emit(job_id, "upload", outcome="upload_start", upload_wait_ms=upload_wait_ms,
+             bytes=upload_bytes, kind=getattr(result, "mode", "media"))
         if on_reserved is not None:
             on_reserved()
-        return await _send_media_attempts(
-            context, chat_id, path, result, caption, filename, reply_markup,
-            attempts, silent=silent, thread_id=thread_id,
-        )
+        try:
+            sent = await _send_media_attempts(
+                context, chat_id, path, result, caption, filename, reply_markup,
+                attempts, silent=silent, thread_id=thread_id,
+            )
+        except Exception:
+            emit(job_id, "upload", outcome="failure", **{"class": "telegram_refused"},
+                 upload_ms=int((time.monotonic() - send_started) * 1000),
+                 upload_wait_ms=upload_wait_ms, bytes=upload_bytes,
+                 kind=getattr(result, "mode", "media"))
+            raise
+        emit(job_id, "upload", outcome="success",
+             upload_ms=int((time.monotonic() - send_started) * 1000),
+             upload_wait_ms=upload_wait_ms, bytes=upload_bytes,
+             kind=getattr(result, "mode", "media"))
+        return sent
 
 
 async def _send_media_attempts(context, chat_id, path, result, caption, filename,

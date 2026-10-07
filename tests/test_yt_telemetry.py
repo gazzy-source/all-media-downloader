@@ -28,6 +28,7 @@ def test_failure_classification_is_shared_and_conservative():
     cases = {
         "Sign in to confirm you're not a bot": "bot_wall",
         "HTTP Error 403: Forbidden": "media_403",
+        "YouTube media range probe failed (http_403)": "media_403",
         "SOCKS5Error: Connection refused": "proxy_refused",
         "Sign in to confirm your age": "age_restricted",
         "Private video": "private",

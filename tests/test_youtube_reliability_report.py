@@ -49,3 +49,50 @@ def test_report_ignores_invalid_attempt_numbers():
         {"job": "bad", "phase": "complete", "outcome": "success"},
     ]
     assert "Metadata: 0 job(s) succeeded after an earlier attempt" in reporter.report(events)
+
+
+def test_report_complete_lifecycle_from_synthetic_event_stream():
+    lines = []
+    for index in range(1, 6):
+        job = f"job0000{index}"
+        lines.extend([
+            f"YT_EVENT job={job} phase=metadata attempt=1 strategy=visionos outcome=success winner=visionos",
+            f"YT_EVENT job={job} phase=metadata outcome=complete metadata_ms={index * 100}",
+            f"YT_EVENT job={job} phase=queue outcome=queue_start queue_wait_ms={index * 10}",
+            f"YT_EVENT job={job} phase=download_strategy attempt=1 strategy=visionos outcome=success winner=visionos",
+            f"YT_EVENT job={job} phase=download outcome=success download_ms={index * 1000}",
+            f"YT_EVENT job={job} phase=upload outcome=success upload_ms={index * 500} upload_wait_ms=20",
+            f"YT_EVENT job={job} phase=complete outcome=success total_ms={index * 2000}",
+        ])
+
+    events = reporter.parse(lines)
+    result = reporter.report(events)
+
+    assert "Terminal events: 5" in result
+    assert "Metadata analysis strategy winners" in result
+    assert "visionos: 5" in result
+    assert "Combined download/extraction strategy winners" in result
+    assert "queue: p50=30ms p95=50ms n=5" in result
+    assert "download: p50=3000ms p95=5000ms n=5" in result
+    assert "upload: p50=1500ms p95=2500ms n=5" in result
+    assert "complete: p50=6000ms p95=10000ms n=5" in result
+
+
+def test_report_uses_combined_winner_for_auto_download_without_analysis():
+    events = reporter.parse([
+        "YT_EVENT job=auto1234 phase=queue outcome=queue_start queue_wait_ms=11",
+        "YT_EVENT job=auto1234 phase=download_strategy attempt=1 strategy=visionos "
+        "outcome=success winner=visionos",
+        "YT_EVENT job=auto1234 phase=download outcome=success download_ms=8580",
+        "YT_EVENT job=auto1234 phase=upload outcome=success upload_ms=1200",
+        "YT_EVENT job=auto1234 phase=complete outcome=success total_ms=13440",
+    ])
+
+    result = reporter.report(events)
+
+    assert "Metadata analysis strategy winners\\n----------------------------------\\ninsufficient sample" in result
+    assert "Combined download/extraction strategy winners\\n----------------------------------------------\\nvisionos: 1" in result
+    assert "queue: observed_min=11ms observed_max=11ms; p50/p95 insufficient sample (n=1)" in result
+    assert "download: observed_min=8580ms observed_max=8580ms" in result
+    assert "upload: observed_min=1200ms observed_max=1200ms" in result
+    assert "complete: observed_min=13440ms observed_max=13440ms" in result

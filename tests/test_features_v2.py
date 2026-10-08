@@ -176,9 +176,9 @@ class TestQueue:
 # ---------------------------------------------------------------- metadata
 class TestMusicMetadata:
     @pytest.mark.parametrize("info,artist", [
-        ({"artist": "Maan Panu, Feat X", "uploader": "Label"}, "Maan Panu"),
-        ({"uploader": "Arijit Singh - Topic"}, "Arijit Singh"),
-        ({"channel": "Lofi Girl"}, "Lofi Girl"),
+        ({"artist": "Maan Panu, Feat X", "uploader": "Label"}, "Maan Panu, Feat X"),
+        ({"uploader": "Arijit Singh - Topic"}, None),
+        ({"channel": "Lofi Girl"}, None),
         ({}, None),
     ])
     def test_artist(self, info, artist):

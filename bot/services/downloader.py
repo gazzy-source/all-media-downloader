@@ -153,6 +153,11 @@ class DownloadResult:
     artist: str | None = None
     # Small square cover (<=320px JPEG) for Telegram's audio thumbnail.
     cover: Path | None = None
+    music: bool = False
+    music_confidence: str = "low"
+    source_codec: str = "unknown"
+    output_codec: str = "unknown"
+    transcoded: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -265,14 +270,89 @@ def _operator_hint(text: str) -> None:
 
 
 def _artist_of(info: dict[str, Any] | None) -> str | None:
-    """Best available artist: tagged artist, else the channel (minus " - Topic")."""
+    """Structured artist only; a channel is not an authoritative performer."""
     if not info:
         return None
-    name = info.get("artist") or info.get("creator") or info.get("uploader") or info.get("channel")
+    name = info.get("artist")
     if not name:
         return None
-    name = str(name).split(",")[0].strip()
-    return name[: -len(" - Topic")] if name.endswith(" - Topic") else name
+    return str(name).strip()
+
+
+def _audio_download_options(opts, info, url):
+    """Resolve the inline song contract against this attempt's fresh formats."""
+    from bot.services.music_audio import classify_music, codec_of, music_metadata, select_best_music_audio
+
+    policy = opts.get("_audio_policy")
+    classification = classify_music(info, url)
+    clean = music_metadata(info, classification)
+    clean["_music"] = classification.is_music
+    clean["_music_confidence"] = classification.confidence
+    configured = dict(opts)
+    if policy == "mp3":
+        configured["format"] = "bestaudio/best"
+    if policy == "best" and classification.is_music:
+        selected = select_best_music_audio(
+            info.get("formats") or [info], max_bytes=MAX_FILE_SIZE_BYTES,
+            duration=info.get("duration"))
+        configured["format"] = str(selected["format_id"])
+        codec = codec_of(selected)
+        clean["_source_codec"] = codec
+        output = "m4a" if codec == "aac" else "mp3" if codec == "mp3" else "best"
+        if codec not in {"aac", "mp3", "alac", "flac"} and not codec.startswith("pcm_"):
+            output = "m4a"  # one compatibility conversion when no native stream exists
+        clean["_output_codec"] = "aac" if output == "m4a" else "mp3" if output == "mp3" else codec
+        clean["_transcoded"] = clean["_output_codec"] != codec
+        configured["postprocessors"] = [dict(p) for p in opts["postprocessors"]]
+        for pp in configured["postprocessors"]:
+            if pp["key"] == "FFmpegExtractAudio":
+                pp["preferredcodec"] = output
+        # Lossless original delivery may be a document. Thumbnail embedding
+        # supports FLAC; unsupported lossless containers retain the sidecar.
+        if output == "best" and codec.startswith("pcm_"):
+            configured["postprocessors"] = [p for p in configured["postprocessors"]
+                                               if p["key"] not in {"FFmpegExtractAudio", "EmbedThumbnail"}]
+        if codec == "alac":
+            configured["postprocessors"] = [
+                {"key": "FFmpegVideoRemuxer", "preferedformat": "m4a"},
+                *[p for p in configured["postprocessors"] if p["key"] != "FFmpegExtractAudio"]]
+    for stale in ("requested_formats", "requested_downloads"):
+        clean.pop(stale, None)
+    return configured, clean
+
+
+def _process_audio_download(opts, info, url):
+    configured, clean = _audio_download_options(opts, info, url)
+    from yt_dlp.postprocessor.embedthumbnail import EmbedThumbnailPP
+    from yt_dlp.postprocessor.ffmpeg import FFmpegThumbnailsConvertorPP
+    from yt_dlp.utils import PostProcessingError
+
+    class OptionalArtworkPP(EmbedThumbnailPP):
+        def run(self, information):
+            try:
+                return super().run(information)
+            except PostProcessingError:
+                logger.warning("Optional audio artwork embedding failed")
+                return [], information
+
+    class OptionalCoverConvertPP(FFmpegThumbnailsConvertorPP):
+        def run(self, information):
+            try:
+                return super().run(information)
+            except PostProcessingError:
+                logger.warning("Optional audio artwork conversion failed")
+                return [], information
+
+    artwork = any(p["key"] == "EmbedThumbnail" for p in configured["postprocessors"])
+    convert_cover = any(p["key"] == "FFmpegThumbnailsConvertor" for p in configured["postprocessors"])
+    configured["postprocessors"] = [p for p in configured["postprocessors"]
+                                       if p["key"] not in {"EmbedThumbnail", "FFmpegThumbnailsConvertor"}]
+    with yt_dlp.YoutubeDL(configured) as audio_ydl:
+        if convert_cover:
+            audio_ydl.add_post_processor(OptionalCoverConvertPP(audio_ydl, format="jpg"), when="before_dl")
+        if artwork:
+            audio_ydl.add_post_processor(OptionalArtworkPP(audio_ydl, already_have_thumbnail=True))
+        return audio_ydl.process_ie_result(clean, download=True)
 
 
 def _esc(text: str) -> str:
@@ -2077,8 +2157,8 @@ class DownloadManager:
                             },
                             {
                                 "key": "FFmpegExtractAudio",
-                                "preferredcodec": audio_format,
-                                "preferredquality": "192",
+                                "preferredcodec": "m4a" if audio_format == "best" else audio_format,
+                                "preferredquality": "0" if audio_format == "mp3" else "192",
                             },
                             {"key": "FFmpegMetadata", "add_metadata": True,
                              "add_chapters": False},
@@ -2088,6 +2168,7 @@ class DownloadManager:
                         ],
                     }
                 )
+                opts["_audio_policy"] = audio_format
             elif mode == "image":
                 res = self._download_image_page(
                     url=url,
@@ -2130,6 +2211,13 @@ class DownloadManager:
                 on_stage=_stage, job_id=job_id,
                 media_probe_state=media_probe_state,
             )
+            if mode == "audio" and audio_format == "best":
+                known_codecs = {"aac", "mp3", "opus", "vorbis", "alac", "flac", "pcm_s16le", "pcm_s24le"}
+                emit(job_id, "audio_policy", music="yes" if info.get("_music") else "no",
+                     music_confidence=info.get("_music_confidence", "low"), audio_policy="best",
+                     source_codec=info.get("_source_codec") if info.get("_source_codec") in known_codecs else "unknown",
+                     output_codec=info.get("_output_codec") if info.get("_output_codec") in known_codecs else "unknown",
+                     transcoded="unknown" if "_transcoded" not in info else "yes" if info["_transcoded"] else "no")
             if tripped:
                 # The guard fired but something downstream swallowed it: the
                 # file on disk is cut short. Never hand that over as a success.
@@ -2193,12 +2281,18 @@ class DownloadManager:
                 quality=quality if mode in ("video", "video_subs") else None,
                 file_size=size,
                 is_image=ext in IMAGE_EXTS,
-                is_audio=ext in {"mp3", "m4a", "opus", "ogg", "flac", "wav", "aac"},
+                is_audio=(ext in {"mp3", "m4a", "opus", "ogg", "flac", "wav", "aac"}
+                          and not (audio_format == "best" and ext in {"flac", "wav"})),
                 is_video=ext in {"mp4", "mkv", "webm", "mov", "avi", "m4v", "3gp"},
                 subtitle_file=sub_file,
                 actual_height=_delivered_height(info),
                 artist=_artist_of(info),
                 cover=_telegram_cover(work_dir) if mode == "audio" else None,
+                music=bool(info.get("_music")),
+                music_confidence=info.get("_music_confidence", "low"),
+                source_codec=info.get("_source_codec", "unknown"),
+                output_codec=info.get("_output_codec", "unknown"),
+                transcoded=info.get("_transcoded"),
             )
         except (JobRefused, JobAborted) as e:
             # Deliberate refusals / limits: expected, no traceback needed.
@@ -2387,7 +2481,9 @@ class DownloadManager:
                          format_fallback="yes" if fi else "no")
                 try:
                     with yt_dlp.YoutubeDL(attempt_opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
+                        info = ydl.extract_info(url, download=not bool(opts.get("_audio_policy")))
+                        if info is not None and opts.get("_audio_policy"):
+                            info = _process_audio_download(attempt_opts, info, url)
                         if info is None:
                             raise RuntimeError("Download returned no data.")
                         prepared = ydl.prepare_filename(info)
@@ -2579,7 +2675,8 @@ class DownloadManager:
             if not info_in["formats"]:
                 return None
             with yt_dlp.YoutubeDL(reuse_opts) as ydl:
-                info = ydl.process_ie_result(info_in, download=True)
+                info = (_process_audio_download(reuse_opts, info_in, url)
+                        if opts.get("_audio_policy") else ydl.process_ie_result(info_in, download=True))
                 if info is None:
                     return None
                 prepared = ydl.prepare_filename(info)

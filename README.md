@@ -69,6 +69,7 @@ For a focused regression, pass its test file or node to pytest. CI also runs sta
 - [Architecture](docs/ARCHITECTURE.md): request flow, concurrency, state, limits and scaling triggers.
 - [Decisions](docs/DECISIONS.md): engineering trade-offs and evidence.
 - [Operations](docs/OPERATIONS.md): production topology, deploy, rollback and verification.
+- [Song audio](docs/SONG_AUDIO.md): conservative music classification, source preservation and Telegram/cache tradeoffs.
 - [Deployment](docs/DEPLOYMENT.md): local and Docker setup.
 - [Health checks](docs/HEALTH.md): health endpoint behavior.
 - [Cookie handling](docs/COOKIES.md): optional credential handling.

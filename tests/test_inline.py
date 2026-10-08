@@ -358,7 +358,7 @@ class TestNoDuplicateDownloads:
         monkeypatch.setattr(inl.download_manager, "download", fake_download)
         monkeypatch.setattr(inl.download_manager, "cleanup_result_files", lambda r: None)
         await inl.handle_chosen_inline_result(_update(chosen_inline_result=_chosen("ap:x")), ctx)
-        assert seen["audio_format"] == "m4a"
+        assert seen["audio_format"] == "best"
 
     async def test_wait_button_just_reassures(self, fx):
         from tests.conftest import FakeCallbackQuery

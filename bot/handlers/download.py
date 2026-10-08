@@ -498,6 +498,7 @@ async def auto_download_flow(
                 context, chat.id, msg.message_id, path, result,
                 remember=lambda sent: _remember_upload(
                     url, repeat, sent, result.title or "", result, mode, quality),
+                job_id=telemetry_id,
             )
             logger.info("Channel post handling: %s", outcome)
         else:
@@ -1628,7 +1629,8 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
 
 
 async def _replace_channel_post(
-    context, chat_id: int, source_message_id: int, path: Path, result, remember=None
+    context, chat_id: int, source_message_id: int, path: Path, result, remember=None,
+    *, job_id: str = "",
 ) -> str:
     """
     Post the media as a new message, then remove the link post.
@@ -1642,7 +1644,8 @@ async def _replace_channel_post(
     (the bot needs the "Delete messages" right); the media is delivered either
     way.
     """
-    sent = await _send_media(context, chat_id, path, result, caption="", reply_markup=None)
+    sent = await _send_media(context, chat_id, path, result, caption="", reply_markup=None,
+                             job_id=job_id)
     if remember is not None:
         remember(sent)
     if await _try_delete(context, chat_id, source_message_id):

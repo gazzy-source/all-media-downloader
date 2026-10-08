@@ -120,7 +120,7 @@ def _esc(text: str) -> str:
 
 def _key(mode: str) -> str:
     """Cache slot shared with DM/group downloads of the same link+quality."""
-    return inline_cache.repeat_key(mode, INLINE_QUALITY, "m4a")
+    return inline_cache.repeat_key(mode, INLINE_QUALITY, "best")
 
 
 def _result_id(kind: str, url: str) -> str:
@@ -470,7 +470,7 @@ def _search_result(mode: str, h: "yt_search.SearchHit"):
             # carries ID3 tags ("Arrives here in a moment" / "All-Media
             # Downloader"): untagged, Telegram showed its file name.
             id=f"sa:{h.id}", audio_url=f"{INLINE_ASSET_BASE}preparing_audio_v3.mp3?v={h.id}",
-            title=h.title[:100], performer=h.channel[:60] or None,
+            title=h.title[:100],
             audio_duration=h.duration, caption=caption, parse_mode=ParseMode.HTML,
             reply_markup=_preparing_markup(),
         )
@@ -669,7 +669,7 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
                 emit(telemetry_id, "queue", outcome="queue_start",
                      queue_wait_ms=int((time.monotonic() - queue_entered) * 1000))
                 return await download_manager.download(
-                    url=url, mode=mode, quality=INLINE_QUALITY, audio_format="m4a",
+                    url=url, mode=mode, quality=INLINE_QUALITY, audio_format="best",
                     title_hint=title or "media", progress_cb=on_progress,
                     cancel=job.event, job_id=telemetry_id,
                 )

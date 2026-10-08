@@ -82,7 +82,7 @@ class TestSearchResults:
         results, _ = q.answers[0]
         assert env.calls == ["lofi beats"]
         assert isinstance(results[0], InlineQueryResultAudio) and results[0].id == "sa:vid00000000"
-        assert results[0].performer == "Chan"
+        assert results[0].performer is None
         # Each result its own placeholder URL, or Telegram shows a cached title.
         assert len({r.audio_url for r in results}) == len(results)
 
@@ -127,7 +127,7 @@ class TestSearchResults:
         q = await _ask(env, "lofi beats")
         result = q.answers[0][0][0]
         assert isinstance(result, InlineQueryResultAudio)
-        assert result.id == "sa:vid00000000" and result.performer == "Chan"
+        assert result.id == "sa:vid00000000" and result.performer is None
         assert "preparing_audio" in result.audio_url
 
         monkeypatch.setattr(inl, "check_public_url", lambda _url: None)

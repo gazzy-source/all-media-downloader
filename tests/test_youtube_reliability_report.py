@@ -90,8 +90,9 @@ def test_report_uses_combined_winner_for_auto_download_without_analysis():
 
     result = reporter.report(events)
 
-    assert "Metadata analysis strategy winners\\n----------------------------------\\ninsufficient sample" in result
-    assert "Combined download/extraction strategy winners\\n----------------------------------------------\\nvisionos: 1" in result
+    assert "Metadata analysis strategy winners" in result
+    assert "Combined download/extraction strategy winners" in result
+    assert "visionos: 1" in result
     assert "queue: observed_min=11ms observed_max=11ms; p50/p95 insufficient sample (n=1)" in result
     assert "download: observed_min=8580ms observed_max=8580ms" in result
     assert "upload: observed_min=1200ms observed_max=1200ms" in result

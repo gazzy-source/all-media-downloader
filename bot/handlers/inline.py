@@ -118,9 +118,15 @@ def _esc(text: str) -> str:
     return html.escape(text or "", quote=False)
 
 
-def _key(mode: str) -> str:
-    """Cache slot shared with DM/group downloads of the same link+quality."""
-    return inline_cache.repeat_key(mode, INLINE_QUALITY, "best")
+def _key(mode: str, url: str = "") -> str:
+    """Versioned audio cache slot preserving URL classification context."""
+    parsed = urllib.parse.urlparse(url)
+    profile = "best-v2"
+    if "/shorts/" in parsed.path:
+        profile += "-short"
+    elif parsed.hostname == "music.youtube.com":
+        profile += "-music"
+    return inline_cache.repeat_key(mode, INLINE_QUALITY, profile)
 
 
 def _result_id(kind: str, url: str) -> str:
@@ -301,7 +307,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     platform = platform_from_url(url)
     # A cache hit will be swapped in after selection. Avoid eagerly extracting
     # the same URL just because the other media mode has not been cached yet.
-    if not (inline_cache.get(url, _key("video")) or inline_cache.get(url, _key("audio"))):
+    if not (inline_cache.get(url, _key("video", url)) or inline_cache.get(url, _key("audio", url))):
         task = asyncio.create_task(_prefetch(url))
         _BACKGROUND.add(task)
         task.add_done_callback(_BACKGROUND.discard)
@@ -431,7 +437,7 @@ async def _search(q, text: str) -> None:
             text=f"No results for “{terms[:30]}”", start_parameter="inline"), cache_time=60)
         return
     results = [_search_result(mode, h) for h in page]
-    if start == 0 and page and not inline_cache.get(page[0].url, _key(mode)):
+    if start == 0 and page and not inline_cache.get(page[0].url, _key(mode, page[0].url)):
         task = asyncio.create_task(_prefetch_if_still_latest(uid, q.id, page[0].url))
         _BACKGROUND.add(task)
         task.add_done_callback(_BACKGROUND.discard)
@@ -627,7 +633,7 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
     if job.cancelled:
         emit_terminal(telemetry_id, "cancelled", **{"class": "cancelled"})
         return
-    hit = inline_cache.get(url, _key(mode))
+    hit = inline_cache.get(url, _key(mode, url))
     if hit:  # fetched before or by someone else while this user was choosing
         emit(telemetry_id, "cache", outcome="hit", kind=hit.get("kind", "unknown"),
              cache_hit="yes", delivery="cached_swap", avoided_download="yes")
@@ -635,7 +641,7 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
         if await _swap_in(context, imid, hit["kind"], hit["file_id"], hit.get("title", "")):
             emit_terminal(telemetry_id, "success", delivery="cached")
             return
-        inline_cache.forget(url, _key(mode))  # Telegram refused it: fetch afresh below
+        inline_cache.forget(url, _key(mode, url))  # Telegram refused it: fetch afresh below
     logger.info("inline cache miss — downloading %s", mode)
     emit(telemetry_id, "cache", outcome="miss", cache_hit="no", delivery="fresh_download")
     if job.cancelled:
@@ -760,7 +766,7 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
         if inline_cache.good_enough(mode, INLINE_QUALITY, result):
             inline_cache.put(
                 url,
-                _key(mode),
+                _key(mode, url),
                 file_id=file_id,
                 kind=kind,
                 title=title,

@@ -381,3 +381,23 @@ def test_suite_never_touches_real_data():
     for p in (cfg.DATA_DIR, history._HISTORY_FILE, inflight._PATH, inline_cache._PATH):
         assert real not in Path(p).resolve().parents and Path(p).resolve() != real
     assert not os.path.isfile(cfg.COOKIES_FILE or ""), "tests must run without cookies"
+
+
+@pytest.mark.parametrize("url", ["https://music.youtube.com/watch?v=abc", "https://www.youtube.com/shorts/abc"])
+async def test_audio_context_bypasses_generic_cache_then_reuses_own(ctx, monkeypatch, tmp_path, url):
+    generic = "https://www.youtube.com/watch?v=abc"
+    inline_cache.put(generic, inl._key("audio", generic), file_id="GENERIC", kind="audio", title="T")
+    calls = []
+    async def download(**kw):
+        calls.append(kw["url"])
+        return _result(tmp_path, is_video=False, is_audio=True, mode="audio")
+    async def send(*args, **kw):
+        return SimpleNamespace(message_id=9, video=None, document=None, photo=None, audio=SimpleNamespace(file_id="CONTEXT"))
+    monkeypatch.setattr(inl.download_manager, "download", download)
+    monkeypatch.setattr(inl.download_manager, "cleanup_result_files", lambda r: None)
+    monkeypatch.setattr(hd, "_send_media", send)
+    for _ in range(2):
+        await inl.handle_chosen_inline_result(_update(chosen_inline_result=_chosen("ap:x", query=url)), ctx)
+    assert calls == [url]
+    assert [media.media for _, media in ctx.bot.media_edits] == ["CONTEXT", "CONTEXT"]
+    assert inline_cache.get(generic, inl._key("audio", generic))["file_id"] == "GENERIC"

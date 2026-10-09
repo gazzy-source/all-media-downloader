@@ -15,6 +15,7 @@ from bot.services.inline_cache import repeat_key
 @pytest.mark.parametrize("info,url,music", [
     ({}, "https://music.youtube.com/watch?v=test", True),
     ({"track": "Song", "artist": "Artist"}, "", True),
+    ({"track": "News", "artist": "Artist", "title": "News"}, "", True),
     ({"categories": ["Music"]}, "", True),
     ({"title": "Song (Official Music Video)", "artist": "Artist"}, "", True),
     ({"title": "Song (Lyric Video)", "album": "Album"}, "", True),
@@ -46,6 +47,11 @@ def test_constrained_aac_does_not_displace_good_mp3():
     assert select_best_music_audio([aac, mp3]) == mp3
 
 
+def test_constrained_opus_does_not_displace_usable_aac_original():
+    opus, aac = fmt("opus", 32), fmt("aac", 128)
+    assert select_best_music_audio([opus, aac], "original") == aac
+
+
 def test_drm_preferred_format_is_unavailable():
     assert select_best_music_audio([fmt("aac", 256, has_drm=True), fmt("mp3", 192)])["acodec"] == "mp3"
 
@@ -72,16 +78,35 @@ def test_size_fallback_and_no_excessive_degradation():
         select_best_music_audio([high, fmt("aac", 32, filesize=10)], max_bytes=50)
 
 
+def test_lossless_compression_bitrate_does_not_block_fitting_source():
+    high = fmt("flac", 800, filesize=60, asr=44100, audio_channels=2)
+    compressed = fmt("flac", 300, filesize=40, asr=44100, audio_channels=2)
+    assert select_best_music_audio([high, compressed], max_bytes=50) == compressed
+
+
+def test_lossless_sample_rate_precedes_compression_bitrate():
+    high_rate = fmt("flac", 300, asr=96000, audio_channels=2)
+    high_bitrate = fmt("flac", 800, asr=44100, audio_channels=2)
+    assert select_best_music_audio([high_rate, high_bitrate]) == high_rate
+
+
+def test_equivalent_lossless_prefers_native_telegram_container():
+    alac = fmt("alac", 800, "m4a", asr=44100, audio_channels=2, filesize=40)
+    flac = fmt("flac", 600, asr=44100, audio_channels=2, filesize=30)
+    assert select_best_music_audio([alac, flac], max_bytes=50) == alac
+
+
 def test_metadata_structured_wins_no_channel_artist():
     info = {"track": "Track", "title": "Decorated title", "artist": "Artist",
             "album": "Album", "uploader": "Wrong channel"}
     tagged = music_metadata(info, classify_music(info))
     assert tagged["title"] == "Track" and tagged["artist"] == "Artist"
     assert tagged["album"] == "Album"
-    generic = music_metadata({"title": "Lecture", "uploader": "Channel", "album": "Wrong"},
+    generic = music_metadata({"title": "Lecture", "uploader": "Channel", "album": "Wrong", "album_artists": ["Wrong"]},
                              classify_music({"title": "Lecture"}))
     assert generic["meta_artist"] == "" and generic["artist"] is None
     assert "album" not in generic
+    assert "album_artists" not in generic
 
 
 def test_only_obvious_music_title_decorations_removed():
@@ -112,7 +137,7 @@ def test_generic_keeps_legacy_policy_and_cache_distinct():
     opts = options()
     configured, _ = _audio_download_options(opts, {"title": "Lecture"}, "")
     assert configured["format"] == opts["format"]
-    assert _key("audio") == "audio@best"
+    assert _key("audio") == "audio@best-v2"
     assert repeat_key("audio", audio_format="m4a") == "audio@m4a"
     from bot.config import INLINE_QUALITY
     assert _key("video") == repeat_key("video", INLINE_QUALITY)
@@ -203,3 +228,11 @@ def test_complete_local_song_pipeline_with_optional_artwork_failure(tmp_path, mo
         return subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a",
             "-f", "hash", "-"], capture_output=True, text=True, check=True).stdout
     assert audio_hash(source) == audio_hash(delivered)
+
+
+def test_inline_cache_profiles_preserve_classification_context():
+    from bot.handlers.inline import _key
+    urls = ["https://www.youtube.com/watch?v=abc", "https://music.youtube.com/watch?v=abc", "https://www.youtube.com/shorts/abc"]
+    assert _key("audio", urls[0]) == _key("audio", "https://youtu.be/abc")
+    assert len({_key("audio", url) for url in urls}) == 3
+    assert len({_key("video", url) for url in urls}) == 1

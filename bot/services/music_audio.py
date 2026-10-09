@@ -12,13 +12,13 @@ class MusicClassification:
 
 
 def classify_music(info, url=""):
+    structured = bool(info.get("track") and (info.get("artist") or info.get("artists") or info.get("album_artist")))
+    if structured:
+        return MusicClassification(True, "high")
     title = str(info.get("title") or "").lower()
     negative = re.search(r"\b(podcast|interview|lecture|tutorial|gameplay|news|trailer)\b", title)
     if negative:
         return MusicClassification(False, "low")
-    structured = bool(info.get("track") and (info.get("artist") or info.get("artists") or info.get("album_artist")))
-    if structured:
-        return MusicClassification(True, "high")
     short = info.get("is_short") or "/shorts/" in url
     if short:
         return MusicClassification(False, "low")
@@ -50,6 +50,10 @@ def _number(value):
         return 0
 
 
+def _lossless(fmt):
+    return codec_of(fmt) in {"flac", "alac"} or codec_of(fmt).startswith("pcm_")
+
+
 def select_best_music_audio(formats, delivery_target="telegram", max_bytes=None, duration=None):
     """Prefer playable native AAC/MP3; compare bitrate only within codec families.
 
@@ -78,11 +82,12 @@ def select_best_music_audio(formats, delivery_target="telegram", max_bytes=None,
         if not size and _number(duration) and bitrate(f):
             size = bitrate(f) * 1000 * _number(duration) / 8
         return not max_bytes or not size or size <= max_bytes
-    pool = [f for f in pool if fits(f) and bitrate(f) >= peaks[codec_of(f)] * .75]
+    pool = [f for f in pool if fits(f) and (_lossless(f) or not bitrate(f)
+                                          or bitrate(f) >= peaks[codec_of(f)] * .75)]
     if not pool:
         raise ValueError("No useful source audio fits the Telegram size limit")
     # Lossless wins when deliverable. AAC wins over MP3 when both native streams
-    # exist; Opus wins over AAC only for original delivery. No cross-codec
+    # exist; unconstrained Opus is a tie-breaker only for original delivery. No cross-codec
     # bitrate equivalence or quality claim is inferred.
     preference = {"alac": 6, "flac": 6, "pcm_s16le": 6, "opus": 4,
                   "aac": 3, "vorbis": 2, "mp3": 1}
@@ -92,11 +97,20 @@ def select_best_music_audio(formats, delivery_target="telegram", max_bytes=None,
         # cross-codec quality equivalence claim; unknown values stay eligible.
         rate = bitrate(f)
         mono = f.get("audio_channels") == 1
-        minimum = {"aac": 64 if mono else 96, "mp3": 96 if mono else 128}
+        minimum = {"aac": 64 if mono else 96, "mp3": 96 if mono else 128,
+                   "opus": 64 if mono else 96}
         return not rate or rate >= minimum.get(codec_of(f), 0)
-    return max(pool, key=lambda f: (useful(f), 6 if codec_of(f).startswith("pcm_") else preference.get(codec_of(f), 0),
-               bitrate(f), _number(f.get("audio_channels")),
-               _number(f.get("asr")), _number(f.get("filesize"))))
+    def quality_key(f):
+        if _lossless(f):
+            # Compression bitrate is not a lossless quality measure. Prefer
+            # source resolution/channels, then the smaller equivalent file.
+            return (True, 6, _number(f.get("asr")),
+                    _number(f.get("audio_channels")), _number(f.get("bits_per_sample")),
+                    int(delivery_target == "telegram" and codec_of(f) == "alac"),
+                    -(_number(f.get("filesize") or f.get("filesize_approx")) or float("inf")))
+        return (useful(f), preference.get(codec_of(f), 0), bitrate(f),
+                _number(f.get("audio_channels")), _number(f.get("asr")), _number(f.get("filesize")))
+    return max(pool, key=quality_key)
 
 
 def music_metadata(info, classification):
@@ -118,6 +132,6 @@ def music_metadata(info, classification):
                          "", title, flags=re.I).strip()
         result["title"] = cleaned or title
     if not classification.is_music:
-        for key in ("album", "album_artist", "track", "track_number", "genre"):
+        for key in ("album", "album_artist", "album_artists", "track", "track_number", "disc_number", "genre", "genres"):
             result.pop(key, None)
     return result

@@ -56,7 +56,11 @@ def _latency(events: list[dict[str, str]], phase: str, field: str) -> str:
         except (KeyError, ValueError):
             continue
     if len(values) < 5:
-        return f"{phase}: insufficient sample (n={len(values)})"
+        if not values:
+            return f"{phase}: insufficient sample (n=0)"
+        return (f"{phase}: observed_min={min(values):.0f}ms "
+                f"observed_max={max(values):.0f}ms; p50/p95 insufficient sample "
+                f"(n={len(values)})")
     return f"{phase}: p50={percentile(values, .50):.0f}ms p95={percentile(values, .95):.0f}ms n={len(values)}"
 
 
@@ -84,9 +88,22 @@ def report(events: list[dict[str, str]]) -> str:
         lines.append("insufficient sample")
     winners = Counter(e.get("winner", e.get("strategy", "unknown")) for e in events
                       if e.get("phase") == "metadata" and e.get("outcome") == "success")
-    lines += ["", "Metadata strategy winners", "-------------------------"]
+    lines += ["", "Metadata analysis strategy winners", "----------------------------------"]
     lines.extend(f"{key}: {value}" for key, value in sorted(winners.items()))
     if not winners:
+        lines.append("insufficient sample")
+
+    # Auto-download flows intentionally skip the separate analysis/wizard
+    # phase. Their successful yt-dlp download attempt still identifies the
+    # strategy that extracted metadata and completed the transfer.
+    combined_winners = Counter(
+        e.get("winner", e.get("strategy", "unknown")) for e in events
+        if e.get("phase") == "download_strategy" and e.get("outcome") == "success"
+    )
+    lines += ["", "Combined download/extraction strategy winners",
+              "----------------------------------------------"]
+    lines.extend(f"{key}: {value}" for key, value in sorted(combined_winners.items()))
+    if not combined_winners:
         lines.append("insufficient sample")
     metadata_attempts: dict[str, list[dict[str, str]]] = {}
     download_attempts: dict[str, list[dict[str, str]]] = {}

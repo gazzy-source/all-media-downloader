@@ -8,6 +8,7 @@ with the finished media. Persisted to data/ so it survives restarts.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -101,13 +102,56 @@ def _load() -> dict[str, dict[str, Any]]:
     return _data
 
 
+# Writes happen off the event loop: callers only mark the cache dirty and one
+# daemon thread persists the latest state shortly after, coalescing bursts
+# (a fresh inline job changes it 2-3 times). Measured 2026-11-21: a full
+# rewrite cost 3.9 ms at 110 entries on the VPS — ~100 ms at the 3000 cap —
+# and every one ran synchronously on the bot's event loop.
+_SAVE_DELAY = 0.2
+_dirty = threading.Event()
+_write_lock = threading.Lock()  # one writer at a time (thread vs flush at exit)
+_writer: threading.Thread | None = None
+
+
+def _write_now() -> None:
+    with _write_lock:
+        with _lock:
+            if _data is None:
+                return
+            path, text = _PATH, json.dumps(_data, ensure_ascii=False)
+        tmp = path.with_suffix(".tmp")
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            logger.exception("could not persist the inline cache")
+
+
+def _writer_loop() -> None:
+    while True:
+        _dirty.wait()
+        time.sleep(_SAVE_DELAY)
+        _dirty.clear()
+        _write_now()
+
+
 def _save(data: dict[str, dict[str, Any]]) -> None:
-    tmp = _PATH.with_suffix(".tmp")
-    try:
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, _PATH)
-    except OSError:
-        logger.exception("could not persist the inline cache")
+    """Schedule persistence of the (already updated) cache; never blocks."""
+    global _writer
+    _dirty.set()
+    if _writer is None or not _writer.is_alive():
+        _writer = threading.Thread(target=_writer_loop, name="inline-cache-writer", daemon=True)
+        _writer.start()
+
+
+def flush() -> None:
+    """Persist pending changes now (shutdown, tests)."""
+    if _dirty.is_set():
+        _dirty.clear()
+        _write_now()
+
+
+atexit.register(flush)
 
 
 def get(url: str, mode: str) -> dict[str, Any] | None:
@@ -192,5 +236,7 @@ def put_meta(name: str, file_id: str) -> None:
 
 def _reset_for_tests(path: Path) -> None:
     global _PATH, _data
-    _PATH = path
-    _data = None
+    flush()
+    with _lock:
+        _PATH = path
+        _data = None

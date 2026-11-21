@@ -63,6 +63,8 @@ class FakeTelegram:
         outcome = (self.script.get(method) or ["ok"]).pop(0) if self.script.get(method) else "ok"
         if outcome == "timeout":
             raise httpx.WriteTimeout("simulated", request=request)
+        if outcome == "readtimeout":  # the whole upload went out; no answer
+            raise httpx.ReadTimeout("simulated", request=request)
         if outcome == "network":
             raise httpx.ReadError("simulated", request=request)
         if outcome == "retryafter":
@@ -209,6 +211,18 @@ async def test_all_attempts_failing_still_raises_timed_out(tg, tmp_path, monkeyp
     with pytest.raises(TimedOut):
         await hd._send_media(tg.ctx, 1, f, res, "cap", attempts=2)
     assert len(tg.uploads("sendVideo")) == 2
+
+
+async def test_timeout_after_the_file_was_sent_is_not_resent(tg, tmp_path, monkeypatch):
+    # A ReadTimeout means Telegram got the whole file and most likely posted
+    # it; a retry would post it twice (as _send_cached already assumes).
+    f, _, res = _video(tmp_path, size=10_000)
+    tg.script["sendVideo"] = ["readtimeout", "ok"]
+    monkeypatch.setattr(hd, "_sleep", _nosleep)
+    with pytest.raises(TimedOut):
+        await hd._send_media(tg.ctx, 1, f, res, "cap", attempts=3)
+    assert len(tg.uploads("sendVideo")) == 1
+    assert hd.upload_gate.running_uploads == hd.upload_gate.in_flight_bytes == 0
 
 
 # 5 --------------------------------------------- video -> document fallback

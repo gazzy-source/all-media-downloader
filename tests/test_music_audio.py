@@ -288,6 +288,33 @@ def test_youtube_dash_audio_delivered_flat_with_one_remux(tmp_path):
     assert abs(float(data["format"]["duration"]) - 2.0) < 0.1
 
 
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="needs FFmpeg")
+def test_youtube_hls_style_adts_audio_still_valid_without_fixup(tmp_path):
+    # With fixup=never the m3u8 fixup (aac_adtstoasc) is skipped too. A retry
+    # can fetch HLS: ADTS AAC in MPEG-TS saved as .m4a must still come out of
+    # the metadata remux as a valid MP4 (the muxer inserts the filter itself).
+    from bot.services.downloader import _process_audio_download
+    source = tmp_path / "hls.m4a"
+    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+                    "sine=frequency=440:duration=2", "-c:a", "aac", "-f", "mpegts",
+                    str(source)], check=True)
+    opts = _with_metadata()
+    opts.update({"enable_file_urls": True, "quiet": True,
+                 "outtmpl": str(tmp_path / "delivered.%(ext)s")})
+    native = fmt("aac", 128, "m4a", url=source.as_uri(), protocol="https")
+    info = {"id": "abc", "title": "Lecture", "formats": [native], "extractor": "youtube"}
+    _process_audio_download(opts, info, "https://www.youtube.com/watch?v=abc")
+    delivered = tmp_path / "delivered.m4a"
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+        "stream=codec_name:format=format_name,duration:format_tags=title", "-of", "json",
+        str(delivered)], capture_output=True, text=True, check=True)
+    data = json.loads(probe.stdout)
+    assert "mp4" in data["format"]["format_name"], "must no longer be MPEG-TS"
+    assert data["streams"][0]["codec_name"] == "aac"
+    assert data["format"]["tags"]["title"] == "Lecture"
+    assert abs(float(data["format"]["duration"]) - 2.0) < 0.15
+
+
 def test_inline_cache_profiles_preserve_classification_context():
     from bot.handlers.inline import _key
     urls = ["https://www.youtube.com/watch?v=abc", "https://music.youtube.com/watch?v=abc", "https://www.youtube.com/shorts/abc"]

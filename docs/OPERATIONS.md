@@ -47,7 +47,15 @@ sudo DRY_RUN=1 /opt/all-media-downloader/scripts/warp_memory_guard.sh
 sudo systemctl disable --now warp-memory-guard.timer && sudo rm /etc/systemd/system/warp-svc.service.d/memory.conf && sudo systemctl daemon-reload
 ```
 
-WARP also logs at DEBUG level (~300 journal lines/min), and the journal has no size cap; it was 3.8 GB on 2026-11-21. Capping it would delete old telemetry, so get explicit approval before changing journald retention.
+WARP also logs at DEBUG level, and the journal has no size cap; it was 3.9 GB on 2026-11-21. Capping it would delete old telemetry, so get explicit approval before changing journald retention.
+
+## VM tuning (2026-11-21)
+
+- **WARP log filter:** `deploy/warp-svc-logfilter.conf` → `/etc/systemd/system/warp-svc.service.d/loglevel.conf`. **[M]** WARP ignores `RUST_LOG`, so journald drops its DEBUG lines (`LogFilterPatterns`; the level tag is ANSI-coloured), plus routine tunnel-stats and netlink-neighbour lines. Warnings, errors and other INFO lines are kept. Takes effect on the next WARP restart.
+- **needrestart:** `deploy/needrestart-mediabot.conf` → `/etc/needrestart/conf.d/50-mediabot.conf`. **[M]** Unattended upgrades restarted the bot on Oct 24 and Nov 13 without waiting for idle; on Nov 13 it overran the 60 s stop timeout and was killed. The bot is now excluded, because `ytdlp-update.timer` restarts it weekly once idle, which also picks up library updates.
+- **zswap:** `deploy/zswap.service` (enabled) turns on zswap with lz4 and a 20% pool. **[M]** The boot volume is slow: the first PO-token mint after idle took 9.0 s versus 0.19 s warm, because the provider was swapped out. Check with `sudo grep -r . /sys/kernel/debug/zswap/`; remove with `sudo systemctl disable --now zswap.service`.
+- **Journal cap:** `deploy/journald-size.conf` → `/etc/systemd/journald.conf.d/50-size.conf` (500M, keep 2G free). On 2026-11-21 the journal was trimmed from 3.8 GB to 0.5 GB after archiving the bot's own logs, including 1,920 YT_EVENT records from 2026-07-13 onwards, to `/var/log/mediabot-archive/bot-journal-until-20261121.txt.gz`.
+- **Kernel:** rebooted into 7.0.0-1016-oracle on 2026-11-21. Everything came back unaided: the bot, WARP (with limits and filters), the egress chain, zswap, the guard timer, the Docker containers and the Funnel. Snapshots of what was running before the reboot are in `/var/log/mediabot-archive/pre-reboot-*.txt`.
 
 ## Useful inspection commands
 

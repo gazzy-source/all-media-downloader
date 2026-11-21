@@ -156,6 +156,23 @@ class TestInlineQuery:
         await self._settle()
         assert ctx.prefetched == ["https://www.tiktok.com/@a/video/123"]
 
+    async def test_older_keystroke_finishing_last_is_not_prefetched(self, ctx, monkeypatch):
+        import asyncio
+        monkeypatch.setattr(inl, "_LINK_PREFETCH_DELAY", 0.05)
+        inl._LATEST.clear()
+        old, new = "https://www.tiktok.com/@a/video/12", "https://www.tiktok.com/@a/video/123"
+
+        async def slow_for_old(url):
+            await asyncio.sleep(0.1 if url == old else 0)
+            return True
+
+        monkeypatch.setattr(inl, "_is_public", slow_for_old)
+        await asyncio.gather(
+            inl.handle_inline_query(_update(inline_query=FakeInlineQuery(old, user_id=7)), ctx),
+            inl.handle_inline_query(_update(inline_query=FakeInlineQuery(new, user_id=7)), ctx))
+        await self._settle()
+        assert ctx.prefetched == [new]
+
     async def test_placeholders_uploaded_only_once(self, ctx):
         for _ in range(3):
             await inl.handle_inline_query(_update(inline_query=FakeInlineQuery("https://youtu.be/abc")), ctx)
@@ -163,9 +180,14 @@ class TestInlineQuery:
 
     async def test_cached_link_answers_with_placeholders_for_inline_picker(self, ctx, monkeypatch, caplog):
         caplog.set_level("INFO", logger=inl.logger.name)
-        inline_cache.put("https://youtu.be/abc", inl._key("video"), file_id="VID1", kind="video", title="T")
-        q = FakeInlineQuery("https://youtu.be/abc")
+        # A complete 11-char id: a half-typed one is never prefetched anyway,
+        # which would make the cache-hit assertion below pass vacuously.
+        link = "https://youtu.be/abcdefghijk"
+        monkeypatch.setattr(inl, "_LINK_PREFETCH_DELAY", 0.01)
+        inline_cache.put(link, inl._key("video"), file_id="VID1", kind="video", title="T")
+        q = FakeInlineQuery(link)
         await inl.handle_inline_query(_update(inline_query=q), ctx)
+        await self._settle()
         results, _ = q.answers[0]
         assert all(isinstance(r, InlineQueryResultCachedPhoto) for r in results)
         assert [r.id[:3] for r in results] == ["vp:", "ap:"]
@@ -176,7 +198,7 @@ class TestInlineQuery:
         monkeypatch.setattr(inl.download_queue, "run", lambda *a, **k: pytest.fail("must not queue"))
         monkeypatch.setattr(hd, "_send_media", lambda *a, **k: pytest.fail("must not upload"))
         await inl.handle_chosen_inline_result(
-            _update(chosen_inline_result=_chosen(results[0].id)), ctx)
+            _update(chosen_inline_result=_chosen(results[0].id, query=link)), ctx)
         assert len(ctx.bot.media_edits) == 1
         assert isinstance(ctx.bot.media_edits[0][1], InputMediaVideo)
         assert ctx.bot.media_edits[0][1].media == "VID1"

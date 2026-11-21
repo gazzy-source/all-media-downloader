@@ -296,8 +296,12 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await _answer(q, [], button=hint, cache_time=3600)
         return
-    allowed, _ = inline_query_limiter.allow(q.from_user.id)
-    if not allowed and q.from_user.id not in ADMIN_IDS:
+    uid = q.from_user.id
+    # Before any await: updates run concurrently, and an older keystroke that
+    # finishes its awaits last must not become the "latest" query.
+    _mark_latest(uid, q.id)
+    allowed, _ = inline_query_limiter.allow(uid)
+    if not allowed and uid not in ADMIN_IDS:
         await _answer(q, [], button=InlineQueryResultsButton(
             text="⏳ Too many searches — try again later", start_parameter="inline"))
         return
@@ -308,8 +312,6 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     platform = platform_from_url(url)
-    uid = q.from_user.id
-    _mark_latest(uid, q.id)
     # A cache hit will be swapped in after selection. Avoid eagerly extracting
     # the same URL just because the other media mode has not been cached yet.
     # Queries arrive per keystroke: only a link the user stopped typing, and

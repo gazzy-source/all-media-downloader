@@ -112,6 +112,17 @@ class TestInlineQuery:
         assert [c for c, _ in ctx.bot.photos] == [1, 1]
         assert len(ctx.bot.deleted) == 2
 
+    async def test_stale_v2_placeholders_are_not_reused(self, ctx):
+        # Telegram Desktop kept a broken local copy of the v2 audio photo
+        # (blurred, untappable; phones fine). A fresh upload = a new photo id.
+        inline_cache.put_meta("placeholder_video_v2", "OLDV")
+        inline_cache.put_meta("placeholder_audio_v2", "OLDA")
+        q = FakeInlineQuery("https://youtu.be/abc")
+        await inl.handle_inline_query(_update(inline_query=q), ctx)
+        results, _ = q.answers[0]
+        assert {r.photo_file_id for r in results}.isdisjoint({"OLDV", "OLDA"})
+        assert len(ctx.bot.photos) == 2
+
     async def test_placeholders_uploaded_only_once(self, ctx):
         for _ in range(3):
             await inl.handle_inline_query(_update(inline_query=FakeInlineQuery("https://youtu.be/abc")), ctx)

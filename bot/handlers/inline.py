@@ -308,10 +308,16 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     platform = platform_from_url(url)
+    uid = q.from_user.id
+    _mark_latest(uid, q.id)
     # A cache hit will be swapped in after selection. Avoid eagerly extracting
     # the same URL just because the other media mode has not been cached yet.
-    if not (inline_cache.get(url, _key("video", url)) or inline_cache.get(url, _key("audio", url))):
-        task = asyncio.create_task(_prefetch(url))
+    # Queries arrive per keystroke: only a link the user stopped typing, and
+    # never a YouTube link whose video id is still incomplete.
+    if not (inline_cache.get(url, _key("video", url)) or inline_cache.get(url, _key("audio", url))
+            or _incomplete_youtube(url)):
+        task = asyncio.create_task(
+            _prefetch_if_still_latest(uid, q.id, url, _LINK_PREFETCH_DELAY))
         _BACKGROUND.add(task)
         task.add_done_callback(_BACKGROUND.discard)
     title = await asyncio.get_running_loop().run_in_executor(None, _fetch_title, url)
@@ -364,6 +370,27 @@ _LATEST: dict[int, str] = {}
 # searched "meet me on the l", "…la", "…lab" separately.
 _DEBOUNCE = 0.5  # searches cost ~0.9s now (one API call), so react sooner
 _SEARCH_SLOTS = asyncio.Semaphore(3)
+# A pasted link arrives as one query and still gets most of the ~2s the user
+# takes to pick Video/Audio; a typed one stops costing an extraction per key.
+_LINK_PREFETCH_DELAY = _DEBOUNCE
+_YT_HOSTS = ("youtube.com", "youtu.be")
+
+
+def _mark_latest(uid: int, query_id: str) -> None:
+    _LATEST.pop(uid, None)
+    _LATEST[uid] = query_id
+    while len(_LATEST) > 5000:
+        _LATEST.pop(next(iter(_LATEST)))  # oldest first, not everyone at once
+
+
+def _incomplete_youtube(url: str) -> bool:
+    """A YouTube single-video link whose id is not a full 11 characters yet."""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not any(host == h or host.endswith("." + h) for h in _YT_HOSTS):
+        return False
+    single = (host.endswith("youtu.be") or parsed.path.startswith(("/watch", "/shorts/", "/live/")))
+    return single and not inline_cache.youtube_id(url)
 
 
 def _split_mode(text: str) -> tuple[str, str]:
@@ -399,10 +426,7 @@ async def _search(q, text: str) -> None:
     uid = q.from_user.id
     # Every query (cached or not) becomes the user's latest, so an older one
     # still waiting out the debounce stands down.
-    _LATEST.pop(uid, None)
-    _LATEST[uid] = q.id
-    while len(_LATEST) > 5000:
-        _LATEST.pop(next(iter(_LATEST)))  # oldest first, not everyone at once
+    _mark_latest(uid, q.id)
     hits = yt_search.cached(terms)
     if hits is None:
         await asyncio.sleep(_DEBOUNCE)
@@ -455,13 +479,14 @@ async def _search(q, text: str) -> None:
                       start_parameter="inline"))
 
 
-async def _prefetch_if_still_latest(uid: int, query_id: str, url: str) -> None:
+async def _prefetch_if_still_latest(uid: int, query_id: str, url: str,
+                                    delay: float = 1.5) -> None:
     """
     Most picks are the top result: once the user has stopped typing and is
     looking at the list, extract it ahead of time so a pick starts warm. Not
     while they are still typing — every word would cost an extraction.
     """
-    await asyncio.sleep(1.5)
+    await asyncio.sleep(delay)
     if _LATEST.get(uid) == query_id:
         await _prefetch(url)
 

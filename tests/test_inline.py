@@ -123,6 +123,39 @@ class TestInlineQuery:
         assert {r.photo_file_id for r in results}.isdisjoint({"OLDV", "OLDA"})
         assert len(ctx.bot.photos) == 2
 
+    async def _settle(self):
+        import asyncio
+        await asyncio.gather(*list(inl._BACKGROUND))
+
+    async def test_pasted_link_is_prefetched_after_a_pause(self, ctx, monkeypatch):
+        monkeypatch.setattr(inl, "_LINK_PREFETCH_DELAY", 0.05)
+        inl._LATEST.clear()
+        await inl.handle_inline_query(_update(inline_query=FakeInlineQuery(
+            "https://youtu.be/o1Od1WrVoCM")), ctx)
+        await self._settle()
+        assert ctx.prefetched == ["https://youtu.be/o1Od1WrVoCM"]
+
+    async def test_half_typed_youtube_link_is_not_prefetched(self, ctx, monkeypatch):
+        # Measured 2026-11-21: "youtu.be/o1Od1WrVoC" (10 chars, still typing)
+        # cost a 13s extraction ending in "Unsupported URL".
+        monkeypatch.setattr(inl, "_LINK_PREFETCH_DELAY", 0.05)
+        inl._LATEST.clear()
+        for url in ("https://youtu.be/o1Od1WrVoC", "https://www.youtube.com/watch?v=o1Od1",
+                    "https://youtube.com/shorts/abc"):
+            q = FakeInlineQuery(url, user_id=7)
+            await inl.handle_inline_query(_update(inline_query=q), ctx)
+            assert q.answers[0][0], "the placeholders are still offered"
+            await self._settle()
+        assert ctx.prefetched == []
+
+    async def test_link_typed_letter_by_letter_prefetches_only_the_last(self, ctx, monkeypatch):
+        monkeypatch.setattr(inl, "_LINK_PREFETCH_DELAY", 0.05)
+        inl._LATEST.clear()
+        for url in ("https://www.tiktok.com/@a/video/12", "https://www.tiktok.com/@a/video/123"):
+            await inl.handle_inline_query(_update(inline_query=FakeInlineQuery(url, user_id=7)), ctx)
+        await self._settle()
+        assert ctx.prefetched == ["https://www.tiktok.com/@a/video/123"]
+
     async def test_placeholders_uploaded_only_once(self, ctx):
         for _ in range(3):
             await inl.handle_inline_query(_update(inline_query=FakeInlineQuery("https://youtu.be/abc")), ctx)

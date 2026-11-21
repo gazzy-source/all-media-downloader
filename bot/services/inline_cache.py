@@ -68,6 +68,12 @@ def good_enough(mode: str, quality: str, result) -> bool:
     return got > 360 or got >= want
 
 
+def youtube_id(url: str) -> str | None:
+    """The 11-character video id of a single-video YouTube link, else None."""
+    m = _YT_ID.match((url or "").strip().split("#")[0])
+    return m.group(1) if m else None
+
+
 def _norm(url: str) -> str:
     """
     youtu.be/X, watch?v=X&si=…, /shorts/X and m./music. hosts are one video:

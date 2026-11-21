@@ -1831,24 +1831,32 @@ class DownloadManager:
                  metadata_ms=int(total * 1000), metadata="success")
         return result
 
-    async def _join_inflight_extraction(self, url: str) -> None:
+    async def _join_inflight_extraction(
+        self, url: str, cancel: threading.Event | None = None,
+    ) -> None:
         """
         Wait for an extraction of this URL that is already running (the inline
         prefetch, an analysis) so the download reuses it via the meta cache
-        instead of starting a second, parallel one. Bounded; never raises —
-        on failure or timeout the download extracts by itself as before.
+        instead of starting a second, parallel one. Bounded, stops at once on
+        `cancel`, never raises — otherwise the download extracts by itself.
         """
         flight = self._meta_inflight.get(url.strip())
         if flight is None or flight.fut.done():
             return
         started = time.monotonic()
-        try:
-            await asyncio.wait_for(self.extract_info(url), INFLIGHT_JOIN_TIMEOUT)
-            outcome = "joined"
-        except asyncio.TimeoutError:
-            outcome = "timeout"
-        except Exception:
-            outcome = "failed"
+        task = asyncio.ensure_future(self.extract_info(url))
+        outcome = "timeout"
+        while time.monotonic() - started < INFLIGHT_JOIN_TIMEOUT:
+            if cancel is not None and cancel.is_set():
+                outcome = "cancelled"
+                break
+            await asyncio.wait({task}, timeout=0.25)
+            if task.done():
+                outcome = "failed" if task.cancelled() or task.exception() else "joined"
+                break
+        if not task.done():
+            task.cancel()  # extract_info shields the shared run; only our wait ends
+            await asyncio.wait({task})  # let it unwind (waiter count) without raising
         logger.info("download %s the running extraction after %.1fs: %s",
                     outcome, time.monotonic() - started, redact.url(url))
 
@@ -1883,7 +1891,7 @@ class DownloadManager:
         self.active += 1
         try:
             await _emit_progress(progress_cb, 1, "Starting…")
-            await self._join_inflight_extraction(url)
+            await self._join_inflight_extraction(url, cancel)
             loop = asyncio.get_running_loop()
             started = time.monotonic()
             result = await loop.run_in_executor(

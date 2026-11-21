@@ -102,7 +102,7 @@ class TestDownloadJoinsInflightExtraction:
     (two YouTube JS challenges on a 2-vCPU box).
     """
 
-    async def _run(self, monkeypatch, extract_s: float):
+    async def _run(self, monkeypatch, extract_s: float, cancel=None):
         dl._META_CACHE.clear()
         url = "https://youtu.be/j"
         seen = {}
@@ -122,10 +122,19 @@ class TestDownloadJoinsInflightExtraction:
         monkeypatch.setattr(m, "_bounded_download", fake_bounded)
         prefetch = asyncio.create_task(m.extract_info(url))
         await asyncio.sleep(0.05)  # the prefetch is running
-        await m.download(url=url, mode="audio")
+        t0 = time.monotonic()
+        await m.download(url=url, mode="audio", cancel=cancel)
+        seen["download_s"] = time.monotonic() - t0
         await prefetch
         dl._META_CACHE.clear()
         return seen
+
+    async def test_cancel_stops_the_wait(self, monkeypatch):
+        import threading
+        cancel = threading.Event()
+        cancel.set()  # the user tapped Cancel while it would wait
+        seen = await self._run(monkeypatch, extract_s=1.0, cancel=cancel)
+        assert seen["download_s"] < 0.8, "a cancelled job must not sit out the join"
 
     async def test_download_waits_for_the_running_prefetch(self, monkeypatch):
         seen = await self._run(monkeypatch, extract_s=0.3)

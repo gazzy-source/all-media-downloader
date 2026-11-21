@@ -232,6 +232,9 @@ def _overall_pct(part: str, file_pct: float) -> float:
 
 
 _META_INFLIGHT = 0  # analyses running right now (the yt-meta pool)
+# How long a download waits for an already-running extraction of its URL.
+# Joining is never slower than starting over, unless that extraction fails.
+INFLIGHT_JOIN_TIMEOUT = float(EXTRACT_TIMEOUT)
 _META_INFLIGHT_LOCK = threading.Lock()
 
 
@@ -1828,6 +1831,27 @@ class DownloadManager:
                  metadata_ms=int(total * 1000), metadata="success")
         return result
 
+    async def _join_inflight_extraction(self, url: str) -> None:
+        """
+        Wait for an extraction of this URL that is already running (the inline
+        prefetch, an analysis) so the download reuses it via the meta cache
+        instead of starting a second, parallel one. Bounded; never raises —
+        on failure or timeout the download extracts by itself as before.
+        """
+        flight = self._meta_inflight.get(url.strip())
+        if flight is None or flight.fut.done():
+            return
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(self.extract_info(url), INFLIGHT_JOIN_TIMEOUT)
+            outcome = "joined"
+        except asyncio.TimeoutError:
+            outcome = "timeout"
+        except Exception:
+            outcome = "failed"
+        logger.info("download %s the running extraction after %.1fs: %s",
+                    outcome, time.monotonic() - started, redact.url(url))
+
     async def download(
         self,
         url: str,
@@ -1859,6 +1883,7 @@ class DownloadManager:
         self.active += 1
         try:
             await _emit_progress(progress_cb, 1, "Starting…")
+            await self._join_inflight_extraction(url)
             loop = asyncio.get_running_loop()
             started = time.monotonic()
             result = await loop.run_in_executor(

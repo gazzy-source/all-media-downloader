@@ -95,6 +95,48 @@ class TestReuseAnalysis:
         dl._META_CACHE.clear()
 
 
+class TestDownloadJoinsInflightExtraction:
+    """
+    Measured 2026-11-20: an inline pick arrived 3s into the prefetch's
+    extraction; the download ignored it and extracted again in parallel
+    (two YouTube JS challenges on a 2-vCPU box).
+    """
+
+    async def _run(self, monkeypatch, extract_s: float):
+        dl._META_CACHE.clear()
+        url = "https://youtu.be/j"
+        seen = {}
+
+        def slow_extract(u, job_id=""):
+            time.sleep(extract_s)
+            dl._meta_cache_put(u, dict(INFO))
+            return dict(INFO)
+
+        def fake_bounded(**kw):
+            seen["cached_at_start"] = dl._meta_cache_get(url, max_age=1800) is not None
+            return dl.DownloadResult(success=False, error="x", mode="audio")
+
+        monkeypatch.setattr(dl, "_extract_info_sync", slow_extract)
+        monkeypatch.setattr(dl, "build_media_info", lambda u, info: info)
+        m = DownloadManager()
+        monkeypatch.setattr(m, "_bounded_download", fake_bounded)
+        prefetch = asyncio.create_task(m.extract_info(url))
+        await asyncio.sleep(0.05)  # the prefetch is running
+        await m.download(url=url, mode="audio")
+        await prefetch
+        dl._META_CACHE.clear()
+        return seen
+
+    async def test_download_waits_for_the_running_prefetch(self, monkeypatch):
+        seen = await self._run(monkeypatch, extract_s=0.3)
+        assert seen["cached_at_start"], "download must reuse the prefetch, not race it"
+
+    async def test_join_is_bounded(self, monkeypatch):
+        monkeypatch.setattr(dl, "INFLIGHT_JOIN_TIMEOUT", 0.1)
+        seen = await self._run(monkeypatch, extract_s=0.6)
+        assert seen["cached_at_start"] is False  # gave up waiting, extracts itself
+
+
 class TestLeanFirstAttempt:
     def test_only_the_first_youtube_attempt_skips_hls(self, fake_ydl, monkeypatch, tmp_path):
         monkeypatch.setattr(dl, "YT_LEAN_DOWNLOAD", True)

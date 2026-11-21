@@ -29,6 +29,26 @@ Use the repository's normal reviewed Git update process and deploy an exact know
 
 Do not restart Docker, WARP, Kuma, networking, or unrelated VM services to deploy a bot-only change. If a side service is the actual fault, inspect its dependents and current state before acting.
 
+## WARP memory guard
+
+**[M] 2026-11-21:** `warp-svc` 2026.7.1377.0 grew to about 690 MB (260 MB RSS + 433 MB swap) after 8.5 days. On the 952 MB VM this caused swap thrash: swap-in of 5–8 MB/s, 54–70% CPU steal, a late heartbeat, and inline answers that expired ("Query is too old", with the picker spinning). Restarting WARP freed about 450 MB of swap and load fell from 9.5 to 1.0. **[E]** It grows about 70–80 MB/day; that figure comes from two data points only.
+
+`scripts/warp_memory_guard.sh` runs every 10 minutes (`warp-memory-guard.timer`) and logs one line per run. Above 300 MB (RSS + swap) it restarts WARP when the bot's heartbeat shows no queued or running downloads. Above 450 MB it waits up to 10 minutes for the bot to go idle, then restarts anyway. It restarts at most once an hour and checks the proxy afterwards. As a backstop, `deploy/warp-svc-memory.conf` caps the WARP cgroup at 450M RAM + 150M swap, so a sudden runaway kills only WARP, which `Restart=always` brings back.
+
+```bash
+# install / update (run from the checkout)
+sudo install -m 0644 deploy/warp-memory-guard.service deploy/warp-memory-guard.timer /etc/systemd/system/
+sudo install -D -m 0644 deploy/warp-svc-memory.conf /etc/systemd/system/warp-svc.service.d/memory.conf
+sudo systemctl daemon-reload && sudo systemctl enable --now warp-memory-guard.timer
+# observe growth and actions
+journalctl -t warp-guard --since -2d --no-pager
+sudo DRY_RUN=1 /opt/all-media-downloader/scripts/warp_memory_guard.sh
+# remove
+sudo systemctl disable --now warp-memory-guard.timer && sudo rm /etc/systemd/system/warp-svc.service.d/memory.conf && sudo systemctl daemon-reload
+```
+
+WARP also logs at DEBUG level (~300 journal lines/min), and the journal has no size cap; it was 3.8 GB on 2026-11-21. Capping it would delete old telemetry, so get explicit approval before changing journald retention.
+
 ## Useful inspection commands
 
 ```bash

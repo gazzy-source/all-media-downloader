@@ -37,7 +37,7 @@ These decisions describe the production-stable v1 baseline (`v1.0.0`, `830f351`)
 ## Metadata cache and single-flight
 
 **Problem:** Simultaneous requests for the same URL repeated expensive extraction.  
-**Evidence:** **[C]** Metadata requests share one in-flight result; the cache is capped at 64 entries/180 seconds. Search has a separate bounded cache and coalescing.  
+**Evidence:** **[C]** Metadata requests share one in-flight result; the cache is capped at 64 entries/180 seconds. Search has a separate bounded cache and coalescing. **[M]** 2026-11-20: an inline download that started while the prefetch extraction for the same URL was still running extracted again in parallel. Downloads now join an in-flight extraction of their URL (bounded by `EXTRACT_TIMEOUT`, stopped by cancel) and then reuse it through the download-reuse cache.  
 **Alternatives considered:** No cache; persistent shared cache.  
 **Why this choice:** Coalescing suppresses duplicate concurrent work; bounded TTL caching helps repeated requests without database or invalidation machinery.  
 **Revisit when:** **[R]** measured hit rates, extractor freshness or multi-process operation requires different cache semantics.

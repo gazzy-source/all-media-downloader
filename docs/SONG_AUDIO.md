@@ -75,6 +75,8 @@ the contract means classify and use best for songs, generic otherwise. Invalid
 file IDs retain the existing forget-and-redownload behavior. Video cache keys
 and delivery semantics are unchanged.
 
+YouTube audio is remuxed once, not twice. yt-dlp's container fixup is disabled (`fixup=never`) for YouTube audio jobs whose chain includes `FFmpegMetadata`, because that stream-copy remux already turns DASH-fragmented m4a, and ADTS/MPEG-TS AAC, into a normal MP4. **[M]** That was verified with ffmpeg 6.1 (production) and 9.0, and each full rewrite of a 30 MB file costs 8–14 s on the production VM. Other hosts keep yt-dlp's fixups.
+
 Queue, single-flight, upload streaming, UploadGate, worker bounds, image/video/
 subtitle behavior, upload ceiling and YouTube/WARP strategy policy are preserved.
 No dependencies or production configuration changes are required.

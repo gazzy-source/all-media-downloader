@@ -780,6 +780,8 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
         found = _file_of(sent)
         if not found:
             state["done"] = False
+            if STORAGE_CHAT_ID is None and sent is not None:
+                await _quiet_delete(context, chat, sent.message_id)  # not left in the admin's DM
             emit_terminal(telemetry_id, "failure", **{"class": "upload_error"})
             await finish(upload_failed_text("inline storage upload returned no file"))
             return
@@ -787,6 +789,8 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
         title = (result.title or title or "")[:200]
         if not await _swap_in(context, imid, kind, file_id, title):
             state["done"] = False
+            if STORAGE_CHAT_ID is None:
+                await _quiet_delete(context, chat, sent.message_id)  # not left in the admin's DM
             emit_terminal(telemetry_id, "failure", **{"class": "telegram_refused"})
             await finish("❌ Telegram refused this file here. Tap <b>Open bot</b> to get it.")
             return

@@ -387,9 +387,9 @@ async def test_unrelated_bad_request_is_not_sent_as_document(
     with pytest.raises(BadRequest) as raised:
         await hd._send_media(tg.ctx, 1, f, res, "cap", attempts=2)
     assert str(raised.value).lower() == rejection
-    # The outer retry loop is unchanged, including its existing treatment of
-    # BadRequest as a NetworkError. It must preserve the original error.
-    assert len(tg.uploads(method)) == 2
+    # BadRequest subclasses NetworkError in PTB. Permanent rejections (chat,
+    # rights, caption, size) upload once; possibly transient ones retry.
+    assert len(tg.uploads(method)) == (1 if hd._permanent_rejection(raised.value) else 2)
     assert not tg.uploads("sendDocument")
     assert hd.upload_gate.running_uploads == hd.upload_gate.in_flight_bytes == 0
 

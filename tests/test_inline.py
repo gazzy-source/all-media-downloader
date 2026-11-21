@@ -219,6 +219,10 @@ def _chosen(result_id, query="https://youtu.be/abc", imid="IMID"):
                            from_user=SimpleNamespace(id=42))
 
 
+async def _coro(value):
+    return value
+
+
 def _result(tmp_path, **kw):
     f = tmp_path / "clip.mp4"
     f.write_bytes(b"v" * 2048)
@@ -253,6 +257,25 @@ class TestChosenResult:
         assert inline_cache.get("https://youtu.be/abc", inl._key("video"))["file_id"] == "NEWVID"
         assert (1, 9) in ctx.bot.deleted, "storage copy removed from the admin DM"
         assert cleaned == [res]
+
+    async def test_refused_swap_leaves_no_copy_in_admin_dm(self, ctx, monkeypatch, tmp_path):
+        res = _result(tmp_path)
+
+        async def fake_send(context, chat_id, path, result, caption="", silent=False, **kw):
+            return SimpleNamespace(message_id=9, video=SimpleNamespace(file_id="NEWVID"),
+                                   audio=None, document=None, photo=None, animation=None)
+
+        async def refuse(**kw):
+            raise BadRequest("MEDIA_EMPTY")
+
+        monkeypatch.setattr(inl.download_manager, "download", lambda **kw: _coro(res))
+        monkeypatch.setattr(inl.download_manager, "cleanup_result_files", lambda r: None)
+        monkeypatch.setattr(hd, "_send_media", fake_send)
+        monkeypatch.setattr(ctx.bot, "edit_message_media", refuse)
+        await inl.handle_chosen_inline_result(_update(chosen_inline_result=_chosen("vp:x")), ctx)
+        assert (1, 9) in ctx.bot.deleted, "a refused upload must not pile up in the admin DM"
+        assert inline_cache.get("https://youtu.be/abc", inl._key("video")) is None
+        assert "refused" in ctx.bot.captions[-1]
 
     async def test_audio_choice_swaps_in_audio(self, ctx, monkeypatch, tmp_path):
         res = _result(tmp_path, is_video=False, is_audio=True, mode="audio")

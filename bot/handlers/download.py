@@ -1759,6 +1759,17 @@ async def _send_media_attempts(context, chat_id, path, result, caption, filename
                 # Retry the SAME media send — switching upload type mid-retry
                 # would bypass the caller's per-type semantics (streaming,
                 # caption handling) and mask the real timeout.
+        except BadRequest as e:
+            # A subclass of NetworkError in PTB. Rejections about the chat,
+            # rights, caption or size are deterministic: re-sending only
+            # uploads the whole file again and holds an upload slot for nothing.
+            # Others ("upload failed", a broken stream) may be transient.
+            if _permanent_rejection(e):
+                raise
+            last_err = _without_frames(e)
+            logger.warning("Upload rejected (attempt %s): %s", attempt, e)
+            if attempt < attempts:
+                await _sleep(2 * attempt)
         except NetworkError as e:
             last_err = _without_frames(e)
             logger.warning("Network error on upload (attempt %s): %s", attempt, e)
@@ -1769,6 +1780,18 @@ async def _send_media_attempts(context, chat_id, path, result, caption, filename
 
     if last_err:
         raise last_err
+
+
+_PERMANENT_REJECTIONS = (
+    "chat not found", "can't parse entities", "message thread not found",
+    "not enough rights", "have no rights", "need administrator rights",
+    "file is too big", "chat_write_forbidden", "bot was blocked", "user is deactivated",
+)
+
+
+def _permanent_rejection(err: BaseException) -> bool:
+    text = str(err).lower()
+    return any(marker in text for marker in _PERMANENT_REJECTIONS)
 
 
 def _without_frames(err: BaseException) -> BaseException:

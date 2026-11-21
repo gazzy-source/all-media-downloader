@@ -47,7 +47,14 @@ sudo DRY_RUN=1 /opt/all-media-downloader/scripts/warp_memory_guard.sh
 sudo systemctl disable --now warp-memory-guard.timer && sudo rm /etc/systemd/system/warp-svc.service.d/memory.conf && sudo systemctl daemon-reload
 ```
 
-WARP also logs at DEBUG level (~300 journal lines/min), and the journal has no size cap; it was 3.8 GB on 2026-11-21. Capping it would delete old telemetry, so get explicit approval before changing journald retention.
+WARP also logs at DEBUG level, and the journal has no size cap; it was 3.9 GB on 2026-11-21. Capping it would delete old telemetry, so get explicit approval before changing journald retention.
+
+## VM tuning (2026-11-21)
+
+- **WARP log filter:** `deploy/warp-svc-logfilter.conf` → `/etc/systemd/system/warp-svc.service.d/loglevel.conf`. **[M]** WARP ignores `RUST_LOG`, so journald drops its DEBUG lines (`LogFilterPatterns`; the level tag is ANSI-coloured), plus routine tunnel-stats and netlink-neighbour lines. Warnings, errors and other INFO lines are kept. Takes effect on the next WARP restart.
+- **needrestart:** `deploy/needrestart-mediabot.conf` → `/etc/needrestart/conf.d/50-mediabot.conf`. **[M]** Unattended upgrades restarted the bot on Oct 24 and Nov 13 without waiting for idle; on Nov 13 it overran the 60 s stop timeout and was killed. The bot is now excluded, because `ytdlp-update.timer` restarts it weekly once idle, which also picks up library updates.
+- **zswap:** `deploy/zswap.service` (enabled) turns on zswap with lz4 and a 20% pool. **[M]** The boot volume is slow: the first PO-token mint after idle took 9.0 s versus 0.19 s warm, because the provider was swapped out. Check with `sudo grep -r . /sys/kernel/debug/zswap/`; remove with `sudo systemctl disable --now zswap.service`.
+- **Pending:** a kernel update is installed but not booted (`needrestart` KSTA=3). Reboot only in a planned window.
 
 ## Useful inspection commands
 

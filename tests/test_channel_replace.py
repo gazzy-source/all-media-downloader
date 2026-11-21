@@ -268,3 +268,36 @@ class TestDmFlowUnchangedButFaster:
         q = FakeCallbackQuery(data="go:sp")
         await hd.handle_callback(fx.update(callback_query=q), fx.ctx)
         assert started == ["sp"]
+
+
+class TestUnconfirmedCachedSendKeepsLink:
+    async def test_link_post_survives_an_unconfirmed_cached_send(self, fx, monkeypatch):
+        # _send_cached timed out: not re-sent (no duplicate) — but if it never
+        # arrived, deleting the link would leave the channel with nothing.
+        hit = {"file_id": "F", "kind": "video", "title": "Clip"}
+        monkeypatch.setattr(hd.inline_cache, "get", lambda url, key: hit)
+        monkeypatch.setattr(hd.rate_limiter, "allow", lambda uid: (True, 0))
+        monkeypatch.setattr(hd, "record_download", lambda *a, **k: None)
+        monkeypatch.setattr(hd, "CHANNEL_REPLACE_LINK", True)
+        deleted = []
+
+        async def unconfirmed(*a, **k):
+            return hd._DELIVERED_UNCONFIRMED
+
+        async def spy_delete(context, chat_id, mid):
+            deleted.append(mid)
+
+        monkeypatch.setattr(hd, "_send_cached", unconfirmed)
+        monkeypatch.setattr(hd, "_try_delete", spy_delete)
+        fx.chat.type = "channel"
+        msg = fx.msg("https://youtu.be/x")
+        assert await hd.auto_download_flow(fx.update(msg), fx.ctx, "https://youtu.be/x") is True
+        assert deleted == [], "unconfirmed delivery must not delete the link post"
+
+        async def confirmed(*a, **k):
+            return object()
+
+        monkeypatch.setattr(hd, "_send_cached", confirmed)
+        msg = fx.msg("https://youtu.be/x")
+        await hd.auto_download_flow(fx.update(msg), fx.ctx, "https://youtu.be/x")
+        assert deleted == [msg.message_id], "a confirmed send still replaces the link"

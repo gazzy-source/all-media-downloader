@@ -316,3 +316,43 @@ class TestDownloaderReviewFixes:
         from pathlib import Path
         src = Path(dl.__file__).read_text(encoding="utf-8")
         assert "_bot_idle() if url == WARMUP_URL" in src
+
+
+class TestInlineCacheWritesOffLoop:
+    """Measured 2026-11-21: each put/pending change rewrote the whole JSON on
+    the event loop (3.9 ms at 110 entries, ~100 ms at the 3000 cap)."""
+
+    def test_put_does_not_write_synchronously_and_flush_persists(self, tmp_path, monkeypatch):
+        import json
+        from bot.services import inline_cache
+        path = tmp_path / "inline_cache.json"
+        inline_cache._reset_for_tests(path)
+        # Only mark dirty: the shared writer thread must not race this test.
+        monkeypatch.setattr(inline_cache, "_save", lambda data: inline_cache._dirty.set())
+        writes = []
+        real = inline_cache._write_now
+        monkeypatch.setattr(inline_cache, "_write_now", lambda: (writes.append(1), real()))
+        for i in range(5):
+            inline_cache.put(f"https://x.test/{i}", "video@720", file_id=f"F{i}", kind="video")
+        inline_cache.add_pending("IMID")
+        assert not path.exists() and writes == [], "callers never write on their thread"
+        inline_cache.flush()
+        assert writes == [1], "a burst of changes is persisted once"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert sum(1 for k in data if k.startswith("video@720|")) == 5
+        inline_cache._reset_for_tests(path)  # reload from disk
+        assert inline_cache.get("https://x.test/3", "video@720")["file_id"] == "F3"
+        assert inline_cache.drain_pending() == ["IMID"]
+
+    def test_background_writer_persists_without_flush(self, tmp_path, monkeypatch):
+        import time
+        from bot.services import inline_cache
+        path = tmp_path / "inline_cache.json"
+        inline_cache._reset_for_tests(path)
+        monkeypatch.setattr(inline_cache, "_SAVE_DELAY", 0.01)
+        inline_cache.put_meta("placeholder_video_v3", "PH")
+        for _ in range(200):
+            if path.exists():
+                break
+            time.sleep(0.01)
+        assert path.exists() and "PH" in path.read_text(encoding="utf-8")

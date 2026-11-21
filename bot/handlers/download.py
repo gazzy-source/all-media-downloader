@@ -315,7 +315,10 @@ async def auto_download_flow(
             url=url, key=repeat, thread_id=_thread_of(msg),
         )
         if sent is not None:
+            # Unconfirmed (timed out): not re-sent, but the link post stays —
+            # if the media never arrived, the channel must not lose both.
             if (is_chan and CHANNEL_REPLACE_LINK and replace_source
+                    and sent is not _DELIVERED_UNCONFIRMED
                     and _is_link_only_post(msg)):
                 await _try_delete(context, chat.id, msg.message_id)
             record_download(actor, url, hit.get("title") or "", platform, mode, quality, True)
@@ -363,6 +366,7 @@ async def auto_download_flow(
     except asyncio.CancelledError:
         jobs.drop(job)
         if not job.cancelled:
+            ticker.cancel()  # else it keeps editing the status every few seconds
             emit_terminal(telemetry_id, "failure", **{"class": "shutdown"})
             raise
         emit_terminal(telemetry_id, "cancelled", **{"class": "cancelled"})
@@ -1410,6 +1414,10 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         )
     except asyncio.CancelledError:
         if not job.cancelled:
+            # Not the user's Cancel (shutdown, task cancelled): stop the ticker
+            # and release the job; the in-flight marker stays for the restart.
+            jobs.drop(job)
+            ticker.cancel()
             emit_terminal(session.telemetry_id, "failure", **{"class": "shutdown"})
             raise
         result = None
@@ -1747,18 +1755,36 @@ async def _send_media_attempts(context, chat_id, path, result, caption, filename
             logger.warning("Flood control, waiting %ss (attempt %s)", wait, attempt)
             await _sleep(wait)
         except TimedOut as e:
+            sent_fully = _timed_out_after_sending(e)
             last_err = _without_frames(e)
             logger.warning(
-                "Upload timed out (attempt %s/%s, size=%s)",
+                "Upload timed out (attempt %s/%s, size=%s%s)",
                 attempt,
                 attempts,
                 path.stat().st_size if path.exists() else "?",
+                ", after the file was sent" if sent_fully else "",
             )
+            if sent_fully:
+                # The whole request went out and only Telegram's answer timed
+                # out: it has most likely posted the file already. Re-sending
+                # would post it twice (as _send_cached already assumes).
+                raise last_err
             if attempt < attempts:
                 await _sleep(2 * attempt)
                 # Retry the SAME media send — switching upload type mid-retry
                 # would bypass the caller's per-type semantics (streaming,
                 # caption handling) and mask the real timeout.
+        except BadRequest as e:
+            # A subclass of NetworkError in PTB. Rejections about the chat,
+            # rights, caption or size are deterministic: re-sending only
+            # uploads the whole file again and holds an upload slot for nothing.
+            # Others ("upload failed", a broken stream) may be transient.
+            if _permanent_rejection(e):
+                raise
+            last_err = _without_frames(e)
+            logger.warning("Upload rejected (attempt %s): %s", attempt, e)
+            if attempt < attempts:
+                await _sleep(2 * attempt)
         except NetworkError as e:
             last_err = _without_frames(e)
             logger.warning("Network error on upload (attempt %s): %s", attempt, e)
@@ -1769,6 +1795,37 @@ async def _send_media_attempts(context, chat_id, path, result, caption, filename
 
     if last_err:
         raise last_err
+
+
+_PERMANENT_REJECTIONS = (
+    "chat not found", "can't parse entities", "message thread not found",
+    "not enough rights", "have no rights", "need administrator rights",
+    "file is too big", "chat_write_forbidden", "bot was blocked", "user is deactivated",
+)
+
+
+def _timed_out_after_sending(err: BaseException) -> bool:
+    """
+    PTB raises TimedOut *from* httpx's error. A ReadTimeout means the request
+    (the whole upload) was sent and only the response never came; connect,
+    write and pool timeouts mean the file did not get through.
+    """
+    import httpx
+    seen, todo = set(), [err.__cause__, err.__context__]
+    while todo:
+        e = todo.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        if isinstance(e, httpx.ReadTimeout):
+            return True
+        todo += [e.__cause__, e.__context__]
+    return False
+
+
+def _permanent_rejection(err: BaseException) -> bool:
+    text = str(err).lower()
+    return any(marker in text for marker in _PERMANENT_REJECTIONS)
 
 
 def _without_frames(err: BaseException) -> BaseException:

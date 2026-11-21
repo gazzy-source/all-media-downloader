@@ -316,6 +316,14 @@ def _audio_download_options(opts, info, url):
             configured["postprocessors"] = [
                 {"key": "FFmpegVideoRemuxer", "preferedformat": "m4a"},
                 *[p for p in configured["postprocessors"] if p["key"] != "FFmpegExtractAudio"]]
+    # YouTube audio arrives as DASH m4a. yt-dlp's container fixup rewrites the
+    # whole file, then FFmpegMetadata rewrites it again — and that stream-copy
+    # remux alone already yields a normal MP4 (verified). Each rewrite of a
+    # 30 MB file measured 8-14 s on the production VM, so skip the first one.
+    # YouTube only: other hosts' HLS audio still gets yt-dlp's fixups.
+    if (_platform_flags((urlparse(url).hostname or "").lower())["yt"]
+            and any(p["key"] == "FFmpegMetadata" for p in configured.get("postprocessors") or [])):
+        configured["fixup"] = "never"
     for stale in ("requested_formats", "requested_downloads"):
         clean.pop(stale, None)
     return configured, clean

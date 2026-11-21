@@ -230,6 +230,64 @@ def test_complete_local_song_pipeline_with_optional_artwork_failure(tmp_path, mo
     assert audio_hash(source) == audio_hash(delivered)
 
 
+def _with_metadata(policy="best"):
+    opts = options(policy)
+    opts["postprocessors"] += [{"key": "FFmpegMetadata", "add_metadata": True}]
+    return opts
+
+
+@pytest.mark.parametrize("url,meta,folded", [
+    ("https://www.youtube.com/watch?v=abc", True, True),
+    ("https://youtu.be/abc", True, True),
+    ("https://music.youtube.com/watch?v=abc", True, True),
+    ("https://soundcloud.com/a/b", True, False),   # HLS audio keeps yt-dlp's fixups
+    ("https://www.youtube.com/watch?v=abc", False, False),  # nothing else remuxes it
+])
+def test_youtube_dash_fixup_folded_into_metadata_pass(url, meta, folded):
+    # Measured 2026-11-21 on the VPS: each full rewrite of a 30 MB m4a costs
+    # 8-14 s. YouTube DASH audio was rewritten twice: the m4a container fixup,
+    # then FFmpegMetadata — whose stream-copy remux alone yields a flat MP4.
+    opts = _with_metadata() if meta else options()
+    configured, _ = _audio_download_options(opts, {"title": "Lecture"}, url)
+    assert (configured.get("fixup") == "never") is folded
+    assert "fixup" not in opts, "caller's options are not mutated"
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="needs FFmpeg")
+def test_youtube_dash_audio_delivered_flat_with_one_remux(tmp_path):
+    import struct
+    from bot.services.downloader import _process_audio_download
+    source = tmp_path / "dash.m4a"
+    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+                    "sine=frequency=440:duration=2", "-c:a", "aac", "-f", "mp4",
+                    "-movflags", "dash+frag_keyframe+empty_moov", str(source)], check=True)
+
+    def top_atoms(path):
+        data, i, out = path.read_bytes(), 0, []
+        while i + 8 <= len(data):
+            size, typ = struct.unpack(">I4s", data[i:i + 8])
+            out.append(typ.decode("latin1"))
+            i += size or len(data)
+        return out
+
+    assert "moof" in top_atoms(source), "fixture is a fragmented DASH file"
+    opts = _with_metadata()
+    opts.update({"enable_file_urls": True, "quiet": True,
+                 "outtmpl": str(tmp_path / "delivered.%(ext)s")})
+    native = fmt("aac", 128, "m4a", url=source.as_uri(), container="m4a_dash", protocol="https")
+    info = {"id": "abc", "title": "Lecture", "formats": [native], "extractor": "youtube"}
+    _process_audio_download(opts, info, "https://www.youtube.com/watch?v=abc")
+    delivered = tmp_path / "delivered.m4a"
+    assert "moof" not in top_atoms(delivered), "container must be a normal MP4"
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+        "stream=codec_name:format=duration:format_tags=title", "-of", "json",
+        str(delivered)], capture_output=True, text=True, check=True)
+    data = json.loads(probe.stdout)
+    assert data["streams"][0]["codec_name"] == "aac"
+    assert data["format"]["tags"]["title"] == "Lecture"
+    assert abs(float(data["format"]["duration"]) - 2.0) < 0.1
+
+
 def test_inline_cache_profiles_preserve_classification_context():
     from bot.handlers.inline import _key
     urls = ["https://www.youtube.com/watch?v=abc", "https://music.youtube.com/watch?v=abc", "https://www.youtube.com/shorts/abc"]

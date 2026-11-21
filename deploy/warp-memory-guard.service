@@ -1,0 +1,7 @@
+[Unit]
+Description=Restart WARP before its memory growth swap-thrashes the VM
+After=warp-svc.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/all-media-downloader/scripts/warp_memory_guard.sh

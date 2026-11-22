@@ -1694,6 +1694,7 @@ async def _send_media(
     cancel=None,
     on_reserved=None,
     job_id: str = "",
+    duplicate_ok: bool = False,
 ):
     """
     Upload media with long timeouts and retries on TimedOut.
@@ -1722,7 +1723,7 @@ async def _send_media(
         try:
             sent = await _send_media_attempts(
                 context, chat_id, path, result, caption, filename, reply_markup,
-                attempts, silent=silent, thread_id=thread_id,
+                attempts, silent=silent, thread_id=thread_id, duplicate_ok=duplicate_ok,
             )
         except Exception:
             emit(job_id, "upload", outcome="failure", **{"class": "telegram_refused"},
@@ -1738,7 +1739,8 @@ async def _send_media(
 
 
 async def _send_media_attempts(context, chat_id, path, result, caption, filename,
-                               reply_markup, attempts, *, silent, thread_id):
+                               reply_markup, attempts, *, silent, thread_id,
+                               duplicate_ok: bool = False):
     """The retry loop, unchanged — run while holding the upload reservation."""
     # Errors are kept WITHOUT tracebacks (see _without_frames): their frames
     # reference the failed attempt's request through the backoff and the retry.
@@ -1764,10 +1766,12 @@ async def _send_media_attempts(context, chat_id, path, result, caption, filename
                 path.stat().st_size if path.exists() else "?",
                 ", after the file was sent" if sent_fully else "",
             )
-            if sent_fully:
+            if sent_fully and not duplicate_ok:
                 # The whole request went out and only Telegram's answer timed
                 # out: it has most likely posted the file already. Re-sending
-                # would post it twice (as _send_cached already assumes).
+                # would post it twice in the user's chat (as _send_cached
+                # assumes). A private storage upload passes duplicate_ok: it
+                # needs the file_id, and a second copy there is harmless.
                 raise last_err
             if attempt < attempts:
                 await _sleep(2 * attempt)

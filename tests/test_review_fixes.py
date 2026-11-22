@@ -356,3 +356,21 @@ class TestInlineCacheWritesOffLoop:
                 break
             time.sleep(0.01)
         assert path.exists() and "PH" in path.read_text(encoding="utf-8")
+
+
+    def test_flush_waits_for_a_write_in_progress(self, tmp_path, monkeypatch):
+        # Shutdown race: the writer has cleared the flag and is writing when
+        # atexit's flush() runs — flush must wait, not return at once.
+        import threading, time
+        from bot.services import inline_cache
+        path = tmp_path / "inline_cache.json"
+        inline_cache._reset_for_tests(path)
+        monkeypatch.setattr(inline_cache, "_save", lambda data: inline_cache._dirty.set())
+        inline_cache.put("https://x.test/a", "video@720", file_id="A", kind="video")
+        inline_cache._write_lock.acquire()  # the writer thread is mid-write
+        done = threading.Event()
+        threading.Thread(target=lambda: (inline_cache.flush(), done.set()), daemon=True).start()
+        time.sleep(0.1)
+        assert not done.is_set(), "flush must not return while a write is in progress"
+        inline_cache._write_lock.release()
+        assert done.wait(2) and "A" in path.read_text(encoding="utf-8")

@@ -32,9 +32,19 @@ if [ "${pid:-0}" -le 0 ] || [ ! -r "/proc/$pid/status" ]; then
     log "$SVC not running; nothing to do"
     exit 0
 fi
-read -r rss swap < <(awk '/^VmRSS:/{r=$2} /^VmSwap:/{s=$2} END{print int(r/1024), int(s/1024)}' "/proc/$pid/status")
+# WARP may exit between the PID lookup and here: then skip quietly (exit 0)
+# rather than failing the unit; the next run is 10 minutes away.
+stats=$(awk '/^VmRSS:/{r=$2} /^VmSwap:/{s=$2} END{print int(r/1024), int(s/1024)}' "/proc/$pid/status" 2>/dev/null || true)
+read -r rss swap <<< "${stats:-}" || true
+if ! [[ "${rss:-}" =~ ^[0-9]+$ && "${swap:-}" =~ ^[0-9]+$ ]]; then
+    log "$SVC (pid $pid) vanished while being measured; skipping"
+    exit 0
+fi
 total=$((rss + swap))
-uptime_s=$(( $(date +%s) - $(stat -c %Y "/proc/$pid") ))
+# Process start time (field 22 of /proc/PID/stat, in clock ticks since boot).
+start_ticks=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || echo 0)
+boot_s=$(awk '{print int($1)}' /proc/uptime)
+uptime_s=$(( boot_s - ${start_ticks:-0} / $(getconf CLK_TCK) ))
 
 # Downloads queued or running, from the bot's heartbeat (0 when stale/unreadable).
 busy() {
@@ -54,7 +64,8 @@ if [ "$total" -lt "$SOFT_MB" ]; then
 fi
 
 now=$(date +%s)
-last=$(cat "$STATE" 2>/dev/null || echo 0)
+last=$(cat "$STATE" 2>/dev/null || true)
+[[ "$last" =~ ^[0-9]+$ ]] || last=0  # missing or corrupt state: no cooldown
 if [ $((now - last)) -lt "$COOLDOWN" ]; then
     log "$base action=cooldown"
     exit 0

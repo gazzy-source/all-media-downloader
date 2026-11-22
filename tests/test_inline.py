@@ -490,3 +490,23 @@ async def test_audio_context_bypasses_generic_cache_then_reuses_own(ctx, monkeyp
     assert calls == [url]
     assert [media.media for _, media in ctx.bot.media_edits] == ["CONTEXT", "CONTEXT"]
     assert inline_cache.get(generic, inl._key("audio", generic))["file_id"] == "GENERIC"
+
+
+@pytest.mark.parametrize("url,incomplete", [
+    ("https://youtu.be/o1Od1WrVoCM", False),
+    ("https://youtu.be/o1Od1WrVoC", True),
+    ("https://WWW.YouTube.com/watch?v=o1Od1WrVoCM&t=3", False),  # host case is irrelevant
+    ("HTTPS://YOUTU.BE/o1Od1WrVoCM", False),
+    ("https://music.youtube.com/watch?v=o1Od1WrVoCM", False),
+    ("https://m.youtube.com/shorts/o1Od1WrVoCM", False),
+    ("https://www.youtube.com/live/o1Od1WrVoCM", False),
+    ("https://youtube.com/playlist?list=PL1", False),       # not a single-video link
+    ("https://www.youtube.com/@chan", False),
+    ("https://notyoutube.com/watch?v=1", False),
+])
+def test_incomplete_youtube(url, incomplete):
+    assert inl._incomplete_youtube(url) is incomplete
+
+
+def test_youtube_id_keeps_the_id_case():
+    assert inline_cache.youtube_id("https://WWW.YOUTUBE.COM/watch?v=AbCdEfGhIjK") == "AbCdEfGhIjK"

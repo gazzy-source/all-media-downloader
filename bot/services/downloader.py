@@ -430,9 +430,14 @@ _YT_WINNER_DL: int = 0
 # ever re-probes the full ladder, so one transient 403 could hold the whole
 # process at 360p until the next restart. Let the pin expire so quality
 # recovers on its own.
+# 180 s, not 600: measured 2026-11-22, a startup warm-up hit a transient bot
+# wall on VISIONOS (median 2.6 s) and pinned the default rotation (median
+# 6.5 s, worst 29 s) — every lookup for the next 10 minutes started slow,
+# while VISIONOS itself worked again minutes later. A persistently blocked
+# first strategy now costs one failed ~2.5 s attempt every 3 minutes.
 _YT_WINNER_META_AT: float = 0.0
 _YT_WINNER_DL_AT: float = 0.0
-_YT_WINNER_TTL = 600.0
+_YT_WINNER_TTL = 180.0
 _YT_WINNER_LOCK = threading.Lock()
 
 # PO-token provider reachability (resolved once per process)

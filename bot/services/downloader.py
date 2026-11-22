@@ -222,6 +222,33 @@ def _telegram_cover(work_dir: Path) -> Path | None:
         return None
 
 
+# The square cover only needs the thumbnail, which yt-dlp writes BEFORE the
+# audio download starts; making it then overlaps its ffmpeg run (0.4 s warm,
+# up to ~2 s cold on the VPS) with the download and the tagging instead of
+# adding it after them. One worker: covers are tiny and jobs are few.
+_COVER_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="cover")
+
+
+def _start_cover_early(state: dict, work_dir: Path) -> None:
+    """Called from the first 'downloading' progress event of an audio job."""
+    if "fut" not in state:
+        state["fut"] = _COVER_POOL.submit(_telegram_cover, work_dir)
+
+
+def _finish_cover(state: dict, work_dir: Path) -> Path | None:
+    """The early cover if it is still there, else make it now (as before)."""
+    fut = state.get("fut")
+    if fut is not None:
+        try:
+            cover = fut.result(timeout=25)
+        except Exception:
+            cover = None
+        # A failed attempt clears work_dir before the retry: re-check the file.
+        if cover is not None and cover.is_file():
+            return cover
+    return _telegram_cover(work_dir)
+
+
 def _overall_pct(part: str, file_pct: float) -> float:
     """The video half is ~90% of the bytes, the audio ~10%."""
     if part == "video":
@@ -2135,10 +2162,14 @@ class DownloadManager:
 
         tripped: dict[str, str] = {}
 
+        cover_state: dict[str, Any] = {}
+
         def guard(d: dict[str, Any]) -> None:
             """Abort mid-transfer: endless streams and huge files stop HERE."""
             if d.get("status") != "downloading":
                 return
+            if mode == "audio" and "fut" not in cover_state:
+                _start_cover_early(cover_state, work_dir)
             reason = None
             if cancel is not None and cancel.is_set():
                 reason = CANCELLED
@@ -2341,7 +2372,7 @@ class DownloadManager:
                 subtitle_file=sub_file,
                 actual_height=_delivered_height(info),
                 artist=_artist_of(info),
-                cover=_telegram_cover(work_dir) if mode == "audio" else None,
+                cover=_finish_cover(cover_state, work_dir) if mode == "audio" else None,
                 music=bool(info.get("_music")),
                 music_confidence=info.get("_music_confidence", "low"),
                 source_codec=info.get("_source_codec", "unknown"),

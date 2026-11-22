@@ -102,3 +102,41 @@ def test_audio_keeps_the_cover_jpg_for_telegram(monkeypatch, tmp_path):
         audio_format="mp3", title_hint="t", progress_cb=None, loop=None)
     embed = [p for p in seen["postprocessors"] if p["key"] == "EmbedThumbnail"][0]
     assert embed["already_have_thumbnail"] is True
+
+
+@pytest.mark.skipif(not __import__("shutil").which("ffmpeg"), reason="needs FFmpeg")
+class TestCoverMadeDuringDownload:
+    """The square cover is started at the first download byte, not after
+    tagging (its ffmpeg run took 0.4 s warm / ~2 s cold on the VPS)."""
+
+    def _thumb(self, work_dir):
+        import subprocess
+        src = work_dir / "song.jpg"
+        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+                        "color=c=red:s=1280x720:d=1", "-frames:v", "1", str(src)], check=True)
+        return src
+
+    def test_early_cover_is_reused(self, tmp_path):
+        import bot.services.downloader as dl
+        self._thumb(tmp_path)
+        state = {}
+        dl._start_cover_early(state, tmp_path)
+        dl._start_cover_early(state, tmp_path)  # every later progress event: no-op
+        cover = dl._finish_cover(state, tmp_path)
+        assert cover is not None and cover.name == "tg_cover.jpg" and cover.is_file()
+
+    def test_cover_deleted_by_a_retry_is_remade(self, tmp_path):
+        import bot.services.downloader as dl
+        self._thumb(tmp_path)
+        state = {}
+        dl._start_cover_early(state, tmp_path)
+        state["fut"].result(10).unlink()  # a failed attempt cleared work_dir
+        cover = dl._finish_cover(state, tmp_path)
+        assert cover is not None and cover.is_file()
+
+    def test_no_thumbnail_no_cover(self, tmp_path):
+        import bot.services.downloader as dl
+        state = {}
+        dl._start_cover_early(state, tmp_path)
+        assert dl._finish_cover(state, tmp_path) is None
+        assert dl._finish_cover({}, tmp_path) is None  # never started: as before

@@ -108,9 +108,20 @@ class TestInlineQuery:
         # A keyboard is mandatory, or Telegram never reports an inline_message_id.
         assert all(r.reply_markup is not None for r in results)
         assert "Cool Clip" in results[0].title
-        # Placeholders were uploaded to the admin's DM once, then deleted there.
+        # Placeholders were uploaded to the admin's DM once and KEPT there:
+        # deleting the only message holding a photo left Desktop unable to
+        # load it later (blurred, untappable tiles).
         assert [c for c, _ in ctx.bot.photos] == [1, 1]
-        assert len(ctx.bot.deleted) == 2
+        assert ctx.bot.deleted == []
+
+    async def test_stale_v3_placeholders_are_not_reused(self, ctx):
+        # v3 photos were orphaned (their upload message deleted).
+        inline_cache.put_meta("placeholder_video_v3", "OLDV3")
+        inline_cache.put_meta("placeholder_audio_v3", "OLDA3")
+        q = FakeInlineQuery("https://youtu.be/abc")
+        await inl.handle_inline_query(_update(inline_query=q), ctx)
+        results, _ = q.answers[0]
+        assert {r.photo_file_id for r in results}.isdisjoint({"OLDV3", "OLDA3"})
 
     async def test_stale_v2_placeholders_are_not_reused(self, ctx):
         # Telegram Desktop kept a broken local copy of the v2 audio photo

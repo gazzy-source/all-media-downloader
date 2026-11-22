@@ -461,8 +461,9 @@ async def test_upload_memory_does_not_scale_with_the_file(tmp_path):
         async for chunk in request.stream:  # consumed as it arrives, never stored
             h.update(chunk)
             n += len(chunk)
-        got.update(n=n, length=int(request.headers["content-length"]))
         method = request.url.path.rsplit("/", 1)[-1]
+        if method != "sendChatAction":  # sent alongside the upload, may land last
+            got.update(n=n, length=int(request.headers["content-length"]))
         result = ME if method == "getMe" else (True if method == "sendChatAction" else MSG)
         return httpx.Response(200, content=json.dumps({"ok": True, "result": result}).encode())
 
@@ -487,3 +488,31 @@ async def test_upload_memory_does_not_scale_with_the_file(tmp_path):
         await bot.shutdown()
     assert got["n"] == got["length"] and got["n"] > size  # whole body, as declared
     assert peak < 8 * 1024 * 1024, f"upload held {peak / 2**20:.1f} MB (file is 40 MB)"
+
+
+async def test_chat_action_never_delays_the_upload(tmp_path):
+    # It cost a full Telegram round trip before every upload; silent uploads
+    # (the private storage chat) skip it entirely.
+    import asyncio
+    f, _, res = _video(tmp_path, size=1000)
+    order, gate = [], asyncio.Event()
+
+    async def slow_action(*a, **k):
+        order.append("action")
+        await gate.wait()  # Telegram slow to answer the status call
+
+    async def send_video(*a, **k):
+        order.append("upload")
+        return MSG
+
+    ctx = SimpleNamespace(bot=SimpleNamespace(send_chat_action=slow_action, send_video=send_video))
+    await asyncio.wait_for(hd._send_media_once(ctx, 1, f, res, "", f.name), 1)
+    assert "upload" in order, "upload did not wait for the status call"
+    await asyncio.sleep(0)  # the background status call starts...
+    assert "action" in order  # ...and is still pending (gate closed)
+    gate.set()
+    await asyncio.sleep(0)
+    order.clear()
+    await hd._send_media_once(ctx, 1, f, res, "", f.name, silent=True)
+    await asyncio.sleep(0)
+    assert order == ["upload"], "no status call for silent (storage) uploads"

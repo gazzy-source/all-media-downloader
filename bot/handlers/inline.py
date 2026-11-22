@@ -172,10 +172,11 @@ def _fetch_title(url: str) -> str:
 async def _placeholder_file_id(context: ContextTypes.DEFAULT_TYPE, mode: str) -> str | None:
     """Upload the labelled placeholder photo once; reuse its file_id after."""
     # Versioned: a redesigned image needs a fresh upload, not the old file_id.
-    # v3: Telegram Desktop held a broken local copy of the v2 audio photo
-    # (tile stayed blurred and untappable; phones were fine) — a new upload
-    # gives a new photo id the client has never cached.
-    name = f"placeholder_{mode}_v3"
+    # v4: the upload message is now KEPT. v2/v3 were deleted right after
+    # upload; Telegram Desktop later showed both tiles blurred and untappable
+    # (only the embedded preview loaded) while phones, with a local copy,
+    # were fine — consistent with the orphaned photo no longer being served.
+    name = f"placeholder_{mode}_v4"
     cached = inline_cache.get_meta(name)
     if cached:
         return cached
@@ -189,8 +190,8 @@ async def _placeholder_file_id(context: ContextTypes.DEFAULT_TYPE, mode: str) ->
             )
         file_id = msg.photo[-1].file_id
         inline_cache.put_meta(name, file_id)
-        if STORAGE_CHAT_ID is None:
-            await _quiet_delete(context, chat, msg.message_id)
+        # Not deleted (even from the admin's DM): the message keeps the photo
+        # referenced, so clients can keep downloading it for inline answers.
         return file_id
     except TelegramError:
         logger.exception("could not upload the inline placeholder")

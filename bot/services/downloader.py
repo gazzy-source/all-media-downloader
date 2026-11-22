@@ -1854,17 +1854,21 @@ class DownloadManager:
         started = time.monotonic()
         task = asyncio.ensure_future(self.extract_info(url))
         outcome = "timeout"
-        while time.monotonic() - started < INFLIGHT_JOIN_TIMEOUT:
-            if cancel is not None and cancel.is_set():
-                outcome = "cancelled"
-                break
-            await asyncio.wait({task}, timeout=0.25)
-            if task.done():
-                outcome = "failed" if task.cancelled() or task.exception() else "joined"
-                break
-        if not task.done():
-            task.cancel()  # extract_info shields the shared run; only our wait ends
-            await asyncio.wait({task})  # let it unwind (waiter count) without raising
+        try:
+            while time.monotonic() - started < INFLIGHT_JOIN_TIMEOUT:
+                if cancel is not None and cancel.is_set():
+                    outcome = "cancelled"
+                    break
+                await asyncio.wait({task}, timeout=0.25)
+                if task.done():
+                    outcome = "failed" if task.cancelled() or task.exception() else "joined"
+                    break
+        finally:
+            # Also when download() itself is cancelled mid-wait: never leave
+            # the inner task orphaned (its exception would go unretrieved).
+            if not task.done():
+                task.cancel()  # extract_info shields the shared run; only our wait ends
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())
         logger.info("download %s the running extraction after %.1fs: %s",
                     outcome, time.monotonic() - started, redact.url(url))
 

@@ -225,6 +225,16 @@ async def test_timeout_after_the_file_was_sent_is_not_resent(tg, tmp_path, monke
     assert hd.upload_gate.running_uploads == hd.upload_gate.in_flight_bytes == 0
 
 
+async def test_storage_upload_retries_a_read_timeout(tg, tmp_path, monkeypatch):
+    # Inline uploads go to a private storage chat and need the file_id: a
+    # second copy there is harmless, failing the user's card is not.
+    f, _, res = _video(tmp_path, size=10_000)
+    tg.script["sendVideo"] = ["readtimeout", "ok"]
+    monkeypatch.setattr(hd, "_sleep", _nosleep)
+    sent = await hd._send_media(tg.ctx, 1, f, res, "cap", attempts=3, duplicate_ok=True)
+    assert sent is not None and len(tg.uploads("sendVideo")) == 2
+
+
 # 5 --------------------------------------------- video -> document fallback
 async def test_video_refused_falls_back_to_document_with_the_whole_file(tg, tmp_path):
     f, data, res = _video(tmp_path)

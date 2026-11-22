@@ -773,6 +773,7 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
                 context, chat, result.primary, result, caption="", silent=True,
                 cancel=job.event, on_reserved=lambda: setattr(job, "cancellable", False),
                 job_id=telemetry_id,
+                duplicate_ok=True,  # storage chat: needs the file_id; a 2nd copy is harmless
             )
         except UploadCancelled:
             emit_terminal(telemetry_id, "cancelled", **{"class": "cancelled"})

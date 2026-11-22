@@ -69,9 +69,24 @@ def good_enough(mode: str, quality: str, result) -> bool:
     return got > 360 or got >= want
 
 
+def _host_lower(url: str) -> str:
+    """Scheme and host are case-insensitive (WWW.YouTube.com); the id is not."""
+    url = (url or "").strip().split("#")[0]
+    head, sep, rest = url.partition("://")
+    if not sep:
+        head, rest = "", url
+    host, slash, path = rest.partition("/")
+    host = host.lower()
+    if host.endswith((":443", ":80")):
+        host = host.rsplit(":", 1)[0]  # an explicit default port
+    if path.startswith("watch/?"):
+        path = "watch?" + path[len("watch/?"):]
+    return f"{head.lower()}{sep}{host}{slash}{path}"
+
+
 def youtube_id(url: str) -> str | None:
     """The 11-character video id of a single-video YouTube link, else None."""
-    m = _YT_ID.match((url or "").strip().split("#")[0])
+    m = _YT_ID.match(_host_lower(url))
     return m.group(1) if m else None
 
 
@@ -114,25 +129,29 @@ _writer: threading.Thread | None = None
 
 
 def _write_now() -> None:
-    with _write_lock:
-        with _lock:
-            if _data is None:
-                return
-            path, text = _PATH, json.dumps(_data, ensure_ascii=False)
-        tmp = path.with_suffix(".tmp")
-        try:
-            tmp.write_text(text, encoding="utf-8")
-            os.replace(tmp, path)
-        except OSError:
-            logger.exception("could not persist the inline cache")
+    """Persist the current state. Caller holds _write_lock."""
+    with _lock:
+        if _data is None:
+            return
+        path, text = _PATH, json.dumps(_data, ensure_ascii=False)
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        logger.exception("could not persist the inline cache")
 
 
 def _writer_loop() -> None:
     while True:
         _dirty.wait()
         time.sleep(_SAVE_DELAY)
-        _dirty.clear()
-        _write_now()
+        # Clear and write under _write_lock: flush() at exit then either
+        # waits for this write or sees the flag still set — never neither.
+        with _write_lock:
+            if _dirty.is_set():
+                _dirty.clear()
+                _write_now()
 
 
 def _save(data: dict[str, dict[str, Any]]) -> None:
@@ -146,9 +165,10 @@ def _save(data: dict[str, dict[str, Any]]) -> None:
 
 def flush() -> None:
     """Persist pending changes now (shutdown, tests)."""
-    if _dirty.is_set():
-        _dirty.clear()
-        _write_now()
+    with _write_lock:
+        if _dirty.is_set():
+            _dirty.clear()
+            _write_now()
 
 
 atexit.register(flush)

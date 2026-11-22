@@ -288,6 +288,22 @@ class TestStickyWinnerOrdering:
             dl._remember_yt_strategy(old, download=True)
 
 
+    def test_a_fallback_pin_expires_within_three_minutes(self, monkeypatch):
+        # A transient bot wall on the fast first strategy must not hold every
+        # lookup on the slow fallback for 10 minutes (measured 2026-11-22).
+        old = dl._YT_WINNER_META
+        t = [1000.0]
+        monkeypatch.setattr(dl.time, "monotonic", lambda: t[0])
+        try:
+            dl._remember_yt_strategy(1, download=False)
+            t[0] += 120
+            assert dl._yt_winner(download=False) == 1, "still pinned shortly after"
+            t[0] += 61
+            assert dl._yt_winner(download=False) == 0, "fast strategy retried after 3 min"
+        finally:
+            dl._remember_yt_strategy(old, download=False)
+
+
 class TestYtStrategyLadder:
     """Ordering and client choice (a second class named TestYtStrategies
     used to shadow the config tests above, silently disabling them)."""

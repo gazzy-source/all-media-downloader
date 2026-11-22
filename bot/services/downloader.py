@@ -327,6 +327,15 @@ def _audio_download_options(opts, info, url):
     if (_platform_flags((urlparse(url).hostname or "").lower())["yt"]
             and any(p["key"] == "FFmpegMetadata" for p in configured.get("postprocessors") or [])):
         configured["fixup"] = "never"
+    # Prefer a JPEG cover when the site offers one (YouTube lists jpg and webp
+    # versions of each thumbnail): the webp -> jpg FFmpegThumbnailsConvertor
+    # run then has nothing to do. Measured on the VPS: that ffmpeg run took
+    # 0.4 s warm / 2.1 s cold, before the audio download even starts.
+    thumbs = [t for t in clean.get("thumbnails") or [] if isinstance(t, dict)]
+    jpgs = [t for t in thumbs
+            if urlparse(t.get("url") or "").path.lower().endswith((".jpg", ".jpeg"))]
+    if jpgs and len(jpgs) < len(thumbs):
+        clean["thumbnails"] = jpgs
     for stale in ("requested_formats", "requested_downloads"):
         clean.pop(stale, None)
     return configured, clean

@@ -1866,6 +1866,29 @@ def _is_media_format_rejection(error: BadRequest, kind: str) -> bool:
     return str(error).strip().lower() in allowed[kind]
 
 
+_ACTION_TASKS: set[asyncio.Task] = set()
+
+
+def _chat_action(context, chat_id: int, action, *, silent: bool = False) -> None:
+    """
+    "uploading…" status, sent alongside the upload instead of before it: an
+    awaited call cost a full Telegram round trip on every send. Skipped for
+    silent uploads (the private storage chat, where nobody sees it).
+    """
+    if silent:
+        return
+
+    async def _send() -> None:
+        try:
+            await context.bot.send_chat_action(chat_id, action)
+        except Exception:  # cosmetic: never affects the upload
+            pass
+
+    task = asyncio.create_task(_send())
+    _ACTION_TASKS.add(task)
+    task.add_done_callback(_ACTION_TASKS.discard)
+
+
 async def _send_media_once(
     context,
     chat_id: int,
@@ -1897,7 +1920,7 @@ async def _send_media_once(
     # ~3x the file per upload (5 x 49 MB measured at 584 MB). Each handle stays
     # open (the `with` below) until the request is done, as PTB requires.
     if result.is_audio:
-        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
+        _chat_action(context, chat_id, ChatAction.UPLOAD_VOICE, silent=silent)
         with path.open("rb") as f:
             return await context.bot.send_audio(
                 chat_id,
@@ -1910,7 +1933,7 @@ async def _send_media_once(
             )
 
     if result.is_image:
-        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
+        _chat_action(context, chat_id, ChatAction.UPLOAD_PHOTO, silent=silent)
         with path.open("rb") as f:
             try:
                 return await context.bot.send_photo(
@@ -1942,7 +1965,7 @@ async def _send_media_once(
             )
 
     if result.is_video:
-        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+        _chat_action(context, chat_id, ChatAction.UPLOAD_VIDEO, silent=silent)
         with path.open("rb") as f:
             try:
                 return await context.bot.send_video(
@@ -1972,7 +1995,7 @@ async def _send_media_once(
                 **kw,
             )
 
-    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
+    _chat_action(context, chat_id, ChatAction.UPLOAD_DOCUMENT, silent=silent)
     with path.open("rb") as f:
         return await context.bot.send_document(
             chat_id,

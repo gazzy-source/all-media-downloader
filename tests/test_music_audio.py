@@ -321,3 +321,17 @@ def test_inline_cache_profiles_preserve_classification_context():
     assert _key("audio", urls[0]) == _key("audio", "https://youtu.be/abc")
     assert len({_key("audio", url) for url in urls}) == 3
     assert len({_key("video", url) for url in urls}) == 1
+
+
+def test_jpeg_cover_preferred_so_no_thumbnail_conversion():
+    # Measured: the webp -> jpg ffmpeg run took 0.4 s warm / 2.1 s cold on the
+    # VPS, before the audio download starts. YouTube lists both formats.
+    thumbs = [{"url": "https://i.ytimg.com/vi/x/hqdefault.jpg", "preference": -7},
+              {"url": "https://i.ytimg.com/vi_webp/x/maxresdefault.webp", "preference": 0},
+              {"url": "https://i.ytimg.com/vi/x/maxresdefault.jpg?sqp=1", "preference": -1}]
+    _, clean = _audio_download_options(options(), {"title": "T", "thumbnails": thumbs}, "")
+    assert [t["url"].split("/")[-1] for t in clean["thumbnails"]] == [
+        "hqdefault.jpg", "maxresdefault.jpg?sqp=1"]
+    only_webp = [{"url": "https://x.test/a.webp"}]
+    _, clean = _audio_download_options(options(), {"title": "T", "thumbnails": only_webp}, "")
+    assert clean["thumbnails"] == only_webp, "no jpg offered: keep what there is"

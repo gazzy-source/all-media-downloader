@@ -225,29 +225,56 @@ class TestGroupAndChannel(_Flow):
         assert "100 downloads" in text
         assert kw["reply_markup"].inline_keyboard[0][0].url == "https://t.me/mediabot?start=buy"
 
-    async def test_channel_is_its_own_account(self, fx, flow):
+    async def test_channel_counts_against_its_daily_cap(self, fx, flow):
         upd = _channel_post(fx)
         assert await hd.auto_download_flow(upd, fx.ctx, "https://youtu.be/x")
         drain()
-        assert quota.status(-100300)["used"] == 1
+        st = quota.status(-100300)
+        assert st["today"] == 1 and st["used"] == 0, "a day count, not a lifetime one"
 
-    async def test_channel_out_of_downloads_names_its_id(self, fx, flow):
-        use_up(-100300)
+    async def test_channel_is_free_but_stops_at_ten_a_day(self, fx, flow):
+        use_up(-100300, 10)
         upd = _channel_post(fx)
         msg = upd.effective_message
         assert not await hd.auto_download_flow(upd, fx.ctx, "https://youtu.be/x")
         assert flow.downloads == []
         text, kw = msg.replies[0]
-        assert "/buy -100300" in text
-        assert kw["reply_markup"].inline_keyboard[0][0].url.endswith("start=buy_-100300")
+        assert "today's 10 free downloads" in text and kw["reply_markup"] is None
 
-    async def test_approved_channel_is_free(self, fx, flow):
-        use_up(-100300)
+    def test_the_cap_resets_the_next_day(self, monkeypatch):
+        use_up(-100300, 10)
+        assert not quota.can_download(-100300)
+        monkeypatch.setattr(quota, "_today", lambda: "2999-01-01")
+        assert quota.can_download(-100300)
+        quota.count(-100300)
+        assert quota.status(-100300)["today"] == 1
+
+    def test_the_day_count_survives_a_restart(self, tmp_path):
+        use_up(-100300, 4)
+        quota._reset_for_tests(tmp_path / "quota.sqlite3")
+        assert quota.status(-100300)["today"] == 4
+
+    async def test_approved_channel_has_no_cap(self, fx, flow):
+        use_up(-100300, 10)
         quota.set_approved(-100300, True, by=OWNER)
         upd = _channel_post(fx)
         assert await hd.auto_download_flow(upd, fx.ctx, "https://youtu.be/x")
         drain()
-        assert quota.status(-100300)["used"] == 100, "approved: not counted"
+        assert quota.status(-100300)["today"] == 10, "approved: not counted"
+
+    async def test_jobs_in_progress_count(self, fx, flow):
+        # Twenty links at once with one download left must not all start.
+        from bot.services import jobs
+
+        use_up(USER, 99)
+        running = jobs.start("dm:1:1", USER)
+        try:
+            fx.chat.type = "supergroup"
+            assert not await hd.auto_download_flow(
+                fx.update(fx.msg("https://youtu.be/x")), fx.ctx, "https://youtu.be/x")
+            assert flow.downloads == []
+        finally:
+            jobs.drop(running)
 
     async def test_failed_download_is_not_counted(self, fx, flow, monkeypatch):
         async def fail(**kw):
@@ -282,20 +309,39 @@ class TestPrivateChat(_Flow):
         assert buttons == ["pay:100", "pay:10000"]
         assert flow.rate_hits == []
 
-    async def test_menu_opened_earlier_stops_at_the_limit(self, fx, flow):
+    async def test_menu_opened_earlier_stops_at_the_limit(self, fx, flow, monkeypatch):
         use_up(USER)
-        s = DownloadSession(session_id="s1", user_id=USER, chat_id=100,
+        refunded = []
+        monkeypatch.setattr(hd.rate_limiter, "refund", lambda uid: refunded.append(uid))
+        s = DownloadSession(session_id="s1", user_id=USER, chat_id=USER,
                             url="https://youtu.be/x", mode="video", quality="720")
         query = FakeCallbackQuery(data="q:s1:720")
         edits = []
 
         async def edit(text, **kw):
-            edits.append(text)
+            edits.append((text, kw))
 
         query.edit_message_text = edit
         await hd.execute_download(query, fx.ctx, s)
-        assert flow.downloads == [] and "used all" in edits[0]
-        assert s.started is False, "after buying, the same menu works"
+        assert flow.downloads == [] and "used all" in edits[0][0]
+        assert edits[0][1]["reply_markup"] is not None, "the packs, in private"
+        assert refunded == [USER], "the hourly slot it took is given back"
+
+    async def test_group_menu_refusal_stays_private(self, fx, flow):
+        use_up(USER)
+        s = DownloadSession(session_id="s2", user_id=USER, chat_id=-100200,
+                            url="https://youtu.be/x", mode="video", quality="720")
+        query = FakeCallbackQuery(data="q:s2:720")
+        edits = []
+
+        async def edit(text, **kw):
+            edits.append((text, kw))
+
+        query.edit_message_text = edit
+        await hd.execute_download(query, fx.ctx, s)
+        text, kw = edits[0]
+        assert "used all" not in text, "no balance posted in a group"
+        assert kw["reply_markup"].inline_keyboard[0][0].url.endswith("start=buy")
 
 
 # ------------------------------------------------------------------ inline
@@ -413,15 +459,11 @@ class TestBuying:
         await prem.handle_premium_callback(_cb(fx, "pay:5"), SimpleNamespace(bot=bot, args=[]))
         assert bot.invoices == []
 
-    async def test_channel_pack_needs_a_channel_admin(self, fx):
+    async def test_chats_no_longer_buy(self, fx):
         bot = StarsBot()
         await prem.handle_premium_callback(_cb(fx, "pay:100:-100300"),
                                            SimpleNamespace(bot=bot, args=[]))
-        assert bot.invoices == []
-        bot = StarsBot(admin_of={(-100300, USER)})
-        await prem.handle_premium_callback(_cb(fx, "pay:100:-100300"),
-                                           SimpleNamespace(bot=bot, args=[]))
-        assert bot.invoices[0]["payload"] == f"dl:-100300:{USER}:100:100"
+        assert bot.invoices == [], "an old channel-pack button does nothing"
 
     @pytest.mark.parametrize("payload,amount,ok", [
         (f"dl:{USER}:{USER}:100:100", 100, True),
@@ -444,7 +486,7 @@ class TestBuying:
                                       SimpleNamespace(bot=StarsBot()))
         assert answers == [ok]
 
-    async def test_precheckout_rechecks_channel_admin(self):
+    async def test_precheckout_refuses_a_chat_account(self):
         answers = []
 
         async def answer(ok, error_message=None):
@@ -455,7 +497,7 @@ class TestBuying:
                               total_amount=100, answer=answer)
         await prem.handle_precheckout(SimpleNamespace(pre_checkout_query=pcq),
                                       SimpleNamespace(bot=StarsBot()))
-        assert answers == [False], "no longer an admin there"
+        assert answers == [False]
 
     def _paid(self, fx, payload, amount, charge="tg_1"):
         msg = fx.msg("")
@@ -547,7 +589,54 @@ class TestBalanceShown:
         await prem.cmd_premium(fx.update(msg), SimpleNamespace(bot=StarsBot(), args=[]))
         assert "<b>63</b> downloads left" in msg.replies[0][0]
 
-    async def test_buy_for_a_channel_you_do_not_run(self, fx):
-        msg = fx.msg("/buy -100300")
-        await prem.cmd_premium(fx.update(msg), SimpleNamespace(bot=StarsBot(), args=["-100300"]))
-        assert "Only an admin" in msg.replies[0][0]
+    async def test_stats_in_a_group_shows_no_balance(self, fx):
+        import bot.handlers.start as start
+
+        fx.chat.type = "supergroup"
+        msg = fx.msg("/stats")
+        fx.ctx.bot.username = "mediabot"
+        await start.cmd_stats(fx.update(msg), fx.ctx)
+        assert "Downloads left" not in msg.replies[0][0]
+
+
+class TestRefundEdges:
+    async def test_unrecorded_refund_is_reported(self, fx, monkeypatch):
+        quota.add_pack(USER, USER, charge_id="tg_e", stars=100, downloads=100)
+
+        def boom(cid):
+            raise RuntimeError("disk")
+
+        monkeypatch.setattr(quota, "mark_refunded", boom)
+        fx.user.id = OWNER
+        msg = fx.msg(f"/refund {USER}")
+        await prem.cmd_refund(fx.update(msg), SimpleNamespace(bot=StarsBot(), args=[str(USER)]))
+        assert "couldn't record it" in msg.replies[0][0] and "tg_e" in msg.replies[0][0]
+
+    async def test_a_refund_made_outside_the_bot_takes_the_pack_back(self, fx):
+        quota.add_pack(USER, USER, charge_id="tg_out", stars=100, downloads=100)
+        msg = fx.msg("")
+        msg.refunded_payment = SimpleNamespace(telegram_payment_charge_id="tg_out",
+                                               total_amount=100)
+        await prem.handle_refunded_payment(fx.update(msg), SimpleNamespace(bot=StarsBot()))
+        assert not quota.is_paid(USER)
+
+
+class TestOwnerCommandsInGroups:
+    async def test_reply_to_a_post_as_own_channel_asks_for_the_id(self, fx):
+        fx.user.id = OWNER
+        msg = fx.msg("/approvefree")
+        msg.reply_to_message = SimpleNamespace(
+            sender_chat=SimpleNamespace(id=-1001), chat=SimpleNamespace(id=-100200),
+            is_automatic_forward=False, from_user=SimpleNamespace(id=136817688))
+        await prem.cmd_approvefree(fx.update(msg), SimpleNamespace(bot=StarsBot(), args=[]))
+        assert not quota.is_exempt(-1001) and not quota.is_exempt(136817688)
+        assert "Usage" in msg.replies[0][0]
+
+    async def test_the_list_never_goes_to_a_group(self, fx):
+        quota.set_approved(555, True, by=OWNER)
+        fx.user.id = OWNER
+        fx.chat.type = "supergroup"
+        msg = fx.msg("/approvefree")
+        msg.reply_to_message = None
+        await prem.cmd_approvefree(fx.update(msg), SimpleNamespace(bot=StarsBot(), args=[]))
+        assert "555" not in msg.replies[0][0]

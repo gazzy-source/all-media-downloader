@@ -63,6 +63,11 @@ def start(key: str, owner: int) -> Job:
     return job
 
 
+def active_for(owner: int, exclude: Job | None = None) -> int:
+    """Jobs of this owner in progress (queued, downloading or sending)."""
+    return sum(1 for j in list(_JOBS.values()) if j.owner == owner and j is not exclude)
+
+
 def get(key: str) -> Job | None:
     return _JOBS.get(key)
 

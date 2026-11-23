@@ -1,15 +1,15 @@
 """
 Download packs, paid with Telegram Stars (currency "XTR", no payment provider).
 
-Each account gets FREE_DOWNLOADS free downloads (see services/quota.py), then:
+Each user gets FREE_DOWNLOADS free downloads (see services/quota.py), then:
 
   /premium (also /buy, ⭐ in the menu) → pick a pack → Stars invoice in the
   buyer's private chat → pre_checkout_query (we re-check account, buyer, pack
   and price) → successful_payment adds the pack. Every charge keeps its
   telegram_payment_charge_id, so the owner can /refund it.
 
-Channels are their own account (a post has no person behind it). An admin of
-the channel buys for it with "/buy <channel id>"; the refund goes to that admin.
+Channels (and groups' anonymous admins) are free, capped per day; they have
+nothing to buy.
 
 Owner commands: /approvefree <id> (lifetime free, never counted),
 /revokefree <id>, /refund <user id>.
@@ -33,7 +33,6 @@ from bot.services import quota
 logger = logging.getLogger(__name__)
 
 CURRENCY = "XTR"  # Telegram Stars
-_ADMIN_STATUSES = ("creator", "administrator")
 
 
 def _html(s: str) -> str:
@@ -60,93 +59,57 @@ def _parse_payload(payload: str) -> tuple[int, int, int, int] | None:
 
 
 # ------------------------------------------------------------------- texts
-def _who(account: int, user_id: int) -> str:
-    return "You have" if account == user_id else f"<code>{account}</code> has"
-
-
-def quota_text(account: int, user_id: int) -> str:
-    """The account's balance and the packs on offer."""
-    st = quota.status(account)
-    who = _who(account, user_id)
+def quota_text(user_id: int) -> str:
+    """The user's balance and the packs on offer."""
+    st = quota.status(user_id)
     if st["admin"] or st["approved"]:
-        head = f"♾ <b>{who} unlimited free downloads</b> (approved by the owner).\n\n"
+        head = "♾ <b>You have unlimited free downloads</b> (approved by the owner).\n\n"
     elif st["remaining"] > 0:
-        head = (f"📥 {who} <b>{_n(st['remaining'])}</b> downloads left "
+        head = (f"📥 You have <b>{_n(st['remaining'])}</b> downloads left "
                 f"({_n(st['used'])} of {_n(st['allowance'])} used).\n\n")
     else:
-        head = (f"🚫 {who} used all <b>{_n(st['allowance'])}</b> downloads "
+        head = (f"🚫 You've used all <b>{_n(st['allowance'])}</b> downloads "
                 f"({_n(quota.FREE)} free" + (f" + {_n(st['bought'])} bought" if st["bought"] else "")
                 + ").\n\n")
     packs = "\n".join(f"• ⭐ <b>{_n(s)} Stars</b> → <b>{_n(n)}</b> more downloads"
                       for n, s in quota.PACKS)
     return (
         f"{head}⭐ <b>Get more downloads</b>\n\n"
-        f"Everyone gets {_n(quota.FREE)} free downloads: in this chat, inline, in "
-        "groups and in channels, all counted together. Then:\n\n"
+        f"Everyone gets {_n(quota.FREE)} free downloads: in this chat, inline and in "
+        "groups, all counted together. Then:\n\n"
         f"{packs}\n\n"
-        "Packs never expire and stack. Buyers also skip ahead in the queue.\n\n"
+        "Packs never expire and stack. Buyers also skip ahead in the queue.\n"
+        f"Channels are free, up to {_n(quota.CHAT_DAILY)} downloads a day.\n\n"
         "<i>Payment is handled by Telegram. Help: /paysupport</i>"
     )
 
 
-def _packs_markup(account: int, user_id: int) -> InlineKeyboardMarkup:
-    suffix = "" if account == user_id else f":{account}"
+def _packs_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(
-        f"⭐ {_n(n)} downloads — {_n(s)} Stars", callback_data=f"pay:{n}{suffix}")]
+        f"⭐ {_n(n)} downloads — {_n(s)} Stars", callback_data=f"pay:{n}")]
         for n, s in quota.PACKS])
 
 
-def refusal(account: int, *, user_id: int | None, private: bool, bot_username: str,
-            channel: bool = False) -> tuple[str, InlineKeyboardMarkup | None]:
-    """What to say when an account is out of downloads, and the way to buy."""
-    st = quota.status(account)
-    used = _n(st["allowance"])
+def refusal(account: int, *, user_id: int | None, private: bool,
+            bot_username: str) -> tuple[str, InlineKeyboardMarkup | None]:
+    """What to say when an account is out of downloads, and the way on."""
+    if quota.is_chat(account):
+        # Channels and anonymous admins: free, capped per day; nothing to buy.
+        return (f"⏳ This chat has used today's {_n(quota.CHAT_DAILY)} free downloads. "
+                "More from 00:00 UTC.", None)
     if private and user_id == account:
-        return quota_text(account, user_id), _packs_markup(account, user_id)
-    if channel:
-        text = (f"🚫 This channel has used its {used} downloads. A channel admin can add "
-                f"more: open @{bot_username} and send <code>/buy {account}</code>.")
-        url = f"https://t.me/{bot_username}?start=buy_{account}"
-    else:
-        text = f"🚫 You've used your {used} downloads. Get more in a private chat with me ⭐"
-        url = f"https://t.me/{bot_username}?start=buy"
+        return quota_text(account), _packs_markup()
+    text = (f"🚫 You've used your {_n(quota.status(account)['allowance'])} downloads. "
+            "Get more in a private chat with me ⭐")
     if not bot_username:
         return text, None
-    return text, InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Get more downloads", url=url)]])
-
-
-async def _is_chat_admin(bot, chat_id: int, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id, user_id)
-    except TelegramError:
-        return False
-    return getattr(member, "status", None) in _ADMIN_STATUSES
-
-
-async def _account_for(update: Update, context, raw: str | None) -> int | None:
-    """
-    The account a buyer is looking at: themselves, or a chat they administer.
-    Returns None (and says why) when they may not buy for it.
-    """
-    user, msg = update.effective_user, update.effective_message
-    if raw is None or raw == str(user.id):
-        return user.id
-    if not raw.lstrip("-").isdigit() or not raw.startswith("-"):
-        if msg:
-            await msg.reply_text("Usage: /buy, or /buy <channel id> for a channel you run.")
-        return None
-    account = int(raw)
-    if user.id not in ADMIN_IDS and not await _is_chat_admin(context.bot, account, user.id):
-        if msg:
-            await msg.reply_text("⛔ Only an admin of that channel can buy downloads for it "
-                                 "(and I have to be in it).")
-        return None
-    return account
+    return text, InlineKeyboardMarkup([[InlineKeyboardButton(
+        "⭐ Get more downloads", url=f"https://t.me/{bot_username}?start=buy")]])
 
 
 # ---------------------------------------------------------------- commands
 async def cmd_premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/premium, /buy and /buy <channel id>: the balance and the packs."""
+    """/premium and /buy: the balance and the packs."""
     msg, user = update.effective_message, update.effective_user
     if not msg or not user:
         return
@@ -158,50 +121,38 @@ async def cmd_premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
                 "⭐ Open", url=f"https://t.me/{me}?start=buy")]]) if me else None)
         return
-    args = getattr(context, "args", None) or []
-    account = await _account_for(update, context, args[0] if args else None)
-    if account is None:
-        return
-    await msg.reply_text(quota_text(account, user.id), parse_mode=ParseMode.HTML,
-                         reply_markup=_packs_markup(account, user.id))
+    await msg.reply_text(quota_text(user.id), parse_mode=ParseMode.HTML,
+                         reply_markup=_packs_markup())
 
 
 async def handle_premium_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """pay:<downloads>[:<account>] sends the invoice; prem:* (older menus) shows the packs."""
+    """pay:<downloads> sends the invoice; prem:* (older menus) shows the packs."""
     query, user = update.callback_query, update.effective_user
     if not query or not user:
         return
     data = query.data or ""
     if data.startswith("prem:"):
         if query.message:
-            await query.message.reply_text(quota_text(user.id, user.id),
-                                           parse_mode=ParseMode.HTML,
-                                           reply_markup=_packs_markup(user.id, user.id))
+            await query.message.reply_text(quota_text(user.id), parse_mode=ParseMode.HTML,
+                                           reply_markup=_packs_markup())
         return
     parts = data.split(":")
-    if parts[0] != "pay" or len(parts) not in (2, 3) or not parts[1].isdigit():
-        return
+    if len(parts) != 2 or parts[0] != "pay" or not parts[1].isdigit():
+        return  # incl. pay:<n>:<chat> from older menus: chats no longer buy
     offer = quota.pack(int(parts[1]))
     if offer is None:
         if query.message:
             await query.message.reply_text("That offer has changed — open /premium again.")
         return
-    account = user.id
-    if len(parts) == 3:
-        # callback_data is client-controlled: check the right to buy again.
-        account = await _account_for(update, context, parts[2])
-        if account is None:
-            return
     downloads, stars = offer
     chat = update.effective_chat
     target = user.id if chat is None or chat.type != "private" else chat.id
-    what = "" if account == user.id else f" for {account}"
     try:
         await context.bot.send_invoice(
             chat_id=target,
             title=f"{_n(downloads)} downloads",
-            description=f"{_n(downloads)} more downloads{what}. Never expire.",
-            payload=_payload(account, user.id, downloads, stars),
+            description=f"{_n(downloads)} more downloads. Never expire.",
+            payload=_payload(user.id, user.id, downloads, stars),
             provider_token="",  # Stars: no provider
             currency=CURRENCY,
             prices=[LabeledPrice(f"{_n(downloads)} downloads", stars)],
@@ -221,13 +172,11 @@ async def handle_precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE)
     parsed = _parse_payload(q.invoice_payload)
     ok = (
         parsed is not None
-        and parsed[1] == q.from_user.id
+        and parsed[0] == parsed[1] == q.from_user.id
         and quota.pack(parsed[2]) == (parsed[2], parsed[3])
         and q.currency == CURRENCY
         and q.total_amount == parsed[3]
     )
-    if ok and parsed[0] != parsed[1] and q.from_user.id not in ADMIN_IDS:
-        ok = await _is_chat_admin(context.bot, parsed[0], q.from_user.id)
     try:
         if ok:
             await q.answer(ok=True)
@@ -381,11 +330,40 @@ async def cmd_refund(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except TelegramError as e:
         await msg.reply_text(f"Refund failed: {e}")
         return
-    quota.mark_refunded(charge["charge_id"])
+    try:
+        quota.mark_refunded(charge["charge_id"])
+    except Exception:  # noqa: BLE001 — the Stars are already back with the payer
+        # Unrecorded, the pack would stay live and a retry fails at Telegram
+        # ("already refunded"): say exactly what to fix.
+        logger.exception("refund of %s not recorded", charge["charge_id"])
+        await msg.reply_text(
+            f"⚠️ Refunded {charge['stars']} Stars to {payer}, but couldn't record it: "
+            f"the {charge['downloads']} downloads are still on their balance. "
+            f"Charge: <code>{_html(charge['charge_id'])}</code>", parse_mode=ParseMode.HTML)
+        return
     logger.info("admin %s refunded %s Stars to %s", user.id, charge["stars"], payer)
     await msg.reply_text(f"✅ Refunded {charge['stars']} Stars to {payer}; the "
-                         f"{charge['downloads']} downloads were taken back from "
-                         f"{charge['account_id']}.")
+                         f"{charge['downloads']} downloads were taken back.")
+
+
+async def handle_refunded_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Telegram tells the bot about refunds made outside /refund (e.g. through
+    Telegram support): take that pack's downloads back too.
+    """
+    msg = update.effective_message
+    rp = getattr(msg, "refunded_payment", None) if msg else None
+    if not rp:
+        return
+    charge = rp.telegram_payment_charge_id
+    try:
+        quota.mark_refunded(charge)
+    except Exception:  # noqa: BLE001
+        logger.exception("could not record the refund of %s", charge)
+        await _tell_admins(context, f"⚠️ Refund of <code>{_html(charge)}</code> could not be "
+                                    "recorded: its downloads are still on the balance.")
+        return
+    logger.info("payment %s refunded by Telegram (%s Stars)", charge, rp.total_amount)
 
 
 def _target_id(update: Update, context) -> int | None:
@@ -398,7 +376,14 @@ def _target_id(update: Update, context) -> int | None:
     if reply is not None:
         sender_chat = getattr(reply, "sender_chat", None)
         if sender_chat is not None:
-            return sender_chat.id
+            # Only a chat that IS an account: the channel itself, or the
+            # group (anonymous admins). A member posting "as" their own
+            # channel is neither, and approving that channel would leave the
+            # member's own allowance untouched: ask for the id instead.
+            here = getattr(getattr(reply, "chat", None), "id", None)
+            if sender_chat.id == here or getattr(reply, "is_automatic_forward", False):
+                return sender_chat.id
+            return None
         if getattr(reply, "from_user", None) is not None:
             return reply.from_user.id
     return None
@@ -411,17 +396,20 @@ async def cmd_approvefree(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     target = _target_id(update, context)
     if target is None:
-        ids = quota.approved_accounts()
-        listing = ", ".join(f"<code>{i}</code>" for i in ids) if ids else "none yet"
-        await msg.reply_text(
-            "Usage: <code>/approvefree &lt;user or channel id&gt;</code> (or reply to "
-            "their message). Undo with /revokefree.\n\n"
-            f"Approved: {listing}", parse_mode=ParseMode.HTML)
+        usage = ("Usage: <code>/approvefree &lt;user or channel id&gt;</code> (or reply to "
+                 "their message). Undo with /revokefree.")
+        chat = update.effective_chat
+        if chat is None or chat.type == "private":  # the list never goes to a group
+            ids = quota.approved_accounts()
+            listing = ", ".join(f"<code>{i}</code>" for i in ids) if ids else "none yet"
+            usage += f"\n\nApproved: {listing}"
+        await msg.reply_text(usage, parse_mode=ParseMode.HTML)
         return
     quota.set_approved(target, True, by=user.id)
     logger.info("admin %s approved %s as free", user.id, target)
     await msg.reply_text(f"♾ <code>{target}</code> is approved: unlimited downloads, never "
-                         "counted. Undo with /revokefree.", parse_mode=ParseMode.HTML)
+                         "counted, no daily cap. Undo with /revokefree.",
+                         parse_mode=ParseMode.HTML)
 
 
 async def cmd_revokefree(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -437,7 +425,9 @@ async def cmd_revokefree(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     quota.set_approved(target, False, by=user.id)
     st = quota.status(target)
     logger.info("admin %s revoked free access of %s", user.id, target)
+    left = (f"{_n(max(0, quota.CHAT_DAILY - st['today']))} of {_n(quota.CHAT_DAILY)} "
+            "downloads left today" if st["chat"] else
+            f"{_n(max(0, st['remaining']))} of {_n(st['allowance'])} downloads left")
     await msg.reply_text(
-        f"↩️ <code>{target}</code> is back on the normal allowance: "
-        f"{_n(max(0, st['remaining']))} of {_n(st['allowance'])} downloads left "
+        f"↩️ <code>{target}</code> is back on the normal allowance: {left} "
         "(downloads made while approved were not counted).", parse_mode=ParseMode.HTML)

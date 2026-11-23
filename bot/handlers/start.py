@@ -121,9 +121,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if args and (args[0] == "buy" or args[0].startswith("buy_")):
         from bot.handlers.premium import cmd_premium
 
-        # t.me/<bot>?start=buy (a refusal in a group or inline) or
-        # ?start=buy_<channel id> (a channel that ran out).
-        context.args = [args[0][4:]] if args[0].startswith("buy_") else []
+        # t.me/<bot>?start=buy: a refusal in a group or inline. (buy_<id>
+        # from older channel notices: channels no longer buy, show the packs.)
         await cmd_premium(update, context)
         return
     if args and args[0] == "settings":
@@ -201,6 +200,17 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message or not update.effective_user:
         return
     remaining = rate_limiter.remaining(update.effective_user.id)
+    chat = update.effective_chat
+    if chat is not None and chat.type != "private":
+        # Personal (a balance) or the operator's (server totals): neither is
+        # for a group to read. Same rule as /settings.
+        me = getattr(context.bot, "username", "") or ""
+        await update.effective_message.reply_text(
+            "📊 Stats are personal — open them in a private chat with me.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "📊 Open", url=f"https://t.me/{me}?start=settings")]]) if me else None,
+        )
+        return
     if update.effective_user.id not in ADMIN_IDS:
         # Server-wide numbers (user count, traffic, platforms) are the
         # operator's business; everyone else gets their own quota.

@@ -123,6 +123,10 @@ def parse_packs(raw: str | None) -> tuple[tuple[int, int], ...]:
 
 DOWNLOAD_PACKS: tuple[tuple[int, int], ...] = parse_packs(
     os.getenv("DOWNLOAD_PACKS", "100:100,10000:10000")) or ((100, 100),)
+# Channels (and groups' anonymous admins, posting as the group) are free, but
+# capped per UTC day: a lifetime allowance per chat was a loophole, since a
+# new chat is free to create. /approvefree lifts the cap.
+CHAT_DAILY_DOWNLOADS: int = max(0, _env_int("CHAT_DAILY_DOWNLOADS", 10))
 # Accounts that have bought a pack get this many times the hourly limit and
 # go ahead of free users in the download queue.
 PAID_RATE_MULT: int = max(1, _env_int("PAID_RATE_MULT", 5))

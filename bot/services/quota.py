@@ -1,11 +1,12 @@
 """
 Lifetime download allowance, paid with Telegram Stars.
 
-Every account gets FREE_DOWNLOADS deliveries. An account is a user, or a
-channel for the channel's own posts, since a channel post has no person
-behind it. After that it buys packs from DOWNLOAD_PACKS. Admins (ADMIN_IDS)
-and accounts the owner approved with /approvefree are never counted and
-never blocked.
+Every user gets FREE_DOWNLOADS deliveries, then buys packs from
+DOWNLOAD_PACKS. A chat account (negative id: a channel's own posts, or a
+group's anonymous admins posting as the group) is free but capped at
+CHAT_DAILY_DOWNLOADS per UTC day; a lifetime allowance per chat was a
+loophole, since a new chat costs nothing. Admins (ADMIN_IDS) and accounts
+the owner approved with /approvefree are never counted and never blocked.
 
 The balance is derived, never stored:
 
@@ -27,10 +28,9 @@ median, 90 ms worst), so counts are written on one background thread, in
 order. Payments, refunds and approvals are written synchronously: nobody is
 told "done" before it is on disk.
 
-Counting happens after a confirmed delivery and the check happens before a
-download starts. So an account at its last download that starts several
-links at once can go a few over (one per job it can run at the same time).
-Those were all delivered; the next pack simply starts from there.
+Counting happens after a confirmed delivery; the check happens before a
+download starts and counts the account's jobs already in progress, so
+starting many links at once can't run past the allowance.
 """
 
 from __future__ import annotations
@@ -49,6 +49,7 @@ from bot.config import (
     DATA_DIR,
     DOWNLOAD_PACKS,
     FREE_DOWNLOADS,
+    CHAT_DAILY_DOWNLOADS,
     PAID_RATE_MULT,
     PAYWALL_ENABLED,
     RATE_LIMIT_PER_HOUR,
@@ -58,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 ENABLED = PAYWALL_ENABLED
 FREE = FREE_DOWNLOADS
+CHAT_DAILY = CHAT_DAILY_DOWNLOADS
 PACKS: tuple[tuple[int, int], ...] = DOWNLOAD_PACKS  # (downloads, stars)
 
 _PATH: Path = DATA_DIR / "quota.sqlite3"
@@ -79,6 +81,11 @@ CREATE TABLE IF NOT EXISTS charges (
     refunded INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS charges_payer ON charges(payer_id, ts);
+CREATE TABLE IF NOT EXISTS chat_daily (
+    id INTEGER PRIMARY KEY,
+    day TEXT NOT NULL,
+    n INTEGER NOT NULL
+);
 """
 
 
@@ -94,6 +101,7 @@ class _Ledger:
         self.approved: set[int] = set()
         self.charges: dict[str, dict[str, Any]] = {}  # charge_id -> row
         self.bought: dict[int, int] = {}  # account -> downloads of live charges
+        self.daily: dict[int, tuple[str, int]] = {}  # chat account -> (UTC day, count)
 
 
 _lock = threading.Lock()  # guards _ledger
@@ -122,6 +130,8 @@ def _load() -> _Ledger:
                 led.used[r["id"]] = r["used"]
                 if r["approved"]:
                     led.approved.add(r["id"])
+            for r in con.execute("SELECT id, day, n FROM chat_daily"):
+                led.daily[r["id"]] = (r["day"], r["n"])
             for r in con.execute("SELECT * FROM charges"):
                 led.charges[r["charge_id"]] = dict(r)
                 if not r["refunded"]:
@@ -130,13 +140,40 @@ def _load() -> _Ledger:
     return _ledger
 
 
+_LOAD_RETRY_S = 30.0
+_load_failed_at = 0.0
+
+
 def _ledger_or_none() -> _Ledger | None:
+    """
+    The ledger, or None while it can't be read. A failed load is retried at
+    most every 30 s: retried on every check, each inline keystroke paid a
+    blocking connect (busy timeout 10 s) and logged a traceback.
+    """
+    global _load_failed_at
+    if _ledger is None and time.monotonic() - _load_failed_at < _LOAD_RETRY_S:
+        return None
     try:
         with _lock:
             return _load()
     except sqlite3.Error:
-        logger.exception("quota: could not load the ledger")
+        _load_failed_at = time.monotonic()
+        logger.exception("quota: could not load the ledger (retrying in 30 s)")
         return None
+
+
+def is_chat(account: int) -> bool:
+    """Negative ids are chats (channels, groups), positive ones people."""
+    return account < 0
+
+
+def _today() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _today_count(led: _Ledger, account: int) -> int:
+    day, n = led.daily.get(account, ("", 0))
+    return n if day == _today() else 0
 
 
 def pack(downloads: int) -> tuple[int, int] | None:
@@ -156,6 +193,9 @@ def status(account: int) -> dict[str, Any]:
         "remaining": allowance - used,
         "approved": account in led.approved,
         "admin": account in ADMIN_IDS,
+        "chat": is_chat(account),
+        "today": _today_count(led, account),
+        "daily": CHAT_DAILY,
     }
 
 
@@ -167,10 +207,11 @@ def is_exempt(account: int) -> bool:
     return led is not None and account in led.approved
 
 
-def can_download(account: int) -> bool:
+def can_download(account: int, active: int = 0) -> bool:
     """
-    Whether a new download may start. An unreadable ledger lets downloads
-    through: a broken disk must not lock every user out of the bot.
+    Whether a new download may start, given `active` downloads of this
+    account already in progress (not yet counted). An unreadable ledger lets
+    downloads through: a broken disk must not lock every user out.
     """
     if not ENABLED or account in ADMIN_IDS:
         return True
@@ -179,7 +220,9 @@ def can_download(account: int) -> bool:
         return True
     if account in led.approved:
         return True
-    return FREE + led.bought.get(account, 0) - led.used.get(account, 0) > 0
+    if is_chat(account):
+        return _today_count(led, account) + active < CHAT_DAILY
+    return FREE + led.bought.get(account, 0) - led.used.get(account, 0) - active > 0
 
 
 def is_paid(account: int) -> bool:
@@ -220,8 +263,24 @@ def count(account: int | None):
             return None
         if account in led.approved:
             return None
+        if is_chat(account):
+            day = _today()
+            n = _today_count(led, account) + 1
+            led.daily[account] = (day, n)
+            return _WRITER.submit(_persist_daily, account, day, n)
         led.used[account] = used = led.used.get(account, 0) + 1
     return _WRITER.submit(_persist_used, account, used)
+
+
+def _persist_daily(account: int, day: str, n: int) -> None:
+    try:
+        with closing(_connect()) as con, con:
+            con.execute(
+                "INSERT INTO chat_daily(id, day, n) VALUES(?, ?, ?) ON CONFLICT(id) DO UPDATE"
+                " SET n = CASE WHEN day = excluded.day THEN MAX(n, excluded.n)"
+                " ELSE excluded.n END, day = excluded.day", (account, day, n))
+    except sqlite3.Error:
+        logger.exception("quota: could not save today's count for %s", account)
 
 
 def flush() -> None:
@@ -295,7 +354,8 @@ def approved_accounts() -> list[int]:
 
 def _reset_for_tests(path: Path, *, enabled: bool = True, free: int = 100,
                      packs: tuple[tuple[int, int], ...] = ((100, 100), (10000, 10000))) -> None:
-    global _PATH, ENABLED, FREE, PACKS, _ledger
+    global _PATH, ENABLED, FREE, PACKS, _ledger, _load_failed_at
     flush()
     with _lock:
         _PATH, ENABLED, FREE, PACKS, _ledger = path, enabled, free, packs, None
+        _load_failed_at = 0.0

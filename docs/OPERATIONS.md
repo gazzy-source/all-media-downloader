@@ -59,10 +59,11 @@ WARP also logs at DEBUG level, and the journal has no size cap; it was 3.9 GB on
 
 ## Download allowance and Stars packs
 
-- Every account gets `FREE_DOWNLOADS` (100) lifetime downloads, counted together across DMs, inline, groups and channels. After that it buys packs (`DOWNLOAD_PACKS`, default 100⭐ = 100 and 10000⭐ = 10000) through `/premium` or `/buy`.
-- A channel is its own account. One of its admins buys for it from a private chat with `/buy <channel id>`; the id is shown in the channel's out-of-downloads notice.
+- Every user gets `FREE_DOWNLOADS` (100) lifetime downloads, counted together across DMs, inline and groups. After that they buy packs (`DOWNLOAD_PACKS`, default 100⭐ = 100 and 10000⭐ = 10000) through `/premium` or `/buy`.
+- Channels are free, capped at `CHAT_DAILY_DOWNLOADS` (10) a day, which resets at 00:00 UTC. The same applies to a group's anonymous admins, who post as the group. Chats buy nothing. (A lifetime allowance per chat was a loophole, since making a new channel costs nothing.)
+- The allowance check counts the account's downloads already in progress, so pasting many links at once can't run past the limit.
 - Owner commands (`ADMIN_IDS` only):
-  - `/approvefree <id>` makes an account lifetime free and stops counting it. The id may be a user or a negative channel/group id, or reply to the person's message instead. With no argument it lists approved ids.
+  - `/approvefree <id>` makes an account lifetime free and stops counting it; for a chat, it also lifts the daily cap. The id may be a user or a negative channel/group id, or you can reply to the person's message instead. With no argument, it lists the approved ids (in a private chat only).
   - `/revokefree <id>` puts the account back on its allowance.
   - `/refund <payer id>` refunds the payer's latest pack and takes those downloads back.
 - The ledger is `data/quota.sqlite3`. It is never evicted, so back it up together with `data/`. To inspect it (read-only):

@@ -483,6 +483,13 @@ async def post_init(app: Application) -> None:
         logger.warning("Could not update bot profile fields: %s", e)
 
 
+class _RefundedPayment(filters.MessageFilter):
+    """Service message about a Stars refund (PTB 21.10 has no ready filter)."""
+
+    def filter(self, message) -> bool:
+        return getattr(message, "refunded_payment", None) is not None
+
+
 def build_app() -> Application:
     # Accounts that bought a pack get a higher hourly limit; asked per user.
     from bot.services import quota
@@ -550,6 +557,7 @@ def build_app() -> Application:
     command("refund", premium.cmd_refund)
     app.add_handler(PreCheckoutQueryHandler(premium.handle_precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, premium.handle_successful_payment))
+    app.add_handler(MessageHandler(_RefundedPayment(), premium.handle_refunded_payment))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
     # Inline mode: @bot <link> in any chat

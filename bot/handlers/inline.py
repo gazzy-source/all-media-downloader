@@ -658,7 +658,7 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
 
 async def _deliver(context, job, mode, url, user_id, imid, title, started,
                    status, finish, state, telemetry_id: str = "") -> None:
-    if not quota.can_download(user_id):
+    if not quota.can_download(user_id, active=jobs.active_for(user_id, exclude=job)):
         emit_terminal(telemetry_id, "failure", **{"class": "other"})
         await finish(f"🚫 You've used your {quota.status(user_id)['allowance']:,} downloads. "
                      "Tap <b>Open bot</b> → /premium to get more ⭐")
@@ -811,6 +811,7 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
             emit_terminal(telemetry_id, "failure", **{"class": "telegram_refused"})
             await finish("❌ Telegram refused this file here. Tap <b>Open bot</b> to get it.")
             return
+        quota.count(user_id)  # delivered: count before any bookkeeping can fail
         # Cached only once Telegram has accepted it in a message (an invalid
         # file_id would make every later inline answer for this link fail as
         # a whole) — and only if it IS the promised quality, not a fallback.
@@ -825,7 +826,6 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
             )
         if STORAGE_CHAT_ID is None:
             await _quiet_delete(context, chat, sent.message_id)
-        quota.count(user_id)
         record_download(user_id, url, title, platform, mode, INLINE_QUALITY, True, file_size=size)
         emit_terminal(telemetry_id, "success", total_ms=int((time.monotonic() - started) * 1000))
         logger.info("inline %s delivered in %.1fs (%s) [%s]: %s", mode,

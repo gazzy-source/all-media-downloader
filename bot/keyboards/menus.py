@@ -154,40 +154,6 @@ def subtitle_lang_keyboard(session: DownloadSession) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def image_size_keyboard(session: DownloadSession) -> InlineKeyboardMarkup:
-    """Offer original + scaled options when multiple sizes exist."""
-    sid = session.session_id
-    sizes = session.available_image_sizes[:6]
-    rows: list[list[InlineKeyboardButton]] = []
-    if sizes:
-        for i, (w, h) in enumerate(sizes):
-            label = f"{w}×{h}"
-            if i == 0:
-                label = f"⭐ Original {label}"
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        label, callback_data=f"imgsize:{sid}:{i}"
-                    )
-                ]
-            )
-    else:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    "⭐ Best Available", callback_data=f"imgsize:{sid}:0"
-                )
-            ]
-        )
-    rows.append(
-        [
-            InlineKeyboardButton("⬅️ Back", callback_data=f"back_mode:{sid}"),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{sid}"),
-        ]
-    )
-    return InlineKeyboardMarkup(rows)
-
-
 # NOTE: there is no confirm_keyboard any more. Picking a quality / audio format
 # / image size / subtitle language starts the download straight away, so the
 # extra "Download Now" screen only cost a tap and a round-trip. The `go:`

@@ -292,7 +292,6 @@ if AUTO_QUALITY not in ("480", "720", "1080", "max"):
     AUTO_QUALITY = "1080"
 
 TELEGRAM_API_URL: str | None = (os.getenv("TELEGRAM_API_URL") or "").strip() or None
-TELEGRAM_LOCAL_MODE: bool = bool(TELEGRAM_API_URL)
 
 # YouTube PO-token provider (bgutil) — lets yt-dlp download WITHOUT cookies.
 # Leave empty to use the default local endpoint (http://127.0.0.1:4416).
@@ -330,8 +329,6 @@ BOT_DESCRIPTION: str | None = _profile_text("BOT_DESCRIPTION", _DEFAULT_DESCRIPT
 BOT_SHORT_DESCRIPTION: str | None = _profile_text(
     "BOT_SHORT_DESCRIPTION", _DEFAULT_SHORT_DESCRIPTION)
 
-TELEGRAM_VIDEO_CAPTION_LIMIT = 1024
-TELEGRAM_MESSAGE_LIMIT = 4096
 # How long a DM wizard stays usable. 10 minutes was tight: pick a link,
 # get distracted, come back to "This session expired". Sessions are a few
 # hundred bytes each and the cleanup job sweeps them, so a longer window
@@ -339,11 +336,6 @@ TELEGRAM_MESSAGE_LIMIT = 4096
 SESSION_TTL = int(os.getenv("SESSION_TTL", "1800"))
 TEMP_CLEANUP_HOURS = 1
 
-BOT_NAME = "All-Media Downloader Bot"
-BOT_BIO = (
-    "Download videos, audio, and images from any platform instantly. "
-    "Built by Gazzy Labs."
-)
 
 SUPPORTED_PLATFORMS = [
     ("YouTube", "youtube.com, youtu.be, music.youtube.com"),

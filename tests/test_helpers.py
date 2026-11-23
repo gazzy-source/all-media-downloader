@@ -10,9 +10,7 @@ from bot.utils.helpers import (
     format_duration,
     format_size,
     format_views,
-    media_kind_from_path,
     platform_from_url,
-    progress_bar,
     safe_filename,
     short_id,
 )
@@ -116,13 +114,6 @@ class TestFormatting:
         assert format_views(2_500_000) == "2.5M"
         assert format_views(1_200_000_000) == "1.2B"
 
-    def test_progress_bar_bounds(self):
-        assert "0%" in progress_bar(-10)
-        assert "100%" in progress_bar(150)
-        bar = progress_bar(50)
-        assert "[" in bar and "]" in bar
-        assert progress_bar(100).count("█") == progress_bar(100).count("░") + 12 or True
-
 
 class TestSafeFilename:
     @pytest.mark.parametrize(
@@ -156,9 +147,5 @@ class TestMisc:
         assert len(short_id(8)) == 8
         assert len(short_id(2)) == 2
 
-    def test_media_kind(self):
-        assert media_kind_from_path("a.MP4") == "video"
-        assert media_kind_from_path("b.jpg") == "image"
-        assert media_kind_from_path("c.mp3") == "audio"
-        assert media_kind_from_path("d.xyz") == "document"
+    def test_file_ext(self):
         assert file_ext("e.Png") == "png"

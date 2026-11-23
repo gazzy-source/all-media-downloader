@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly yt-dlp update
+
+[Timer]
+OnCalendar=Mon *-*-* 03:30:00
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

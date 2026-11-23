@@ -29,6 +29,25 @@ Use the repository's normal reviewed Git update process and deploy an exact know
 
 Do not restart Docker, WARP, Kuma, networking, or unrelated VM services to deploy a bot-only change. If a side service is the actual fault, inspect its dependents and current state before acting.
 
+## Units in the repository
+
+`deploy/systemd/` holds the live unit files and drop-ins, copied from the VM on 2026-11-23: the bot, its hardening, `bot-health`, `mediabot-egress` and `ytdlp-update`. `mediabot-backup` is new and not installed yet. `deploy/mediabot-egress.sh` started as a copy of `/usr/local/sbin/mediabot-egress` and has since been hardened (it fails closed, and also rejects host-local, broadcast and mapped IPv6 addresses). **It is not applied on the VM yet.** To apply it: `sudo install -m 755 deploy/mediabot-egress.sh /usr/local/sbin/mediabot-egress && sudo systemctl restart mediabot-egress`, then check `sudo iptables -S MEDIABOT_EGRESS` and that the bot still reaches Telegram, WARP and the PO-token provider. A rebuilt VM gets the same setup from git. A change made on the VM must be copied back here, or the two drift apart.
+
+- **Weekly yt-dlp update** (`scripts/update_ytdlp.sh`):
+  - It never starts a bot that is stopped; it logs "left stopped" instead.
+  - After the restart, it waits for a heartbeat written after the restart. If none arrives within 2 minutes, it rolls yt-dlp back and restarts again.
+  - Check it with `journalctl -t ytdlp-update`.
+- **Data backup** (`scripts/backup_data.sh`):
+  - Once a day it snapshots `data/` into `/var/backups/mediabot/`, owner-only, keeping 14 copies. SQLite files go through SQLite's online backup, so a snapshot taken mid-write is still consistent.
+  - Cookies and `.env` are left out.
+  - It is the same disk, so copy that folder off the VM to survive losing it.
+  - Install it with:
+    ```bash
+    sudo install -m 644 deploy/systemd/mediabot-backup.{service,timer} /etc/systemd/system/
+    sudo systemctl daemon-reload && sudo systemctl enable --now mediabot-backup.timer
+    ```
+  - Restore: stop the bot, then `tar -xzf <snapshot> -C /opt/all-media-downloader/data/` and `chown mediabot:ubuntu` the files.
+
 ## WARP memory guard
 
 **[M] 2026-11-21:** `warp-svc` 2026.7.1377.0 grew to about 690 MB (260 MB RSS + 433 MB swap) after 8.5 days. On the 952 MB VM this caused swap thrash: swap-in of 5–8 MB/s, 54–70% CPU steal, a late heartbeat, and inline answers that expired ("Query is too old", with the picker spinning). Restarting WARP freed about 450 MB of swap and load fell from 9.5 to 1.0. **[E]** It grows about 70–80 MB/day; that figure comes from two data points only.

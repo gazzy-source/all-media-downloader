@@ -1,0 +1,8 @@
+[Unit]
+Description=Daily snapshot of the All-Media bot data (packs, history, caches)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/all-media-downloader/scripts/backup_data.sh
+Nice=10
+IOSchedulingClass=idle

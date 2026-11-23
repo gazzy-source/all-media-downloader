@@ -1,0 +1,26 @@
+[Unit]
+Description=All-Media Downloader Bot (Gazzy Labs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/all-media-downloader
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/ubuntu/.deno/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/ubuntu
+ExecStart=/opt/all-media-downloader/.venv/bin/python -O run.py
+Restart=on-failure
+RestartSec=5
+# Allow ~5 concurrent downloads without OOM (1GB VPS + 1G swap)
+MemoryMax=700M
+MemoryHigh=550M
+CPUQuota=180%
+TasksMax=128
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

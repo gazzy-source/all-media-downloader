@@ -65,7 +65,9 @@ came_back() {
         systemctl is-active --quiet "$SVC" || continue
         "$PY" - "$APP/data/heartbeat.json" "$1" <<'EOF' 2>/dev/null && return 0
 import json, sys
-sys.exit(0 if json.load(open(sys.argv[1])).get("ts", 0) > float(sys.argv[2]) else 1)
+# +1: date +%s is floored, so a heartbeat from earlier in the restart second
+# must not pass.
+sys.exit(0 if json.load(open(sys.argv[1])).get("ts", 0) > float(sys.argv[2]) + 1 else 1)
 EOF
     done
     return 1

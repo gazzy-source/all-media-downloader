@@ -31,7 +31,7 @@ Do not restart Docker, WARP, Kuma, networking, or unrelated VM services to deplo
 
 ## Units in the repository
 
-`deploy/systemd/` holds the live unit files and drop-ins, copied from the VM on 2026-11-23: the bot, its hardening, `bot-health`, `mediabot-egress`, `ytdlp-update`, and `mediabot-backup`. `deploy/mediabot-egress.sh` is `/usr/local/sbin/mediabot-egress`. A rebuilt VM gets the same setup from git. A change made on the VM must be copied back here, or the two drift apart.
+`deploy/systemd/` holds the live unit files and drop-ins, copied from the VM on 2026-11-23: the bot, its hardening, `bot-health`, `mediabot-egress` and `ytdlp-update`. `mediabot-backup` is new and not installed yet. `deploy/mediabot-egress.sh` started as a copy of `/usr/local/sbin/mediabot-egress` and has since been hardened (it fails closed, and also rejects host-local, broadcast and mapped IPv6 addresses). **It is not applied on the VM yet.** To apply it: `sudo install -m 755 deploy/mediabot-egress.sh /usr/local/sbin/mediabot-egress && sudo systemctl restart mediabot-egress`, then check `sudo iptables -S MEDIABOT_EGRESS` and that the bot still reaches Telegram, WARP and the PO-token provider. A rebuilt VM gets the same setup from git. A change made on the VM must be copied back here, or the two drift apart.
 
 - **Weekly yt-dlp update** (`scripts/update_ytdlp.sh`):
   - It never starts a bot that is stopped; it logs "left stopped" instead.

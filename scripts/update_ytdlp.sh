@@ -5,7 +5,9 @@
 # a months-old yt-dlp is the most common reason a platform "stops working".
 # This updates yt-dlp only (NOT the bgutil plugin, whose version must match
 # the pinned provider image), runs the test suite, and restarts the bot. If
-# the tests fail, the previous version is put back and the bot is untouched.
+# the tests fail, the previous version is put back and the bot is untouched;
+# if the bot does not come back after the restart, the same. A bot that was
+# stopped on purpose is never started by this.
 #
 # Installed by the server setup as a systemd timer; safe to run by hand:
 #   sudo /opt/all-media-downloader/scripts/update_ytdlp.sh
@@ -54,10 +56,38 @@ EOF
     logger -t ytdlp-update "bot still busy after 30 min - restarting anyway"
 }
 
+# Up and writing a NEW heartbeat (every 30 s) within 2 minutes of $1?
+came_back() {
+    for _ in $(seq 1 24); do
+        sleep 5
+        systemctl is-active --quiet "$SVC" || continue
+        "$PY" - "$APP/data/heartbeat.json" "$1" <<'EOF' 2>/dev/null && return 0
+import json, sys
+sys.exit(0 if json.load(open(sys.argv[1])).get("ts", 0) > float(sys.argv[2]) else 1)
+EOF
+    done
+    return 1
+}
+
 if as_owner bash -c "cd '$APP' && $check >/tmp/ytdlp-update-tests.log 2>&1"; then
+    # A bot the operator stopped stays stopped: a plain restart would start
+    # it, possibly next to another bot on this box (seen 2026-11-23).
+    if ! systemctl is-active --quiet "$SVC"; then
+        logger -t ytdlp-update "yt-dlp updated $before -> $after; tests passed; $SVC is stopped, left stopped"
+        exit 0
+    fi
     wait_idle
+    restarted_at=$(date +%s)
     systemctl restart "$SVC"
-    logger -t ytdlp-update "yt-dlp updated $before -> $after; tests passed; $SVC restarted"
+    if came_back "$restarted_at"; then
+        logger -t ytdlp-update "yt-dlp updated $before -> $after; tests passed; $SVC restarted"
+    else
+        as_owner "$PY" -m pip install --quiet "yt-dlp==$before"
+        systemctl restart "$SVC"
+        logger -p user.err -t ytdlp-update \
+            "$SVC did not come back on yt-dlp $after; rolled back to $before and restarted"
+        exit 1
+    fi
 else
     as_owner "$PY" -m pip install --quiet "yt-dlp==$before"
     logger -p user.err -t ytdlp-update \

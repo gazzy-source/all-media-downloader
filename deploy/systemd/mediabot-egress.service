@@ -1,0 +1,12 @@
+[Unit]
+Description=Egress firewall for the All-Media bot user
+After=network-pre.target netfilter-persistent.service docker.service tailscaled.service
+Before=all-media-downloader.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/mediabot-egress
+
+[Install]
+WantedBy=multi-user.target

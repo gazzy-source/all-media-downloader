@@ -1,0 +1,15 @@
+[Unit]
+Description=All-Media Downloader health endpoint for Uptime Kuma
+After=network.target all-media-downloader.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/all-media-downloader/scripts/bot_health_server.py
+Restart=always
+RestartSec=3
+User=ubuntu
+MemoryMax=32M
+CPUQuota=10%
+
+[Install]
+WantedBy=multi-user.target

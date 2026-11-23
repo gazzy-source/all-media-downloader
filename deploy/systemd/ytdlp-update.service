@@ -1,0 +1,7 @@
+[Unit]
+Description=Update yt-dlp, test, restart the bot (rolls back on failure)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/all-media-downloader/scripts/update_ytdlp.sh

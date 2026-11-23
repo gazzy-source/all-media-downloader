@@ -215,6 +215,12 @@ class BotApplication(Application):
         if stopped:
             logger.info("Shutdown: stopping %s running/queued download(s)", stopped)
         url_tokens.flush()
+        from bot.services import quota
+
+        try:
+            quota.flush()  # counts still queued for the disk
+        except Exception:  # noqa: BLE001 — shutdown must go on
+            logger.exception("quota flush at shutdown failed")
         await super().stop()
 
 

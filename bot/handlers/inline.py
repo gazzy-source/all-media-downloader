@@ -225,15 +225,6 @@ CANCEL_CALLBACK = "inl:x"
 _STATUS: dict[str, str] = {}
 
 
-def _status_markup(label: str) -> InlineKeyboardMarkup:
-    # An inline keyboard is REQUIRED: without one Telegram omits the
-    # inline_message_id, and the message could never be edited into the media.
-    # The button IS the live status ("⬇ 45%"); it must not lead anywhere while
-    # the download runs — an "Open bot" link here started a second, parallel
-    # download of the same link in the DM.
-    return InlineKeyboardMarkup([[InlineKeyboardButton(label[:60], callback_data=WAIT_CALLBACK)]])
-
-
 def _preparing_markup() -> InlineKeyboardMarkup:
     """Working… (tap: the live status) | ✖ Cancel (stops the download)."""
     return InlineKeyboardMarkup([[
@@ -691,7 +682,7 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
              cache_hit="yes", delivery="cached_swap", avoided_download="yes")
         logger.info("inline cache hit — swapping cached %s", mode)
         if await _swap_in(context, imid, hit["kind"], hit["file_id"], hit.get("title", "")):
-            quota.consume_soon(user_id)
+            quota.count(user_id)
             record_download(user_id, url, hit.get("title") or "", platform_from_url(url), mode,
                             INLINE_QUALITY, True)
             emit_terminal(telemetry_id, "success", delivery="cached")
@@ -834,7 +825,7 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
             )
         if STORAGE_CHAT_ID is None:
             await _quiet_delete(context, chat, sent.message_id)
-        quota.consume_soon(user_id)
+        quota.count(user_id)
         record_download(user_id, url, title, platform, mode, INLINE_QUALITY, True, file_size=size)
         emit_terminal(telemetry_id, "success", total_ms=int((time.monotonic() - started) * 1000))
         logger.info("inline %s delivered in %.1fs (%s) [%s]: %s", mode,

@@ -36,13 +36,13 @@ def q(tmp_path, monkeypatch):
 
 
 def drain() -> None:
-    """Wait for counts queued with consume_soon."""
-    quota._WRITER.submit(lambda: None).result(timeout=10)
+    """Wait for counts queued for the disk."""
+    quota.flush()
 
 
 def use_up(account: int, n: int = 100) -> None:
     for _ in range(n):
-        quota.consume(account)
+        quota.count(account)
 
 
 # ------------------------------------------------------------- the ledger
@@ -51,7 +51,7 @@ class TestLedger:
         assert quota.status(USER)["remaining"] == 100
         use_up(USER, 99)
         assert quota.can_download(USER)
-        quota.consume(USER)
+        quota.count(USER)
         st = quota.status(USER)
         assert st["used"] == 100 and st["remaining"] == 0
         assert not quota.can_download(USER)
@@ -86,6 +86,23 @@ class TestLedger:
         use_up(USER, 120)
         assert quota.status(USER)["used"] == 120 and quota.can_download(USER)
 
+    def test_everything_survives_a_restart(self, tmp_path):
+        use_up(USER, 30)
+        quota.add_pack(USER, USER, charge_id="c1", stars=100, downloads=100)
+        quota.add_pack(9, 9, charge_id="c9", stars=100, downloads=100)
+        quota.mark_refunded("c9")
+        quota.set_approved(7, True, by=OWNER)
+        quota._reset_for_tests(tmp_path / "quota.sqlite3")  # a new process
+        assert quota.status(USER)["remaining"] == 170
+        assert not quota.is_paid(9) and quota.is_exempt(7)
+        assert quota.last_charge(USER)["charge_id"] == "c1"
+
+    def test_count_is_visible_at_once(self):
+        # Read from memory: the next check must not wait for the disk write.
+        use_up(USER, 99)
+        quota.count(USER)
+        assert not quota.can_download(USER)
+
     def test_storage_error_does_not_lock_everyone_out(self, monkeypatch):
         import sqlite3
 
@@ -94,7 +111,7 @@ class TestLedger:
 
         monkeypatch.setattr(quota, "_connect", broken)
         assert quota.can_download(USER)
-        quota.consume(USER)  # never raises: the file was already delivered
+        quota.count(USER)  # never raises: the file was already delivered
 
 
 # ------------------------------------------------------- who is counted

@@ -389,7 +389,7 @@ async def auto_download_flow(
                     and _is_link_only_post(msg)):
                 await _try_delete(context, chat.id, msg.message_id)
             record_download(actor, url, hit.get("title") or "", platform, mode, quality, True)
-            quota.consume_soon(actor)
+            quota.count(actor)
             emit_terminal(telemetry_id, "success", delivery="cached")
             return True
     emit(telemetry_id, "cache", outcome="miss", cache_hit="no", delivery="fresh_download")
@@ -584,7 +584,7 @@ async def auto_download_flow(
             actor, url, result.title or "", platform, mode, quality, True,
             file_size=size,
         )
-        quota.consume_soon(actor)
+        quota.count(actor)
         delivered = True
         emit_terminal(telemetry_id, "success", total_ms=int(view.elapsed() * 1000))
         try:
@@ -1459,7 +1459,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         if sent is not None:
             record_download(session.user_id, session.url, session.title, session.platform,
                             mode, quality, True)
-            quota.consume_soon(session.user_id)
+            quota.count(session.user_id)
             emit_terminal(session.telemetry_id, "success", delivery="cached")
             sessions.remove(session.session_id)
             try:
@@ -1663,7 +1663,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
                 except Exception:
                     logger.exception("subtitle send failed")
 
-            quota.consume_soon(session.user_id)
+            quota.count(session.user_id)
             record_download(
                 session.user_id,
                 session.url,

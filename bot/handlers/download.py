@@ -33,7 +33,7 @@ from bot.keyboards.menus import (
     quality_keyboard,
     subtitle_lang_keyboard,
 )
-from bot.services import activity, inline_cache, jobs, user_prefs
+from bot.services import activity, inline_cache, jobs, quota, user_prefs
 from bot.services.dl_queue import download_queue
 from bot.services.upload_gate import UploadCancelled, upload_gate
 from bot.utils import redact
@@ -92,7 +92,17 @@ def _is_auto_chat(update: Update) -> bool:
 
 
 def _actor_id(update: Update) -> int | None:
-    """User id, or channel id when the post has no from-user."""
+    """
+    Who a download belongs to (and is counted against): the sender, or the
+    chat a message was sent as. Anonymous group admins, "send as channel"
+    posts and a linked channel's auto-forwards all carry a shared stand-in
+    user (GroupAnonymousBot, Channel_Bot, 777000) — keyed on that, every such
+    post everywhere would share one allowance.
+    """
+    msg = update.effective_message
+    sender_chat = getattr(msg, "sender_chat", None) if msg is not None else None
+    if sender_chat is not None and getattr(sender_chat, "id", None) is not None:
+        return sender_chat.id
     user = update.effective_user
     if user:
         return user.id
@@ -100,6 +110,47 @@ def _actor_id(update: Update) -> int | None:
     if chat and chat.type == "channel":
         return chat.id
     return None
+
+
+# Out-of-downloads notices outside private chats: once per account and chat
+# per window, so a busy group or channel isn't flooded with the same line.
+_QUOTA_NOTICE_EVERY = {"channel": 6 * 3600.0}
+_QUOTA_NOTICE_DEFAULT = 600.0
+_last_quota_notice: dict[tuple[int, int], float] = {}
+
+
+async def _refuse_over_quota(context, chat, msg, account: int, *, reply_markup=None) -> bool:
+    """
+    True (and says so) when `account` has no downloads left. Checked before
+    the hourly limit, so a refusal doesn't use up an hourly slot.
+    """
+    if quota.can_download(account):
+        return False
+    from bot.handlers.premium import refusal
+
+    private = chat.type == "private"
+    me = getattr(context.bot, "username", "") or ""
+    # A negative id is a chat (a channel, or a group's anonymous admins),
+    # never a person: its admins buy for it with /buy <id>.
+    text, markup = refusal(account, user_id=account if private else None, private=private,
+                           bot_username=me, channel=account < 0)
+    if not private:
+        now = time.monotonic()
+        key = (chat.id, account)
+        every = _QUOTA_NOTICE_EVERY.get(chat.type, _QUOTA_NOTICE_DEFAULT)
+        if now - _last_quota_notice.get(key, -every) < every:
+            return True
+        _last_quota_notice[key] = now
+        if len(_last_quota_notice) > 5000:
+            _last_quota_notice.pop(next(iter(_last_quota_notice)))
+    logger.info("download refused: %s is out of downloads", redact.uid(account))
+    try:
+        await msg.reply_text(text, parse_mode=ParseMode.HTML,
+                             reply_markup=markup if markup is not None else reply_markup,
+                             disable_web_page_preview=True)
+    except TelegramError:
+        pass
+    return True
 
 
 def _should_auto_download(update: Update) -> bool:
@@ -250,6 +301,8 @@ async def auto_download_flow(
     platform = platform_from_url(url)
     telemetry_id = new_job_id() if "youtube" in platform.lower() else ""
 
+    if await _refuse_over_quota(context, chat, msg, actor):
+        return False
     allowed, retry = rate_limiter.allow(actor)
     if not allowed and actor not in ADMIN_IDS:
         try:
@@ -322,6 +375,7 @@ async def auto_download_flow(
                     and _is_link_only_post(msg)):
                 await _try_delete(context, chat.id, msg.message_id)
             record_download(actor, url, hit.get("title") or "", platform, mode, quality, True)
+            quota.consume_soon(actor)
             emit_terminal(telemetry_id, "success", delivery="cached")
             return True
     emit(telemetry_id, "cache", outcome="miss", cache_hit="no", delivery="fresh_download")
@@ -361,7 +415,7 @@ async def auto_download_flow(
             job, download_queue,
             _queued_download,
             on_position=lambda n: on_progress(0, f"Queued — you're #{n} in line"),
-            priority=user_prefs.is_premium(actor),
+            priority=quota.is_paid(actor),
         )
     except asyncio.CancelledError:
         jobs.drop(job)
@@ -516,6 +570,7 @@ async def auto_download_flow(
             actor, url, result.title or "", platform, mode, quality, True,
             file_size=size,
         )
+        quota.consume_soon(actor)
         delivered = True
         emit_terminal(telemetry_id, "success", total_ms=int(view.elapsed() * 1000))
         try:
@@ -562,6 +617,9 @@ async def start_url_flow(
         await auto_download_flow(update, context, url)
         return
 
+    if await _refuse_over_quota(context, chat, msg, user.id,
+                                reply_markup=main_reply_keyboard()):
+        return
     allowed, retry = rate_limiter.allow(user.id)
     if not allowed and user.id not in ADMIN_IDS:
         await msg.reply_text(
@@ -933,7 +991,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except TelegramError:
             pass
         return
-    if query.data.startswith(("pref:", "prem:")):
+    if query.data.startswith(("pref:", "prem:", "pay:")):
         # Answered first, or Telegram keeps a spinner on the tapped button.
         try:
             await query.answer()
@@ -1290,6 +1348,19 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         logger.info("Ignoring duplicate start for session %s", session.session_id)
         return
     session.started = True
+    # Again here, not only when the link was sent: menus opened while
+    # downloads were left would otherwise all still work afterwards.
+    if not quota.can_download(session.user_id):
+        from bot.handlers.premium import refusal
+
+        session.started = False  # after buying, the same menu works
+        text, markup = refusal(session.user_id, user_id=session.user_id, private=True,
+                               bot_username=getattr(context.bot, "username", "") or "")
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except TelegramError:
+            pass
+        return
 
     mode = session.mode or "video"
     quality = session.quality or "720"
@@ -1374,6 +1445,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         if sent is not None:
             record_download(session.user_id, session.url, session.title, session.platform,
                             mode, quality, True)
+            quota.consume_soon(session.user_id)
             emit_terminal(session.telemetry_id, "success", delivery="cached")
             sessions.remove(session.session_id)
             try:
@@ -1410,7 +1482,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
             job, download_queue,
             _queued_download,
             on_position=lambda n: on_progress(0, f"Queued — you're #{n} in line"),
-            priority=user_prefs.is_premium(session.user_id),
+            priority=quota.is_paid(session.user_id),
         )
     except asyncio.CancelledError:
         if not job.cancelled:
@@ -1577,6 +1649,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
                 except Exception:
                     logger.exception("subtitle send failed")
 
+            quota.consume_soon(session.user_id)
             record_download(
                 session.user_id,
                 session.url,

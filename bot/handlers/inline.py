@@ -57,7 +57,7 @@ from bot.config import (
     STORAGE_CHAT_ID,
 )
 from bot.handlers import download as download_handlers
-from bot.services import activity, inline_cache, jobs, user_prefs, yt_search
+from bot.services import activity, inline_cache, jobs, quota, yt_search
 from bot.services.dl_queue import download_queue
 from bot.services.upload_gate import UploadCancelled
 from bot.services.downloader import PRIVATE_URL_ERROR, download_manager
@@ -306,6 +306,10 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _answer(q, [], button=InlineQueryResultsButton(
             text="⏳ Too many searches — try again later", start_parameter="inline"))
         return
+    buy = _out_of_downloads(uid)
+    if buy is not None:  # no tiles, and no prefetch for a download that can't start
+        await _answer(q, [], button=buy, cache_time=0)
+        return
     url = urls[0]
     if not await _is_public(url):
         await _answer(q, [], button=InlineQueryResultsButton(
@@ -418,6 +422,14 @@ def _split_mode(text: str) -> tuple[str, str]:
     return "audio", text
 
 
+def _out_of_downloads(uid: int) -> InlineQueryResultsButton | None:
+    """The 'get more' button instead of results, for an account with none left."""
+    if quota.can_download(uid):
+        return None
+    return InlineQueryResultsButton(text="⭐ Free downloads used — tap to get more",
+                                    start_parameter="buy")
+
+
 async def _search(q, text: str) -> None:
     mode, terms = _split_mode(text)
     if len(terms) < 3:
@@ -430,6 +442,10 @@ async def _search(q, text: str) -> None:
     # Every query (cached or not) becomes the user's latest, so an older one
     # still waiting out the debounce stands down.
     _mark_latest(uid, q.id)
+    buy = _out_of_downloads(uid)
+    if buy is not None:
+        await _answer(q, [], button=buy, cache_time=0)
+        return
     hits = yt_search.cached(terms)
     if hits is None:
         await asyncio.sleep(_DEBOUNCE)
@@ -651,6 +667,11 @@ async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFA
 
 async def _deliver(context, job, mode, url, user_id, imid, title, started,
                    status, finish, state, telemetry_id: str = "") -> None:
+    if not quota.can_download(user_id):
+        emit_terminal(telemetry_id, "failure", **{"class": "other"})
+        await finish(f"🚫 You've used your {quota.status(user_id)['allowance']:,} downloads. "
+                     "Tap <b>Open bot</b> → /premium to get more ⭐")
+        return
     allowed, retry = rate_limiter.allow(user_id)
     if not allowed and user_id not in ADMIN_IDS:
         emit_terminal(telemetry_id, "failure", **{"class": "other"})
@@ -670,6 +691,9 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
              cache_hit="yes", delivery="cached_swap", avoided_download="yes")
         logger.info("inline cache hit — swapping cached %s", mode)
         if await _swap_in(context, imid, hit["kind"], hit["file_id"], hit.get("title", "")):
+            quota.consume_soon(user_id)
+            record_download(user_id, url, hit.get("title") or "", platform_from_url(url), mode,
+                            INLINE_QUALITY, True)
             emit_terminal(telemetry_id, "success", delivery="cached")
             return
         inline_cache.forget(url, _key(mode, url))  # Telegram refused it: fetch afresh below
@@ -714,7 +738,7 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
                 job, download_queue,
                 _queued_download,
                 on_position=lambda n: on_progress(0, f"Queued — you're #{n} in line"),
-                priority=user_prefs.is_premium(user_id),
+                priority=quota.is_paid(user_id),
             )
         except asyncio.CancelledError:
             if job.cancelled:
@@ -810,6 +834,7 @@ async def _deliver(context, job, mode, url, user_id, imid, title, started,
             )
         if STORAGE_CHAT_ID is None:
             await _quiet_delete(context, chat, sent.message_id)
+        quota.consume_soon(user_id)
         record_download(user_id, url, title, platform, mode, INLINE_QUALITY, True, file_size=size)
         emit_terminal(telemetry_id, "success", total_ms=int((time.monotonic() - started) * 1000))
         logger.info("inline %s delivered in %.1fs (%s) [%s]: %s", mode,

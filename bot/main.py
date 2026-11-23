@@ -407,7 +407,7 @@ async def post_init(app: Application) -> None:
         [
             BotCommand("start", "Start & how to use"),
             BotCommand("settings", "Save default quality/format — skip the menu"),
-            BotCommand("premium", "More downloads + priority queue"),
+            BotCommand("premium", "Downloads left & get more ⭐"),
             BotCommand("history", "Your recent downloads"),
             BotCommand("help", "All features & limits"),
             BotCommand("platforms", "Supported sites"),
@@ -438,11 +438,11 @@ async def post_init(app: Application) -> None:
 
 
 def build_app() -> Application:
-    # Premium users get a higher hourly limit; the limiter asks per user.
-    from bot.services import user_prefs
+    # Accounts that bought a pack get a higher hourly limit; asked per user.
+    from bot.services import quota
     from bot.services.rate_limit import rate_limiter
 
-    rate_limiter.limit_for = user_prefs.hourly_limit
+    rate_limiter.limit_for = quota.hourly_limit
 
     if not BOT_TOKEN:
         logger.error(
@@ -495,8 +495,11 @@ def build_app() -> Application:
     command("stats", cmd_stats)
     command("settings", cmd_settings)
     command("cancel", cmd_cancel)
-    # Premium (Telegram Stars)
+    # Download packs (Telegram Stars) and the owner's free-access list
     command("premium", premium.cmd_premium)
+    command("buy", premium.cmd_premium)
+    command("approvefree", premium.cmd_approvefree)
+    command("revokefree", premium.cmd_revokefree)
     command("paysupport", premium.cmd_paysupport)
     command("refund", premium.cmd_refund)
     app.add_handler(PreCheckoutQueryHandler(premium.handle_precheckout))

@@ -55,15 +55,33 @@ def parse_proxy_hosts(raw: str | None) -> tuple[str, ...]:
 PROXY_HOSTS: tuple[str, ...] = parse_proxy_hosts(os.getenv("PROXY_HOSTS"))
 RATE_LIMIT_PER_HOUR: int = int(os.getenv("RATE_LIMIT_PER_HOUR", "30"))
 
-# Premium (paid with Telegram Stars — no payment provider needed). Price in
-# Stars for PREMIUM_DAYS days; premium users get PREMIUM_RATE_MULT x the
-# hourly download limit and go ahead of free users in the download queue.
-PREMIUM_ENABLED: bool = os.getenv("PREMIUM_ENABLED", "1").strip().lower() in (
+# Download allowance (paid with Telegram Stars, no payment provider needed).
+# Every account (a user, or a channel for its posts) gets FREE_DOWNLOADS
+# lifetime downloads; then it buys packs. DOWNLOAD_PACKS is
+# "downloads:stars,..." Admins and accounts the owner approves with
+# /approvefree are never counted. PAYWALL_ENABLED=0 counts but never blocks.
+PAYWALL_ENABLED: bool = os.getenv("PAYWALL_ENABLED", "1").strip().lower() in (
     "1", "true", "yes", "on",
 )
-PREMIUM_STARS: int = max(1, int(os.getenv("PREMIUM_STARS", "100")))
-PREMIUM_DAYS: int = max(1, int(os.getenv("PREMIUM_DAYS", "30")))
-PREMIUM_RATE_MULT: int = max(1, int(os.getenv("PREMIUM_RATE_MULT", "5")))
+FREE_DOWNLOADS: int = max(0, int(os.getenv("FREE_DOWNLOADS", "100")))
+
+
+def parse_packs(raw: str | None) -> tuple[tuple[int, int], ...]:
+    """'100:100,10000:10000' -> ((100, 100), (10000, 10000)); bad parts skipped."""
+    out: list[tuple[int, int]] = []
+    for part in (raw or "").split(","):
+        n, _, stars = part.strip().partition(":")
+        if n.strip().isdigit() and stars.strip().isdigit() and int(n) > 0 and int(stars) > 0:
+            if all(p[0] != int(n) for p in out):
+                out.append((int(n), int(stars)))
+    return tuple(sorted(out))
+
+
+DOWNLOAD_PACKS: tuple[tuple[int, int], ...] = parse_packs(
+    os.getenv("DOWNLOAD_PACKS", "100:100,10000:10000")) or ((100, 100),)
+# Accounts that have bought a pack get this many times the hourly limit and
+# go ahead of free users in the download queue.
+PAID_RATE_MULT: int = max(1, int(os.getenv("PAID_RATE_MULT", "5")))
 
 AUTO_DOWNLOAD_GROUPS: bool = os.getenv("AUTO_DOWNLOAD_GROUPS", "1").strip() not in (
     "0",

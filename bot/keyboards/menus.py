@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 
-from bot.config import PREMIUM_ENABLED
 from bot.services.downloader import quality_buttons_meta
 from bot.services.session import DownloadSession
 
@@ -14,7 +13,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton("📥 New Download"), KeyboardButton("🕘 History")],
             [KeyboardButton("🌐 Platforms"), KeyboardButton("❓ Help")],
-            [KeyboardButton("⭐ Premium" if PREMIUM_ENABLED else "📊 Stats"),
+            [KeyboardButton("⭐ Premium"),
              KeyboardButton("⚙️ Settings")],
         ],
         resize_keyboard=True,
@@ -217,7 +216,7 @@ def after_download_keyboard(url: str, user_id: int = 0, *, private: bool = True)
     )
 
 
-def settings_keyboard(prefs: dict, *, premium_enabled: bool = True) -> InlineKeyboardMarkup:
+def settings_keyboard(prefs: dict) -> InlineKeyboardMarkup:
     """
     Tap-to-set defaults. With a type plus its quality/format chosen, a pasted
     link downloads straight away — no wizard. "Ask" brings the wizard back.
@@ -238,6 +237,5 @@ def settings_keyboard(prefs: dict, *, premium_enabled: bool = True) -> InlineKey
                         ("max", "Max"), ("ask", "Ask")]),
         row("audio", [("mp3", "MP3"), ("m4a", "M4A"), ("opus", "Opus"), ("ask", "Ask")]),
     ]
-    if premium_enabled:
-        rows.append([InlineKeyboardButton("💎 Premium", callback_data="prem:open")])
+    rows.append([InlineKeyboardButton("⭐ Get more downloads", callback_data="prem:open")])
     return InlineKeyboardMarkup(rows)

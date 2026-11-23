@@ -130,23 +130,6 @@ def test_history_migrates_once_under_concurrent_first_use(tmp_path, monkeypatch)
     assert len(hist.get_user_history(1, limit=50)) == 1  # imported exactly once
 
 
-async def test_unsaved_premium_is_never_announced_as_active(fx, monkeypatch, tmp_path):
-    import bot.handlers.premium as prem
-    from bot.services import user_prefs
-
-    user_prefs._reset_for_tests(tmp_path / "p.json")
-    monkeypatch.setattr(user_prefs, "_save", lambda data: False)  # disk full
-    monkeypatch.setattr(prem, "ADMIN_IDS", {999})
-    payload = prem._payload(fx.user.id)
-    msg = fx.msg("")
-    msg.successful_payment = SimpleNamespace(
-        invoice_payload=payload, currency="XTR", telegram_payment_charge_id="CH1",
-        total_amount=prem.PREMIUM_STARS)
-    await prem.handle_successful_payment(fx.update(msg), fx.ctx)
-    assert "couldn't activate" in msg.replies[0][0]
-    assert not user_prefs.is_premium(fx.user.id)
-    assert any("CH1" in a[1][1] for a in fx.ctx.bot.sent)  # the owner has the charge id
-
 
 async def test_shutdown_stops_jobs_but_keeps_them_for_the_restart_notice(monkeypatch):
     from bot.services import jobs

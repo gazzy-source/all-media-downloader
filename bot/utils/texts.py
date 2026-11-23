@@ -10,8 +10,7 @@ import math
 
 from bot.config import (
     MAX_FILE_SIZE_BYTES,
-    PREMIUM_ENABLED,
-    PREMIUM_RATE_MULT,
+    PAID_RATE_MULT,
     QUALITY_MAP,
     RATE_LIMIT_PER_HOUR,
 )
@@ -24,13 +23,13 @@ def rate_limit_text(retry_s: float, user_id: int | None = None, *, html: bool = 
     """Hourly download limit hit: when the next one is allowed, and how to get more."""
     mins = max(1, math.ceil((retry_s or 0) / 60))
     text = f"⏳ Hourly limit reached — next download in {mins} min."
-    if PREMIUM_ENABLED and user_id is not None:
-        from bot.services import user_prefs
+    if user_id is not None and PAID_RATE_MULT > 1:
+        from bot.services import quota
 
-        if not user_prefs.is_premium(user_id):
-            more = RATE_LIMIT_PER_HOUR * PREMIUM_RATE_MULT
-            text += (f"\n⭐ <b>/premium</b> gives {more} downloads an hour." if html
-                     else f" /premium gives {more} downloads an hour.")
+        if not quota.is_paid(user_id):
+            more = RATE_LIMIT_PER_HOUR * PAID_RATE_MULT
+            text += (f"\n⭐ Buying a /premium pack raises it to {more} an hour." if html
+                     else f" Buying a /premium pack raises it to {more} an hour.")
     return text
 
 

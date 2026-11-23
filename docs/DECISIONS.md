@@ -106,6 +106,22 @@ These decisions describe the production-stable v1 baseline (`v1.0.0`, `830f351`)
 **Why this choice:** It was disabled on this VM for the measured experiment; this is not a general project default or a claim that firmware maintenance is unnecessary.  
 **Revisit when:** **[R]** VM image/provider maintenance policy changes or the host is replaced; review firmware/security update responsibility explicitly.
 
+## Download allowance in its own SQLite ledger
+
+**Problem:** Charge for downloads past a free allowance: 100 per account, then Stars packs (100⭐ = 100, 10000⭐ = 10000). Count every delivery in DMs, inline, groups and channels. The owner can make an account lifetime free (`/approvefree`).
+**Evidence:** **[C]** History keeps 50 rows per user and 5000 users, and `user_prefs.json` evicts users, so neither can hold a lifetime count or paid records. **[M]** No `user_prefs.json` existed on production on 2026-11-23: the 30-day Premium it replaces was never bought.
+**Alternatives considered:**
+- A per-job reservation, which is exact at the limit but needs a release on every exit path.
+- Counting inside `record_download`, which is fire-and-forget and swallows errors, and which the inline cached swap never called.
+
+**Why this choice:**
+- `data/quota.sqlite3` stores a monotonic `used` count and a charges table keyed by Telegram charge id. The balance is derived (free + non-refunded packs − used), so duplicate payment updates and refunds cannot corrupt it.
+- Downloads are checked before they start (and again when a DM menu is used) and counted once per confirmed delivery, on one writer thread.
+- An account at its last download that starts several jobs at once can go over by at most its concurrent jobs.
+- A channel post, or a message sent as a chat, is counted against that chat (`sender_chat`), never against Telegram's shared stand-in users.
+
+**Revisit when:** **[R]** overshoot at the limit matters in practice, or a pack size exceeds what Telegram accepts per invoice.
+
 ## Known limitations and future triggers
 
 - Job execution is not durable or resumable; restart recovery only has best-effort interruption markers. Add durable work state only if recovery is a requirement.

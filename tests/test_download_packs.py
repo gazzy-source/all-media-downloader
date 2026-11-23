@@ -102,10 +102,21 @@ class TestAccount:
     def test_sender_chat_is_the_account(self, fx):
         # Anonymous admins / "send as channel": the stand-in user is shared by
         # everyone, so the chat they posted as is the account.
-        msg = fx.msg("x")
-        msg.sender_chat = SimpleNamespace(id=-100555)
-        assert hd._actor_id(fx.update(msg)) == -100555
+        fx.chat.type, fx.chat.id = "supergroup", -100200
+        anon = fx.msg("x")
+        anon.sender_chat = SimpleNamespace(id=-100200)  # anonymous admin
+        assert hd._actor_id(fx.update(anon)) == -100200
+        fwd = fx.msg("x")
+        fwd.sender_chat, fwd.is_automatic_forward = SimpleNamespace(id=-100555), True
+        assert hd._actor_id(fx.update(fwd)) == -100555, "the linked channel's post"
         assert hd._actor_id(fx.update(fx.msg("x"))) == fx.user.id
+
+    def test_posting_as_your_own_channel_is_not_a_fresh_allowance(self, fx):
+        fx.chat.type, fx.chat.id = "supergroup", -100200
+        for throwaway in (-1001, -1002, -1003):
+            m = fx.msg("x")
+            m.sender_chat = SimpleNamespace(id=throwaway)
+            assert hd._actor_id(fx.update(m)) == -100200, "counted against the group"
 
 
 def _res(tmp_path, **kw):

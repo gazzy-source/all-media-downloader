@@ -98,11 +98,22 @@ def _actor_id(update: Update) -> int | None:
     posts and a linked channel's auto-forwards all carry a shared stand-in
     user (GroupAnonymousBot, Channel_Bot, 777000) — keyed on that, every such
     post everywhere would share one allowance.
+
+    In a group, only the group itself (anonymous admins) or its linked
+    channel (automatic forwards) is trusted as the sender. A member posting
+    "as" one of their own channels is counted against the group: otherwise
+    every throwaway channel would be a fresh free allowance.
     """
     msg = update.effective_message
+    chat = update.effective_chat
     sender_chat = getattr(msg, "sender_chat", None) if msg is not None else None
-    if sender_chat is not None and getattr(sender_chat, "id", None) is not None:
-        return sender_chat.id
+    sc_id = getattr(sender_chat, "id", None) if sender_chat is not None else None
+    if sc_id is not None:
+        if chat is None or chat.type in ("channel", "private") or sc_id == chat.id:
+            return sc_id
+        if getattr(msg, "is_automatic_forward", False):
+            return sc_id  # the linked channel's own post, mirrored here
+        return chat.id
     user = update.effective_user
     if user:
         return user.id

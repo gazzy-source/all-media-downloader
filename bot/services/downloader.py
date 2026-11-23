@@ -241,12 +241,32 @@ def _finish_cover(state: dict, work_dir: Path) -> Path | None:
     if fut is not None:
         try:
             cover = fut.result(timeout=25)
+        except TimeoutError:
+            # Still queued or running: making it again here would race it on
+            # the same tg_cover.jpg. A song without a cover beats a torn one.
+            if not fut.cancel():
+                return None
+            cover = None
         except Exception:
             cover = None
         # A failed attempt clears work_dir before the retry: re-check the file.
         if cover is not None and cover.is_file():
             return cover
     return _telegram_cover(work_dir)
+
+
+def _drop_partials(opts: dict[str, Any]) -> None:
+    """Delete yt-dlp's partial downloads in this job's own work dir."""
+    outtmpl = opts.get("outtmpl")
+    work_dir = Path(outtmpl).parent if isinstance(outtmpl, str) else None
+    if work_dir is None or not work_dir.is_dir() or work_dir == TEMP_DIR:
+        return
+    for f in work_dir.iterdir():
+        if f.name.endswith((".part", ".ytdl")) or ".part-Frag" in f.name:
+            try:
+                f.unlink()
+            except OSError:
+                pass
 
 
 def _overall_pct(part: str, file_pct: float) -> float:
@@ -414,6 +434,10 @@ def _esc(text: str) -> str:
 # Resolve once per process (avoid logging / path scans every download)
 _COOKIE_SOURCE: Path | None = None  # sanitized/source jar (immutable)
 _COOKIE_RESOLVED = False
+# Startup runs the warm-up, the PO-token mint check and a user's job at once.
+# The flags used to be set BEFORE the value, so one of them ran with no
+# cookies or PO token (and a 4-rung ladder whose pin index meant another rung).
+_RESOLVE_LOCK = threading.RLock()
 _FFMPEG_DIR: str | None = None
 _FFMPEG_RESOLVED = False
 _IMPERSONATE = None
@@ -455,7 +479,15 @@ def _resolved_cookie_source() -> Path | None:
     global _COOKIE_SOURCE, _COOKIE_RESOLVED
     if _COOKIE_RESOLVED:
         return _COOKIE_SOURCE
-    _COOKIE_RESOLVED = True
+    with _RESOLVE_LOCK:  # concurrent first calls: compute once, publish whole
+        if not _COOKIE_RESOLVED:
+            _COOKIE_SOURCE = _load_cookie_source()
+            _COOKIE_RESOLVED = True
+    return _COOKIE_SOURCE
+
+
+def _load_cookie_source():
+    """The first-call work of _resolved_cookie_source (under _RESOLVE_LOCK)."""
     from bot.utils.cookies import prepare_cookies
 
     candidates: list[Path] = []
@@ -475,10 +507,9 @@ def _resolved_cookie_source() -> Path | None:
                     break
             except OSError:
                 continue
-    _COOKIE_SOURCE = source
     if source is not None:
         logger.info("Cookies source ready: %s", source)
-    return _COOKIE_SOURCE
+    return source
 
 
 def _cookie_jar_for_job() -> Path | None:
@@ -544,7 +575,15 @@ def _pot_provider_args() -> dict[str, Any]:
     global _POT_ARGS, _POT_RESOLVED
     if _POT_RESOLVED:
         return dict(_POT_ARGS or {})
-    _POT_RESOLVED = True
+    with _RESOLVE_LOCK:  # concurrent first calls: compute once, publish whole
+        if not _POT_RESOLVED:
+            _POT_ARGS = _load_pot_args()
+            _POT_RESOLVED = True
+    return dict(_POT_ARGS or {})
+
+
+def _load_pot_args():
+    """The first-call work of _pot_provider_args (under _RESOLVE_LOCK)."""
 
     configured = bool(POT_PROVIDER_URL)
     base = (POT_PROVIDER_URL or "http://127.0.0.1:4416").rstrip("/")
@@ -559,10 +598,10 @@ def _pot_provider_args() -> dict[str, Any]:
             reachable = False
 
     if reachable:
-        _POT_ARGS = {"youtubepot-bgutilhttp": {"base_url": [base]}}
+        args = {"youtubepot-bgutilhttp": {"base_url": [base]}}
         logger.info("PO-token provider: %s (%s)", base, "configured" if configured else "detected")
     else:
-        _POT_ARGS = {}
+        args = {}
         logger.info(
             "PO-token provider: none reachable at %s — cookieless YouTube still "
             "works; the top formats may 403 and fall back to the `android` "
@@ -570,7 +609,7 @@ def _pot_provider_args() -> dict[str, Any]:
             "make every quality reachable.",
             base,
         )
-    return dict(_POT_ARGS)
+    return args
 
 
 def pot_provider_available() -> bool:
@@ -629,7 +668,6 @@ def _resolved_impersonate():
     global _IMPERSONATE, _IMPERSONATE_RESOLVED
     if _IMPERSONATE_RESOLVED:
         return _IMPERSONATE
-    _IMPERSONATE_RESOLVED = True
     try:
         # Presence check only — importing curl_cffi here just to discard it
         # reads as dead code and trips linters. yt-dlp needs it installed for
@@ -641,13 +679,24 @@ def _resolved_impersonate():
         _IMPERSONATE = ImpersonateTarget.from_str("chrome")
     except Exception:
         _IMPERSONATE = None
+    _IMPERSONATE_RESOLVED = True  # after the value: a concurrent caller never sees None early
     return _IMPERSONATE
+
+
+_YT_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+
+
+def _is_youtube_host(host: str) -> bool:
+    h = (host or "").lower().rstrip(".").split(":")[0]
+    return any(h == d or h.endswith("." + d) for d in _YT_HOSTS)
 
 
 def _platform_flags(host: str) -> dict[str, bool]:
     h = (host or "").lower()
     return {
-        "yt": "youtu" in h,
+        # Exact hosts: "youtu" in h made youtu.example.net YouTube, so any site
+        # could steer the YouTube strategy pin and trigger WARP rotations.
+        "yt": _is_youtube_host(h),
         "ig": "instagram" in h or "instagr.am" in h,
         "tt": "tiktok" in h,
         "x": "twitter." in h or h == "x.com" or h.endswith(".x.com"),
@@ -1127,8 +1176,12 @@ def _download_match_filter(info: dict[str, Any], *, incomplete: bool = False) ->
         )
     # Where yt-dlp will actually fetch from — a public page can point its
     # media at a private address, which the up-front URL check never sees.
-    for key in ("url", "manifest_url"):
-        target = info.get(key)
+    # A merged video+audio pick has no url of its own: its parts do.
+    targets = [info.get("url"), info.get("manifest_url")]
+    for part in info.get("requested_formats") or ():
+        if isinstance(part, dict):
+            targets += [part.get("url"), part.get("manifest_url")]
+    for target in targets:
         # URI schemes are case-insensitive. Do not let an extracted uppercase
         # HTTP(S) URL bypass the private-address guard.
         if isinstance(target, str) and target.lower().startswith(("http://", "https://")):
@@ -1273,14 +1326,16 @@ def _yt_strategies(*, has_cookies: bool) -> list[dict[str, Any]]:
 def _remember_yt_strategy(original_index: int, *, download: bool) -> None:
     global _YT_WINNER_META, _YT_WINNER_DL
     global _YT_WINNER_META_AT, _YT_WINNER_DL_AT
+    # Stamped only when the pin CHANGES. Re-stamping on every win made the TTL
+    # slide: the pinned rung is tried first and android always succeeds, so
+    # with a YouTube job every 3 min a 360p pin never expired.
     now = time.monotonic()
     with _YT_WINNER_LOCK:
         if download:
-            _YT_WINNER_DL = original_index
-            _YT_WINNER_DL_AT = now
-        else:
-            _YT_WINNER_META = original_index
-            _YT_WINNER_META_AT = now
+            if original_index != _YT_WINNER_DL:
+                _YT_WINNER_DL, _YT_WINNER_DL_AT = original_index, now
+        elif original_index != _YT_WINNER_META:
+            _YT_WINNER_META, _YT_WINNER_META_AT = original_index, now
 
 
 def _yt_winner(*, download: bool) -> int:
@@ -2492,10 +2547,14 @@ class DownloadManager:
                     DOWNLOAD_ATTEMPT_BUDGET, si, url[:80],
                 )
                 break
+            if si:
+                # A failed attempt can leave title.mp4.part behind; the next
+                # strategy may pick another format with the same file name, and
+                # yt-dlp would resume INTO it by byte range: a corrupt file
+                # reported as a success.
+                _drop_partials(opts)
             # Prefer requested quality; only try b/best if that format fails
             formats_to_try = [primary]
-            if primary != FORMAT_FALLBACK and primary != "b/best":
-                pass  # b/best added only on format failure
             attempt_base = dict(opts)
             attempt_base["http_headers"] = dict(opts.get("http_headers") or {})
 
@@ -2573,6 +2632,8 @@ class DownloadManager:
                     with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                         info = ydl.extract_info(url, download=not bool(opts.get("_audio_policy")))
                         if info is not None and opts.get("_audio_policy"):
+                            # A playlist link gives the playlist, not a track.
+                            info = _normalize_info_dict(url, info)
                             info = _process_audio_download(attempt_opts, info, url)
                         if info is None:
                             raise RuntimeError("Download returned no data.")

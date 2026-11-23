@@ -47,7 +47,9 @@ wait_idle() {
 import json, sys, time
 d = json.load(open(sys.argv[1]))
 fresh = time.time() - d.get("ts", 0) < 120
-print((d.get("queue_running", 0) + d.get("queue_waiting", 0)) if fresh else 0)
+# "busy" also counts uploads, inline jobs and links being read (older
+# bots wrote only the queue fields).
+print(d.get("busy", d.get("queue_running", 0) + d.get("queue_waiting", 0)) if fresh else 0)
 EOF
 )
         [ "${busy:-0}" = "0" ] && return 0

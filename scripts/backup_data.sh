@@ -17,19 +17,24 @@ APP=${APP:-/opt/all-media-downloader}
 DEST=${DEST:-/var/backups/mediabot}
 KEEP=${KEEP:-14}
 
+BOT_USER=${BOT_USER:-mediabot}  # owns data/; files are read as this user
+
 umask 077
 mkdir -p "$DEST"
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
+chown "$BOT_USER" "$stage"
+as_bot() { runuser -u "$BOT_USER" -- "$@"; }
 
+# Read as the bot, never as root: data/ is writable by the bot, so a planted
+# symlink (data/x.json -> /etc/shadow) must not gain root's read access.
 shopt -s nullglob
-# Regular files only: data/ is writable by the bot, and this runs as root, so
-# a planted symlink (data/x.json -> /etc/shadow) must not be followed.
 for f in "$APP"/data/*.sqlite3; do
     [ -L "$f" ] || [ ! -f "$f" ] && continue
-    python3 - "$f" "$stage/$(basename "$f")" <<'EOF'
+    as_bot python3 - "$f" "$stage/$(basename "$f")" <<'EOF'
 import sqlite3, sys
-src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=30)
+from urllib.parse import quote
+src = sqlite3.connect(f"file:{quote(sys.argv[1])}?mode=ro", uri=True, timeout=30)
 dst = sqlite3.connect(sys.argv[2])
 with dst:
     src.backup(dst)
@@ -38,7 +43,7 @@ EOF
 done
 for f in "$APP"/data/*.json; do
     [ -L "$f" ] || [ ! -f "$f" ] && continue
-    cp -p "$f" "$stage/"
+    as_bot cp -p "$f" "$stage/"
 done
 
 out="$DEST/data-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"

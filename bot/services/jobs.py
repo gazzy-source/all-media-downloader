@@ -53,6 +53,12 @@ def shutdown_all() -> int:
 
 def start(key: str, owner: int) -> Job:
     job = Job(key, owner)
+    if SHUTTING_DOWN:
+        # Application.stop() still runs updates already fetched; one that
+        # starts a download now would run past systemd's stop timeout and be
+        # killed. Stopped at once instead: its message stays registered, so
+        # the next start tells the user "Interrupted".
+        job.event.set()
     _JOBS[key] = job
     return job
 

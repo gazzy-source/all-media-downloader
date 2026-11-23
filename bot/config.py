@@ -11,6 +11,52 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+
+def _env_warn(name: str, raw: str, default) -> None:
+    # logging isn't configured yet at import time: stderr reaches the journal.
+    import sys
+
+    print(f"config: {name}={raw!r} is not valid; using {default!r}", file=sys.stderr)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """1/0, true/false, yes/no, on/off in any case; empty or unknown = default."""
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    _env_warn(name, raw, default)
+    return default
+
+
+def _env_int(name: str, default: int) -> int:
+    """
+    A bad number falls back to the default with a warning. A bare int() made
+    one typo in .env crash the import, and systemd restarted it forever.
+    """
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        _env_warn(name, raw, default)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        _env_warn(name, raw, default)
+        return default
+
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
 
 ADMIN_IDS: set[int] = {
@@ -20,12 +66,12 @@ ADMIN_IDS: set[int] = {
 }
 
 # Parallel user jobs (5 is fine if MemoryMax ~700M+ and progressive formats)
-MAX_CONCURRENT_DOWNLOADS: int = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "5"))
-MAX_FILE_SIZE_MB: float = float(os.getenv("MAX_FILE_SIZE_MB", "49"))
+MAX_CONCURRENT_DOWNLOADS: int = _env_int("MAX_CONCURRENT_DOWNLOADS", 5)
+MAX_FILE_SIZE_MB: float = _env_float("MAX_FILE_SIZE_MB", 49)
 MAX_FILE_SIZE_BYTES: int = int(MAX_FILE_SIZE_MB * 1024 * 1024)
 # Uploads to Telegram at once, and MB of files in flight (see upload_gate.py).
-UPLOAD_MAX_CONCURRENT: int = max(1, int(os.getenv("UPLOAD_MAX_CONCURRENT", "2")))
-UPLOAD_BUDGET_BYTES: int = int(float(os.getenv("UPLOAD_BUDGET_MB", "100")) * 1024 * 1024)
+UPLOAD_MAX_CONCURRENT: int = max(1, _env_int("UPLOAD_MAX_CONCURRENT", 2))
+UPLOAD_BUDGET_BYTES: int = int(_env_float("UPLOAD_BUDGET_MB", 100) * 1024 * 1024)
 
 DOWNLOAD_DIR: Path = Path(os.getenv("DOWNLOAD_DIR", str(BASE_DIR / "downloads")))
 TEMP_DIR: Path = Path(os.getenv("TEMP_DIR", str(BASE_DIR / "temp")))
@@ -53,17 +99,15 @@ def parse_proxy_hosts(raw: str | None) -> tuple[str, ...]:
 
 
 PROXY_HOSTS: tuple[str, ...] = parse_proxy_hosts(os.getenv("PROXY_HOSTS"))
-RATE_LIMIT_PER_HOUR: int = int(os.getenv("RATE_LIMIT_PER_HOUR", "30"))
+RATE_LIMIT_PER_HOUR: int = _env_int("RATE_LIMIT_PER_HOUR", 30)
 
 # Download allowance (paid with Telegram Stars, no payment provider needed).
 # Every account (a user, or a channel for its posts) gets FREE_DOWNLOADS
 # lifetime downloads; then it buys packs. DOWNLOAD_PACKS is
 # "downloads:stars,..." Admins and accounts the owner approves with
 # /approvefree are never counted. PAYWALL_ENABLED=0 counts but never blocks.
-PAYWALL_ENABLED: bool = os.getenv("PAYWALL_ENABLED", "1").strip().lower() in (
-    "1", "true", "yes", "on",
-)
-FREE_DOWNLOADS: int = max(0, int(os.getenv("FREE_DOWNLOADS", "100")))
+PAYWALL_ENABLED: bool = _env_bool("PAYWALL_ENABLED", True)
+FREE_DOWNLOADS: int = max(0, _env_int("FREE_DOWNLOADS", 100))
 
 
 def parse_packs(raw: str | None) -> tuple[tuple[int, int], ...]:
@@ -81,30 +125,15 @@ DOWNLOAD_PACKS: tuple[tuple[int, int], ...] = parse_packs(
     os.getenv("DOWNLOAD_PACKS", "100:100,10000:10000")) or ((100, 100),)
 # Accounts that have bought a pack get this many times the hourly limit and
 # go ahead of free users in the download queue.
-PAID_RATE_MULT: int = max(1, int(os.getenv("PAID_RATE_MULT", "5")))
+PAID_RATE_MULT: int = max(1, _env_int("PAID_RATE_MULT", 5))
 
-AUTO_DOWNLOAD_GROUPS: bool = os.getenv("AUTO_DOWNLOAD_GROUPS", "1").strip() not in (
-    "0",
-    "false",
-    "False",
-    "no",
-)
-AUTO_DOWNLOAD_ALWAYS: bool = os.getenv("AUTO_DOWNLOAD_ALWAYS", "0").strip() in (
-    "1",
-    "true",
-    "True",
-    "yes",
-)
+AUTO_DOWNLOAD_GROUPS: bool = _env_bool("AUTO_DOWNLOAD_GROUPS", True)
+AUTO_DOWNLOAD_ALWAYS: bool = _env_bool("AUTO_DOWNLOAD_ALWAYS", False)
 # Channels: post the downloaded media as a new message and delete the original
 # link post, so nobody has to remove it by hand. Needs the "Delete messages"
 # admin right; without it the media is still posted and the link is left.
 # Groups and DMs are unaffected.
-CHANNEL_REPLACE_LINK: bool = os.getenv("CHANNEL_REPLACE_LINK", "1").strip() not in (
-    "0",
-    "false",
-    "False",
-    "no",
-)
+CHANNEL_REPLACE_LINK: bool = _env_bool("CHANNEL_REPLACE_LINK", True)
 
 # Links that are music/podcast by nature: auto-download delivers them as an
 # audio message rather than a video file. music.youtube.com in particular serves
@@ -122,66 +151,55 @@ AUDIO_HOST_HINTS: tuple[str, ...] = (
 )
 
 # Private chat: 0 = mode/quality buttons (default). 1 = auto-download like groups.
-DM_FAST_AUTO: bool = os.getenv("DM_FAST_AUTO", "0").strip() in (
-    "1",
-    "true",
-    "True",
-    "yes",
-)
+DM_FAST_AUTO: bool = _env_bool("DM_FAST_AUTO", False)
 # Hard ceiling on the "Analyzing…" phase. yt-dlp's socket_timeout only
 # bounds a single socket operation; with retries across several
 # strategies a flaky connection can stretch to minutes, and the user just
 # waits. Observed in production: 254s on one link. Fail fast instead.
-EXTRACT_TIMEOUT: int = int(os.getenv("EXTRACT_TIMEOUT", "45"))
+EXTRACT_TIMEOUT: int = _env_int("EXTRACT_TIMEOUT", 45)
 # Per-request leash for the metadata pass only. Downloads keep the more
 # patient values, where waiting out a slow socket beats restarting a
 # large transfer.
-METADATA_SOCKET_TIMEOUT: int = int(os.getenv("METADATA_SOCKET_TIMEOUT", "8"))
-METADATA_RETRIES: int = int(os.getenv("METADATA_RETRIES", "1"))
+METADATA_SOCKET_TIMEOUT: int = _env_int("METADATA_SOCKET_TIMEOUT", 8)
+METADATA_RETRIES: int = _env_int("METADATA_RETRIES", 1)
 # Ceiling on the download RESOLVE loop: no NEW (strategy, format) attempt
 # starts past this. A transfer already in flight is allowed to finish, so
 # this bounds thrashing rather than cutting off a legitimately large file.
 # Without it the ladder multiplies out to ~19 minutes (38 with the
 # image-only retry) while holding a concurrency slot and a pool thread.
-DOWNLOAD_ATTEMPT_BUDGET: int = int(os.getenv("DOWNLOAD_ATTEMPT_BUDGET", "420"))
+DOWNLOAD_ATTEMPT_BUDGET: int = _env_int("DOWNLOAD_ATTEMPT_BUDGET", 420)
 
 # Hard ceilings for one download, enforced WHILE it runs. The size check after
 # the download protects Telegram, not the server: without these, one link to a
 # 24/7 livestream or a 50 GB file (posted in any group the bot sits in) filled
 # the disk and pinned a download slot forever.
-MAX_MEDIA_DURATION: int = int(os.getenv("MAX_MEDIA_DURATION", str(3 * 3600)))
+MAX_MEDIA_DURATION: int = _env_int("MAX_MEDIA_DURATION", 3 * 3600)
 # Bytes fetched per file before aborting — a multiple of the upload limit so
 # an over-estimate that would still fit after merging isn't cut short.
-DOWNLOAD_MAX_BYTES: int = int(
-    os.getenv("DOWNLOAD_MAX_BYTES", str(3 * MAX_FILE_SIZE_BYTES))
-)
-DOWNLOAD_MAX_SECONDS: int = int(os.getenv("DOWNLOAD_MAX_SECONDS", "900"))
+DOWNLOAD_MAX_BYTES: int = _env_int("DOWNLOAD_MAX_BYTES", 3 * MAX_FILE_SIZE_BYTES)
+DOWNLOAD_MAX_SECONDS: int = _env_int("DOWNLOAD_MAX_SECONDS", 900)
 
 # Inline mode (@bot <link> in any chat). The finished file is uploaded once to
 # a "storage" chat to get a reusable file_id, then swapped into the inline
 # message. STORAGE_CHAT_ID: a private channel with the bot as admin (kept as an
 # archive). Unset = the first admin's private chat, where each upload is
 # deleted again right after (file_ids stay valid after deletion).
-INLINE_ENABLED: bool = os.getenv("INLINE_ENABLED", "1").strip().lower() in (
-    "1", "true", "yes", "on",
-)
+INLINE_ENABLED: bool = _env_bool("INLINE_ENABLED", True)
 STORAGE_CHAT_ID: int | None = (
-    int(os.environ["STORAGE_CHAT_ID"]) if os.getenv("STORAGE_CHAT_ID", "").strip() else None
+    _env_int("STORAGE_CHAT_ID", 0) or None
 )
 # Inline queries arrive per keystroke; this caps answers per user per hour.
-INLINE_QUERIES_PER_HOUR: int = int(os.getenv("INLINE_QUERIES_PER_HOUR", "300"))
+INLINE_QUERIES_PER_HOUR: int = _env_int("INLINE_QUERIES_PER_HOUR", 300)
 # Inline search: "@bot lofi beats" lists YouTube results ("@bot audio …" for
 # audio). Results are cached per query, and a search only runs once typing
 # pauses, so keystrokes cost nothing.
-INLINE_SEARCH_ENABLED: bool = os.getenv("INLINE_SEARCH_ENABLED", "1").strip().lower() in (
-    "1", "true", "yes", "on",
-)
-INLINE_SEARCH_PAGE: int = max(1, min(int(os.getenv("INLINE_SEARCH_PAGE", "10")), 20))
-INLINE_SEARCH_MAX: int = max(1, min(int(os.getenv("INLINE_SEARCH_MAX", "30")), 50))
+INLINE_SEARCH_ENABLED: bool = _env_bool("INLINE_SEARCH_ENABLED", True)
+INLINE_SEARCH_PAGE: int = max(1, min(_env_int("INLINE_SEARCH_PAGE", 10), 20))
+INLINE_SEARCH_MAX: int = max(1, min(_env_int("INLINE_SEARCH_MAX", 30), 50))
 # Search lists only media up to this long (seconds). Beyond an hour a video is
 # almost always over Telegram's 50 MB bot limit (and slow to fetch), so
 # offering it would mostly lead to "too big" — keep the list to what works.
-INLINE_SEARCH_MAX_DURATION: int = int(os.getenv("INLINE_SEARCH_MAX_DURATION", "3600"))
+INLINE_SEARCH_MAX_DURATION: int = _env_int("INLINE_SEARCH_MAX_DURATION", 3600)
 # Public URL prefix for the placeholder clip/track that a picked search result
 # shows until the real file replaces it (Telegram fetches it by URL). Default:
 # this repo's bot/assets via jsDelivr's GitHub CDN (correct MIME types).
@@ -202,11 +220,7 @@ INLINE_ASSET_BASE: str = (
 #
 # It also re-warms after YouTube rotates its player, because that invalidates
 # the cached signature function — the same 24s, otherwise charged to a user.
-WARMUP_ON_START: bool = (os.getenv("WARMUP_ON_START", "1") or "1").strip().lower() not in (
-    "0",
-    "false",
-    "no",
-)
+WARMUP_ON_START: bool = _env_bool("WARMUP_ON_START", True)
 # "Me at the zoo": the oldest, most stable public video on YouTube — 19s long
 # and metadata-only here, so warming costs a few small JSON requests.
 WARMUP_URL: str = (
@@ -218,19 +232,17 @@ WARMUP_URL: str = (
 # later — 60/60 sequential and 30/30 concurrent probes pass, so this is a brief
 # blip rather than load or an outage. Every strategy in the ladder shares the
 # proxy, so advancing through them cannot absorb one; a short wait can.
-PROXY_BLIP_RETRIES: int = int(os.getenv("PROXY_BLIP_RETRIES", "2"))
-PROXY_BLIP_BACKOFF: float = float(os.getenv("PROXY_BLIP_BACKOFF", "1.5"))
+PROXY_BLIP_RETRIES: int = _env_int("PROXY_BLIP_RETRIES", 2)
+PROXY_BLIP_BACKOFF: float = _env_float("PROXY_BLIP_BACKOFF", 1.5)
 
 # On an explicit YouTube bot wall, an enabled rotation attempts a WARP
 # reconnect. The downloader retries only if the configured proxy egress IP
 # changes; a successful local reconnect alone is not evidence of a new route.
 # 1 = enable this guarded attempt; 0 = off, the default.
-WARP_ROTATE_ON_BOTCHECK: bool = os.getenv(
-    "WARP_ROTATE_ON_BOTCHECK", "0"
-).strip().lower() in ("1", "true", "yes", "on")
+WARP_ROTATE_ON_BOTCHECK: bool = _env_bool("WARP_ROTATE_ON_BOTCHECK", False)
 # Minimum seconds between rotations, so a genuinely blocked video can't make
 # the bot flap WARP for every other in-flight download.
-WARP_ROTATE_COOLDOWN: float = float(os.getenv("WARP_ROTATE_COOLDOWN", "120"))
+WARP_ROTATE_COOLDOWN: float = _env_float("WARP_ROTATE_COOLDOWN", 120)
 
 # Skip YouTube's HLS manifest and translated-subtitle enumeration during the
 # ANALYSIS pass only (1 = skip, the default; 0 = restore the old behaviour).
@@ -249,11 +261,7 @@ WARP_ROTATE_COOLDOWN: float = float(os.getenv("WARP_ROTATE_COOLDOWN", "120"))
 #
 # Deliberately NOT applied to the download pass, which may still want an HLS
 # rendition as a fallback when a progressive/DASH URL fails.
-YT_LEAN_METADATA: bool = (os.getenv("YT_LEAN_METADATA", "1") or "1").strip().lower() not in (
-    "0",
-    "false",
-    "no",
-)
+YT_LEAN_METADATA: bool = _env_bool("YT_LEAN_METADATA", True)
 
 # How often to re-warm the YouTube pipeline, in minutes (0 disables).
 #
@@ -266,10 +274,10 @@ YT_LEAN_METADATA: bool = (os.getenv("YT_LEAN_METADATA", "1") or "1").strip().low
 #
 # Re-warming well inside the token lifetime keeps that bill on the bot. The job
 # is one small metadata extract, so it is cheap to run often.
-WARMUP_INTERVAL_MIN: int = int(os.getenv("WARMUP_INTERVAL_MIN", "45"))
+WARMUP_INTERVAL_MIN: int = _env_int("WARMUP_INTERVAL_MIN", 45)
 
 # Metadata extract cache TTL (seconds) — speeds repeated DM analyzes
-META_CACHE_TTL: int = int(os.getenv("META_CACHE_TTL", "180"))
+META_CACHE_TTL: int = _env_int("META_CACHE_TTL", 180)
 
 # The download reuses the analysis pass's extraction when it is at most this
 # old, instead of extracting the same link again. Measured on the 2-core VPS:
@@ -277,13 +285,11 @@ META_CACHE_TTL: int = int(os.getenv("META_CACHE_TTL", "180"))
 # transfer itself 0.3-2s — extracting twice was most of every DM download.
 # Media URLs stay valid for hours; if one has gone stale (or WARP changed
 # IP) the download falls back to a fresh extraction automatically.
-DOWNLOAD_REUSE_TTL: int = int(os.getenv("DOWNLOAD_REUSE_TTL", "1800"))
+DOWNLOAD_REUSE_TTL: int = _env_int("DOWNLOAD_REUSE_TTL", 1800)
 # The FIRST download attempt on YouTube also skips the HLS manifest (measured
 # 21.0s -> 10.7s extraction). Retries still extract in full, so HLS remains
 # the fallback the note on YT_LEAN_METADATA asks for.
-YT_LEAN_DOWNLOAD: bool = (os.getenv("YT_LEAN_DOWNLOAD", "1") or "1").strip().lower() not in (
-    "0", "false", "no",
-)
+YT_LEAN_DOWNLOAD: bool = _env_bool("YT_LEAN_DOWNLOAD", True)
 # Inline results default to 720p: phone-sized, roughly half of 1080p's bytes
 # to fetch and upload, and far more often under Telegram's 50 MB bot limit.
 INLINE_QUALITY: str = (os.getenv("INLINE_QUALITY", "720") or "720").strip().lower()
@@ -333,7 +339,7 @@ BOT_SHORT_DESCRIPTION: str | None = _profile_text(
 # get distracted, come back to "This session expired". Sessions are a few
 # hundred bytes each and the cleanup job sweeps them, so a longer window
 # costs nothing. (They still die on restart — they live in memory only.)
-SESSION_TTL = int(os.getenv("SESSION_TTL", "1800"))
+SESSION_TTL = _env_int("SESSION_TTL", 1800)
 TEMP_CLEANUP_HOURS = 1
 
 

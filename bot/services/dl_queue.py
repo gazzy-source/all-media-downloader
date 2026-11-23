@@ -3,7 +3,7 @@ One fair download queue for every entry point (DM, groups/channels, inline).
 
 The downloader's own semaphore made waiting jobs wait silently and in no
 particular order. This queue hands out the same number of slots first-come
-first-served (premium ahead of free), and tells each waiting job its place in
+first-served (buyers ahead of free, for up to a minute), and tells each waiting job its place in
 line whenever it changes, so users see "#3 in line" instead of a frozen bar.
 
 Fair between people too: one user runs at most PER_USER jobs at a time (a
@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import time
 from collections import Counter
 from typing import Any, Awaitable, Callable
 
@@ -25,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 PositionCallback = Callable[[int], Awaitable[Any]]
 PER_USER = 2
+# A free job that has waited this long ranks with the paid ones, so paid
+# accounts (priority, 5x hourly limit) can't keep every slot forever.
+PRIORITY_AGING_S = 60.0
 
 
 class DownloadQueue:
@@ -33,8 +37,8 @@ class DownloadQueue:
         self.per_user = max(1, per_user)
         self.running = 0
         self._running_by: Counter = Counter()
-        # (priority rank, ticket, owner), kept sorted
-        self._waiting: list[tuple[int, int, Any]] = []
+        # (priority rank, ticket, owner, enqueued at), in arrival order
+        self._waiting: list[tuple[int, int, Any, float]] = []
         self._tickets = itertools.count()
         self._changed = asyncio.Event()
         self._notes: set[asyncio.Task] = set()
@@ -43,14 +47,20 @@ class DownloadQueue:
     def waiting(self) -> int:
         return len(self._waiting)
 
+    def _ordered(self) -> list:
+        """Paid first, then by arrival; a free job ages into the paid rank."""
+        now = time.monotonic()
+        return sorted(self._waiting, key=lambda e: (
+            0 if e[0] == 0 or now - e[3] >= PRIORITY_AGING_S else 1, e[1]))
+
     def _position(self, entry) -> int:
-        return self._waiting.index(entry) + 1
+        return self._ordered().index(entry) + 1
 
     def _next(self):
         """The first waiting entry whose owner isn't already at their cap."""
         if self.running >= self.slots:
             return None
-        for e in self._waiting:
+        for e in self._ordered():
             if e[2] is None or self._running_by[e[2]] < self.per_user:
                 return e
         return None
@@ -80,9 +90,8 @@ class DownloadQueue:
         priority: bool = False,
         owner: Any = None,
     ) -> Any:
-        entry = (0 if priority else 1, next(self._tickets), owner)
+        entry = (0 if priority else 1, next(self._tickets), owner, time.monotonic())
         self._waiting.append(entry)
-        self._waiting.sort(key=lambda e: (e[0], e[1]))
         self._wake()  # positions behind a priority job just moved
         told = None
         try:

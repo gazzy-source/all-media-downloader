@@ -37,13 +37,16 @@ def warmup_result(ok: bool, error: str | None = None) -> None:
         state["warmup_error"] = (error or "")[:200]
 
 
-def write(polling: bool, running: int, waiting: int) -> None:
+def write(polling: bool, running: int, waiting: int, busy: int | None = None) -> None:
     data = {
         "ts": time.time(),
         "pid": os.getpid(),
         "polling": polling,
         "queue_running": running,
         "queue_waiting": waiting,
+        # Anything a restart would cut (downloads, uploads, inline jobs, links
+        # being read). The restart scripts wait for this to be 0.
+        "busy": running + waiting if busy is None else busy,
         **state,
     }
     tmp = PATH.with_suffix(".tmp")

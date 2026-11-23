@@ -23,7 +23,10 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 
 shopt -s nullglob
+# Regular files only: data/ is writable by the bot, and this runs as root, so
+# a planted symlink (data/x.json -> /etc/shadow) must not be followed.
 for f in "$APP"/data/*.sqlite3; do
+    [ -L "$f" ] || [ ! -f "$f" ] && continue
     python3 - "$f" "$stage/$(basename "$f")" <<'EOF'
 import sqlite3, sys
 src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=30)
@@ -34,6 +37,7 @@ dst.close(); src.close()
 EOF
 done
 for f in "$APP"/data/*.json; do
+    [ -L "$f" ] || [ ! -f "$f" ] && continue
     cp -p "$f" "$stage/"
 done
 

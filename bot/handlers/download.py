@@ -33,7 +33,7 @@ from bot.keyboards.menus import (
     quality_keyboard,
     subtitle_lang_keyboard,
 )
-from bot.services import activity, inline_cache, jobs, user_prefs
+from bot.services import activity, inline_cache, jobs, quota, user_prefs
 from bot.services.dl_queue import download_queue
 from bot.services.upload_gate import UploadCancelled, upload_gate
 from bot.utils import redact
@@ -92,7 +92,31 @@ def _is_auto_chat(update: Update) -> bool:
 
 
 def _actor_id(update: Update) -> int | None:
-    """User id, or channel id when the post has no from-user."""
+    """
+    Who a download belongs to (and is counted against): the sender, or the
+    chat a message was sent as. Anonymous group admins, "send as channel"
+    posts and a linked channel's auto-forwards all carry a shared stand-in
+    user (GroupAnonymousBot, Channel_Bot, 777000) — keyed on that, every such
+    post everywhere would share one allowance.
+
+    In a group, only the group itself (anonymous admins) or its linked
+    channel (automatic forwards, a flag only Telegram sets) is trusted as the
+    sender. A member posting "as" one of their own channels has no account:
+    keyed on that channel, every throwaway channel would be a fresh free
+    allowance; keyed on the group, they would spend the group's downloads
+    or ride its /approvefree. Telegram shows no person behind such a post,
+    so it is not downloaded (None).
+    """
+    msg = update.effective_message
+    chat = update.effective_chat
+    sender_chat = getattr(msg, "sender_chat", None) if msg is not None else None
+    sc_id = getattr(sender_chat, "id", None) if sender_chat is not None else None
+    if sc_id is not None:
+        if chat is None or chat.type in ("channel", "private") or sc_id == chat.id:
+            return sc_id
+        if getattr(msg, "is_automatic_forward", False):
+            return sc_id  # the linked channel's own post, mirrored here
+        return None
     user = update.effective_user
     if user:
         return user.id
@@ -100,6 +124,47 @@ def _actor_id(update: Update) -> int | None:
     if chat and chat.type == "channel":
         return chat.id
     return None
+
+
+# Out-of-downloads notices: once per account and chat per window, so a busy
+# group or channel isn't flooded with the same line (and a 5-link DM gets one
+# refusal, not five).
+_QUOTA_NOTICE_EVERY = {"channel": 6 * 3600.0, "private": 10.0}
+_QUOTA_NOTICE_DEFAULT = 600.0
+_last_quota_notice: dict[tuple[int, int], float] = {}
+
+
+async def _refuse_over_quota(context, chat, msg, account: int, *, reply_markup=None) -> bool:
+    """
+    True (and says so) when `account` has no downloads left. Checked before
+    the hourly limit, so a refusal doesn't use up an hourly slot. Its jobs
+    already in progress count: twenty links at once with one download left
+    must not all start.
+    """
+    if quota.can_download(account, active=jobs.active_for(account)):
+        return False
+    from bot.handlers.premium import refusal
+
+    private = chat.type == "private"
+    me = getattr(context.bot, "username", "") or ""
+    text, markup = refusal(account, user_id=account if private else None, private=private,
+                           bot_username=me)
+    now = time.monotonic()
+    key = (chat.id, account)
+    every = _QUOTA_NOTICE_EVERY.get(chat.type, _QUOTA_NOTICE_DEFAULT)
+    if now - _last_quota_notice.get(key, -every) < every:
+        return True
+    _last_quota_notice[key] = now
+    if len(_last_quota_notice) > 5000:
+        _last_quota_notice.pop(next(iter(_last_quota_notice)))
+    logger.info("download refused: %s is out of downloads", redact.uid(account))
+    try:
+        await msg.reply_text(text, parse_mode=ParseMode.HTML,
+                             reply_markup=markup if markup is not None else reply_markup,
+                             disable_web_page_preview=True)
+    except TelegramError:
+        pass
+    return True
 
 
 def _should_auto_download(update: Update) -> bool:
@@ -250,6 +315,8 @@ async def auto_download_flow(
     platform = platform_from_url(url)
     telemetry_id = new_job_id() if "youtube" in platform.lower() else ""
 
+    if await _refuse_over_quota(context, chat, msg, actor):
+        return False
     allowed, retry = rate_limiter.allow(actor)
     if not allowed and actor not in ADMIN_IDS:
         try:
@@ -322,6 +389,7 @@ async def auto_download_flow(
                     and _is_link_only_post(msg)):
                 await _try_delete(context, chat.id, msg.message_id)
             record_download(actor, url, hit.get("title") or "", platform, mode, quality, True)
+            quota.count(actor)
             emit_terminal(telemetry_id, "success", delivery="cached")
             return True
     emit(telemetry_id, "cache", outcome="miss", cache_hit="no", delivery="fresh_download")
@@ -332,6 +400,12 @@ async def auto_download_flow(
     status = await msg.reply_text(view.render(head), parse_mode=ParseMode.HTML,
                                   reply_markup=_CANCEL_KB if can_cancel else None)
     job = jobs.start(f"dm:{chat.id}:{status.message_id}", actor)
+    # Again, now that this job is registered: between the first check and
+    # here (awaits), another link of the same account may have started.
+    if not quota.can_download(actor, active=jobs.active_for(actor, exclude=job)):
+        jobs.drop(job)
+        await _quiet_delete_msg(context, chat.id, status.message_id)
+        return False
     if not can_cancel:
         job.cancellable = False
     on_progress, ticker = _progress_driver(
@@ -347,7 +421,7 @@ async def auto_download_flow(
 
     inflight_add(chat.id, status.message_id)
     try:
-        await context.bot.send_chat_action(chat.id, ChatAction.UPLOAD_DOCUMENT)
+        _chat_action(context, chat.id, ChatAction.UPLOAD_DOCUMENT)  # cosmetic: never fails the job
         queue_entered = time.monotonic()
         emit(telemetry_id, "queue", outcome="queue_enter")
         async def _queued_download():
@@ -361,7 +435,7 @@ async def auto_download_flow(
             job, download_queue,
             _queued_download,
             on_position=lambda n: on_progress(0, f"Queued — you're #{n} in line"),
-            priority=user_prefs.is_premium(actor),
+            priority=quota.is_paid(actor),
         )
     except asyncio.CancelledError:
         jobs.drop(job)
@@ -504,6 +578,7 @@ async def auto_download_flow(
                     url, repeat, sent, result.title or "", result, mode, quality),
             )
             logger.info("Channel post handling: %s", outcome)
+            quota.count(actor)
         else:
             sent = await _send_media(
                 context, chat.id, path, result, caption, reply_markup=actions,
@@ -511,6 +586,9 @@ async def auto_download_flow(
                 cancel=job.event, on_reserved=lambda: setattr(job, "cancellable", False),
                 job_id=telemetry_id,
             )
+            # Counted the moment it's delivered: a later bookkeeping error
+            # must not turn a delivered file into an uncounted one.
+            quota.count(actor)
             _remember_upload(url, repeat, sent, result.title or "", result, mode, quality)
         record_download(
             actor, url, result.title or "", platform, mode, quality, True,
@@ -562,6 +640,9 @@ async def start_url_flow(
         await auto_download_flow(update, context, url)
         return
 
+    if await _refuse_over_quota(context, chat, msg, user.id,
+                                reply_markup=main_reply_keyboard()):
+        return
     allowed, retry = rate_limiter.allow(user.id)
     if not allowed and user.id not in ADMIN_IDS:
         await msg.reply_text(
@@ -601,7 +682,7 @@ async def start_url_flow(
 
     heartbeat = asyncio.create_task(_analysing_heartbeat())
     try:
-        await context.bot.send_chat_action(chat.id, ChatAction.TYPING)
+        _chat_action(context, chat.id, ChatAction.TYPING)  # cosmetic: never fails the job
         # Bounded: a flaky connection used to leave this running for minutes
         # (254s seen in production) with the user simply waiting.
         info = await asyncio.wait_for(
@@ -933,7 +1014,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except TelegramError:
             pass
         return
-    if query.data.startswith(("pref:", "prem:")):
+    if query.data.startswith(("pref:", "prem:", "pay:")):
         # Answered first, or Telegram keeps a spinner on the tapped button.
         try:
             await query.answer()
@@ -1282,6 +1363,24 @@ def _session_header(session: DownloadSession) -> str:
     )
 
 
+async def _refuse_menu(query, context, session: DownloadSession) -> None:
+    """Out of downloads at the moment a menu choice was made."""
+    from bot.handlers.premium import refusal
+
+    sessions.remove(session.session_id)
+    rate_limiter.refund(session.user_id)  # nothing was downloaded
+    # The wizard also runs in groups when auto-download is off: the balance
+    # and pay buttons belong in private only.
+    private = session.chat_id == session.user_id
+    text, markup = refusal(session.user_id, user_id=session.user_id if private else None,
+                           private=private,
+                           bot_username=getattr(context.bot, "username", "") or "")
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except TelegramError:
+        pass
+
+
 async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: DownloadSession) -> None:
     # Guard against a double-tapped button. Handlers run as tasks on one loop,
     # so this check-and-set is atomic between awaits — the second callback sees
@@ -1290,6 +1389,11 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         logger.info("Ignoring duplicate start for session %s", session.session_id)
         return
     session.started = True
+    # Again here, not only when the link was sent: menus opened while
+    # downloads were left would otherwise all still work afterwards.
+    if not quota.can_download(session.user_id, active=jobs.active_for(session.user_id)):
+        await _refuse_menu(query, context, session)
+        return
 
     mode = session.mode or "video"
     quality = session.quality or "720"
@@ -1374,6 +1478,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
         if sent is not None:
             record_download(session.user_id, session.url, session.title, session.platform,
                             mode, quality, True)
+            quota.count(session.user_id)
             emit_terminal(session.telemetry_id, "success", delivery="cached")
             sessions.remove(session.session_id)
             try:
@@ -1386,6 +1491,13 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
     inflight_add(chat_id, query.message.message_id)
     # Registered only now: every return above would otherwise leak the job.
     job = jobs.start(f"dm:{chat_id}:{query.message.message_id}", session.user_id)
+    if not quota.can_download(session.user_id,
+                              active=jobs.active_for(session.user_id, exclude=job)):
+        # Another menu of the same user took the last download meanwhile.
+        jobs.drop(job)
+        inflight_remove(chat_id, query.message.message_id)
+        await _refuse_menu(query, context, session)
+        return
     job.on_cancel = _cancelled
     ticker.start()
     try:  # ✖ Cancel straight away, not only after the first progress event
@@ -1394,7 +1506,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
     except TelegramError:
         pass
     try:
-        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
+        _chat_action(context, chat_id, ChatAction.UPLOAD_DOCUMENT)  # cosmetic: never fails the job
         queue_entered = time.monotonic()
         emit(session.telemetry_id, "queue", outcome="queue_enter")
         async def _queued_download():
@@ -1410,7 +1522,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
             job, download_queue,
             _queued_download,
             on_position=lambda n: on_progress(0, f"Queued — you're #{n} in line"),
-            priority=user_prefs.is_premium(session.user_id),
+            priority=quota.is_paid(session.user_id),
         )
     except asyncio.CancelledError:
         if not job.cancelled:
@@ -1562,6 +1674,7 @@ async def execute_download(query, context: ContextTypes.DEFAULT_TYPE, session: D
                 cancel=job.event, on_reserved=lambda: setattr(job, "cancellable", False),
                 job_id=session.telemetry_id,
             )
+            quota.count(session.user_id)  # delivered: count before any bookkeeping
             _remember_upload(session.url, repeat, sent, result.title or session.title,
                              result, mode, quality)
             if result.subtitle_file and result.subtitle_file.exists() and mode == "video_subs":

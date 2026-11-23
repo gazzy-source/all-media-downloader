@@ -64,6 +64,12 @@ def remove(chat_id: int, message_id: int) -> None:
         _write(rows)
 
 
+def count() -> int:
+    """Messages still in progress (reading a link, downloading)."""
+    with _LOCK:
+        return len(_read())
+
+
 def drain() -> list[dict]:
     """Return everything that was still running when the process died, and clear it."""
     with _LOCK:

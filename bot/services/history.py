@@ -14,6 +14,7 @@ import logging
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ _MAX_HISTORY_USERS = 5000
 _MAX_USER_HISTORY = 50
 _lock = threading.Lock()
 _init_lock = threading.Lock()
+_WRITER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="history")
 _ready: set[str] = set()
 
 _SCHEMA = """
@@ -141,16 +143,19 @@ def record_download(
     error: str | None = None,
 ) -> None:
     """Fire-and-forget disk write so the Telegram upload path isn't blocked."""
-    threading.Thread(
-        target=_record_download_safe,
-        kwargs={
-            "user_id": user_id, "url": url, "title": title, "platform": platform,
-            "mode": mode, "quality": quality, "success": success,
-            "file_size": file_size, "error": error,
-        },
-        daemon=True,
-        name="history-write",
-    ).start()
+    # One writer thread, in order. A thread per call queued up behind the
+    # same lock during a burst, counted against the unit's TasksMax (shared
+    # with deno and ffmpeg), and daemon threads lost their rows at exit.
+    _WRITER.submit(
+        _record_download_safe,
+        user_id=user_id, url=url, title=title, platform=platform, mode=mode,
+        quality=quality, success=success, file_size=file_size, error=error,
+    )
+
+
+def flush() -> None:
+    """Wait for queued history writes (shutdown, tests)."""
+    _WRITER.submit(lambda: None).result(timeout=30)
 
 
 def _record_download_safe(**kw: Any) -> None:

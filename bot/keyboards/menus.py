@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 
-from bot.config import PREMIUM_ENABLED
 from bot.services.downloader import quality_buttons_meta
 from bot.services.session import DownloadSession
 
@@ -14,7 +13,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton("📥 New Download"), KeyboardButton("🕘 History")],
             [KeyboardButton("🌐 Platforms"), KeyboardButton("❓ Help")],
-            [KeyboardButton("⭐ Premium" if PREMIUM_ENABLED else "📊 Stats"),
+            [KeyboardButton("⭐ Premium"),
              KeyboardButton("⚙️ Settings")],
         ],
         resize_keyboard=True,
@@ -155,40 +154,6 @@ def subtitle_lang_keyboard(session: DownloadSession) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def image_size_keyboard(session: DownloadSession) -> InlineKeyboardMarkup:
-    """Offer original + scaled options when multiple sizes exist."""
-    sid = session.session_id
-    sizes = session.available_image_sizes[:6]
-    rows: list[list[InlineKeyboardButton]] = []
-    if sizes:
-        for i, (w, h) in enumerate(sizes):
-            label = f"{w}×{h}"
-            if i == 0:
-                label = f"⭐ Original {label}"
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        label, callback_data=f"imgsize:{sid}:{i}"
-                    )
-                ]
-            )
-    else:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    "⭐ Best Available", callback_data=f"imgsize:{sid}:0"
-                )
-            ]
-        )
-    rows.append(
-        [
-            InlineKeyboardButton("⬅️ Back", callback_data=f"back_mode:{sid}"),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{sid}"),
-        ]
-    )
-    return InlineKeyboardMarkup(rows)
-
-
 # NOTE: there is no confirm_keyboard any more. Picking a quality / audio format
 # / image size / subtitle language starts the download straight away, so the
 # extra "Download Now" screen only cost a tap and a round-trip. The `go:`
@@ -217,7 +182,7 @@ def after_download_keyboard(url: str, user_id: int = 0, *, private: bool = True)
     )
 
 
-def settings_keyboard(prefs: dict, *, premium_enabled: bool = True) -> InlineKeyboardMarkup:
+def settings_keyboard(prefs: dict) -> InlineKeyboardMarkup:
     """
     Tap-to-set defaults. With a type plus its quality/format chosen, a pasted
     link downloads straight away — no wizard. "Ask" brings the wizard back.
@@ -238,6 +203,5 @@ def settings_keyboard(prefs: dict, *, premium_enabled: bool = True) -> InlineKey
                         ("max", "Max"), ("ask", "Ask")]),
         row("audio", [("mp3", "MP3"), ("m4a", "M4A"), ("opus", "Opus"), ("ask", "Ask")]),
     ]
-    if premium_enabled:
-        rows.append([InlineKeyboardButton("💎 Premium", callback_data="prem:open")])
+    rows.append([InlineKeyboardButton("⭐ Get more downloads", callback_data="prem:open")])
     return InlineKeyboardMarkup(rows)

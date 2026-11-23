@@ -205,14 +205,14 @@ class TestHistoryMigration:
         assert hist.get_stats()["total_downloads"] == 3
 
 
-class TestPrefsNeverLosePremium:
+class TestPrefsNeverLoseData:
     def test_corrupt_file_is_kept_aside(self, tmp_path):
         from bot.services import user_prefs
 
         p = tmp_path / "p.json"
         p.write_text("{not json")
         user_prefs._reset_for_tests(p)
-        assert user_prefs.premium_until(1) == 0
+        assert user_prefs.get(1)["mode"] == "ask"
         user_prefs.set_pref(1, "mode", "audio")
         assert list(tmp_path.glob("p.json.corrupt-*")), "the bad file must be kept"
 
@@ -220,7 +220,7 @@ class TestPrefsNeverLosePremium:
         from bot.services import user_prefs
 
         p = tmp_path / "p.json"
-        p.write_text('{"1": {"premium_until": 9999999999}}')
+        p.write_text('{"1": {"mode": "video", "quality": "1080"}}')
         user_prefs._reset_for_tests(p)
         real = type(p).read_text
 
@@ -232,9 +232,9 @@ class TestPrefsNeverLosePremium:
         monkeypatch.setattr(type(p), "read_text", flaky)
         user_prefs.set_pref(2, "mode", "audio")  # must not save {"2": …} over it
         monkeypatch.setattr(type(p), "read_text", real)
-        assert "9999999999" in p.read_text()
+        assert "1080" in p.read_text()
         user_prefs._reset_for_tests(p)
-        assert user_prefs.is_premium(1)
+        assert user_prefs.get(1)["quality"] == "1080"
 
 
 class TestUrlTokensSurviveRestart:

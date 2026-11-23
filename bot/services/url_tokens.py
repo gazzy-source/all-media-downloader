@@ -26,6 +26,7 @@ _MAX = 5000
 # token -> (url, user_id, expires_at); insertion order = age
 _store: dict[str, tuple[str, int, float]] | None = None
 _lock = Lock()
+_write_lock = Lock()  # one writer; never held together with _lock's callers waiting
 _dirty = False
 
 
@@ -46,11 +47,11 @@ def _loaded() -> dict[str, tuple[str, int, float]]:
     return _store
 
 
-def _save_locked() -> None:
+def _write(snapshot: dict[str, list]) -> None:
     tmp = _PATH.with_suffix(".tmp")
     try:
         _PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps({k: list(v) for k, v in _loaded().items()}), encoding="utf-8")
+        tmp.write_text(json.dumps(snapshot), encoding="utf-8")
         os.replace(tmp, _PATH)
     except OSError as e:
         logger.warning("could not save url tokens: %s", e)
@@ -77,10 +78,16 @@ def put_url(url: str, user_id: int) -> str:
 def flush() -> None:
     """Write new tokens to disk (every 30s from a worker thread, and at stop)."""
     global _dirty
-    with _lock:
-        if _dirty:
-            _save_locked()
+    # Snapshot under _lock, write outside it: every keyboard render takes
+    # _lock on the event loop, and a slow disk (swap thrash) used to freeze
+    # the whole bot for the length of the write.
+    with _write_lock:
+        with _lock:
+            if not _dirty:
+                return
+            snapshot = {k: list(v) for k, v in _loaded().items()}
             _dirty = False
+        _write(snapshot)
 
 
 def get_url(token: str, user_id: int | None = None) -> str | None:

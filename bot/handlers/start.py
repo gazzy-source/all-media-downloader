@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -13,13 +12,11 @@ from telegram.ext import ContextTypes
 from bot import __bot_bio__, __bot_name__
 from bot.config import (
     ADMIN_IDS,
-    PREMIUM_ENABLED,
-    PREMIUM_RATE_MULT,
     RATE_LIMIT_PER_HOUR,
     SUPPORTED_PLATFORMS,
 )
 from bot.keyboards.menus import main_reply_keyboard, settings_keyboard
-from bot.services import user_prefs
+from bot.services import quota, user_prefs
 from bot.services.history import get_stats, get_user_history
 from bot.services.rate_limit import rate_limiter
 from bot.utils.helpers import format_size
@@ -33,10 +30,8 @@ def _kb(update: Update):
 
 
 def _premium_line() -> str:
-    if not PREMIUM_ENABLED:
-        return ""
-    more = RATE_LIMIT_PER_HOUR * PREMIUM_RATE_MULT
-    return f"• /premium — {more} downloads/hour + priority queue ⭐\n"
+    return (f"• {quota.FREE} free downloads, then /premium for more ⭐\n"
+            if quota.ENABLED else "")
 
 
 def welcome_text(bot_username: str) -> str:
@@ -72,7 +67,8 @@ def help_text(bot_username: str) -> str:
 
 <b>Commands</b>
 /settings — default type, quality &amp; audio format
-{'/premium — more downloads per hour + priority' + chr(10) if PREMIUM_ENABLED else ''}/history — your recent downloads
+/premium — downloads left &amp; get more ⭐
+/history — your recent downloads
 /platforms — supported sites
 /cancel — stop the current download
 /paysupport — help with a payment
@@ -95,7 +91,8 @@ Busy? You'll see your place in the queue. Tap <b>✖ Cancel</b> to stop one.
 
 <b>Limits</b>
 • Telegram bots can send files up to ~50 MB — pick a lower quality for long videos
-• {RATE_LIMIT_PER_HOUR} downloads/hour{f' ({RATE_LIMIT_PER_HOUR * PREMIUM_RATE_MULT} with /premium)' if PREMIUM_ENABLED else ''}
+• {quota.FREE} free downloads (DM, inline and groups together), then /premium packs; channels free, {quota.CHAT_DAILY} a day
+• {RATE_LIMIT_PER_HOUR} downloads/hour
 • Search shows videos up to 1 hour long
 
 Built with ❤️ by <b>Gazzy Labs</b>
@@ -120,6 +117,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "🔗 That link has expired — paste it here again and I'll download it.",
             reply_markup=_kb(update),
         )
+        return
+    if args and (args[0] == "buy" or args[0].startswith("buy_")):
+        from bot.handlers.premium import cmd_premium
+
+        # t.me/<bot>?start=buy: a refusal in a group or inline. (buy_<id>
+        # from older channel notices: channels no longer buy, show the packs.)
+        await cmd_premium(update, context)
         return
     if args and args[0] == "settings":
         await cmd_settings(update, context)
@@ -196,12 +200,27 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message or not update.effective_user:
         return
     remaining = rate_limiter.remaining(update.effective_user.id)
+    chat = update.effective_chat
+    if chat is not None and chat.type != "private":
+        # Personal (a balance) or the operator's (server totals): neither is
+        # for a group to read. Same rule as /settings.
+        me = getattr(context.bot, "username", "") or ""
+        await update.effective_message.reply_text(
+            "📊 Stats are personal — open them in a private chat with me.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "📊 Open", url=f"https://t.me/{me}?start=settings")]]) if me else None,
+        )
+        return
     if update.effective_user.id not in ADMIN_IDS:
         # Server-wide numbers (user count, traffic, platforms) are the
         # operator's business; everyone else gets their own quota.
+        st = quota.status(update.effective_user.id)
+        left = ("unlimited" if st["approved"] or st["admin"]
+                else f"{max(0, st['remaining']):,} of {st['allowance']:,}")
         await update.effective_message.reply_text(
-            f"⏱ Downloads this hour: <b>{remaining}</b> left of "
-            f"{user_prefs.hourly_limit(update.effective_user.id)}",
+            f"📥 Downloads left: <b>{left}</b>\n"
+            f"⏱ This hour: <b>{remaining}</b> left of "
+            f"{quota.hourly_limit(update.effective_user.id)}",
             parse_mode=ParseMode.HTML,
             reply_markup=_kb(update),
         )
@@ -235,7 +254,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def _settings_text(uid: int) -> str:
     prefs = user_prefs.get(uid)
-    premium = user_prefs.premium_until(uid)
     labels = {"ask": "ask each time", "video": "🎥 Video", "audio": "🎵 Audio",
               "max": "Max", "mp3": "MP3", "m4a": "M4A", "opus": "Opus"}
     q = prefs["quality"]
@@ -246,10 +264,14 @@ def _settings_text(uid: int) -> str:
         f"Audio format: <b>{labels.get(prefs['audio'], prefs['audio'])}</b>",
         "",
         f"Downloads this hour: <b>{rate_limiter.remaining(uid)}</b> left "
-        f"of {user_prefs.hourly_limit(uid)}",
+        f"of {quota.hourly_limit(uid)}",
     ]
-    if premium > time.time():
-        lines.append(f"💎 Premium until <b>{time.strftime('%d %b %Y', time.gmtime(premium))}</b>")
+    st = quota.status(uid)
+    if st["approved"] or st["admin"]:
+        lines.append("♾ Downloads: <b>unlimited</b> (free)")
+    else:
+        lines.append(f"📥 Downloads left: <b>{max(0, st['remaining']):,}</b> of "
+                     f"{st['allowance']:,} · /premium")
     if uid in ADMIN_IDS:
         lines.append("🛡 Admin")
     ready = (prefs["mode"] == "video" and q != "ask") or (
@@ -280,7 +302,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.effective_message.reply_text(
         _settings_text(uid),
         parse_mode=ParseMode.HTML,
-        reply_markup=settings_keyboard(user_prefs.get(uid), premium_enabled=PREMIUM_ENABLED),
+        reply_markup=settings_keyboard(user_prefs.get(uid)),
     )
 
 
@@ -297,7 +319,7 @@ async def handle_pref_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(
             _settings_text(uid),
             parse_mode=ParseMode.HTML,
-            reply_markup=settings_keyboard(user_prefs.get(uid), premium_enabled=PREMIUM_ENABLED),
+            reply_markup=settings_keyboard(user_prefs.get(uid)),
         )
     except TelegramError:
         pass  # unchanged ("message is not modified") or too old to edit

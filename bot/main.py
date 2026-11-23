@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import sys
 import time
@@ -186,6 +187,30 @@ async def cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Cleanup: %s sessions, %s temp files", removed_sessions, removed_files)
 
 
+# Its own thread: on the shared default pool, user-triggered blocking calls
+# (DNS for the URL guard, title fetches) could starve it, the heartbeat went
+# stale, and the restart scripts read stale as idle.
+_HOUSEKEEPING = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="housekeeping")
+
+
+def _busy_count() -> int:
+    """
+    Work a restart would cut: queued and running downloads, but also uploads
+    (the download slot is freed before UploadGate), inline jobs and links
+    still being read. The restart scripts used to see only the queue.
+    """
+    from bot.services import inflight, jobs
+    from bot.services.dl_queue import download_queue
+    from bot.services.upload_gate import upload_gate
+
+    return max(
+        download_queue.running + download_queue.waiting,
+        len(jobs._JOBS),
+        upload_gate.running_uploads + upload_gate.waiters,
+        inflight.count(),
+    )
+
+
 async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """data/heartbeat.json for the health check (stale = event loop stuck)."""
     from bot.services.dl_queue import download_queue
@@ -194,10 +219,12 @@ async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     updater = getattr(context.application, "updater", None)
     loop = asyncio.get_running_loop()
+    polling = bool(updater and updater.running)
+    running, waiting = download_queue.running, download_queue.waiting
+    # _busy_count reads inflight.json: on the housekeeping thread, not the loop.
     await loop.run_in_executor(
-        None, heartbeat.write, bool(updater and updater.running),
-        download_queue.running, download_queue.waiting)
-    await loop.run_in_executor(None, url_tokens.flush)
+        _HOUSEKEEPING, lambda: heartbeat.write(polling, running, waiting, _busy_count()))
+    await loop.run_in_executor(_HOUSEKEEPING, url_tokens.flush)
 
 
 class BotApplication(Application):
@@ -215,6 +242,15 @@ class BotApplication(Application):
         if stopped:
             logger.info("Shutdown: stopping %s running/queued download(s)", stopped)
         url_tokens.flush()
+        from bot.services import quota
+
+        from bot.services import history
+
+        for name, flush in (("quota", quota.flush), ("history", history.flush)):
+            try:
+                flush()  # writes still queued for the disk
+            except Exception:  # noqa: BLE001 — shutdown must go on
+                logger.exception("%s flush at shutdown failed", name)
         await super().stop()
 
 
@@ -324,6 +360,23 @@ async def _recheck_pot() -> None:
     logger.error("YouTube: PO-token provider still cannot mint after 5 minutes")
 
 
+async def _set_commands(app: Application) -> None:
+    from telegram import BotCommand
+
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "Start & how to use"),
+            BotCommand("settings", "Save default quality/format — skip the menu"),
+            BotCommand("premium", "Downloads left & get more ⭐"),
+            BotCommand("history", "Your recent downloads"),
+            BotCommand("help", "All features & limits"),
+            BotCommand("platforms", "Supported sites"),
+            BotCommand("cancel", "Stop the current download"),
+            BotCommand("paysupport", "Help with a payment"),
+        ]
+    )
+
+
 async def post_init(app: Application) -> None:
     from bot.handlers.inline import ignore_backlog
     from bot.utils.ffmpeg import find_ffmpeg
@@ -389,7 +442,9 @@ async def post_init(app: Application) -> None:
     logger.info("Telegram API: %s", TELEGRAM_API_URL or "https://api.telegram.org (default)")
     logger.info("=" * 50)
 
-    await _rescue_interrupted_jobs(app)
+    # Background like the rest: up to 200 edits one by one used to hold
+    # polling (and the first heartbeat) back on a slow start.
+    app.bot_data["_rescue_task"] = asyncio.create_task(_rescue_interrupted_jobs(app))
 
     # Background, so polling starts immediately: the whole point is that no
     # user waits on this. Held on the Application so it is not garbage
@@ -401,20 +456,11 @@ async def post_init(app: Application) -> None:
 
     # Command menu only — do NOT overwrite name/description/about from BotFather
     # unless explicitly set in .env (BOT_NAME / BOT_DESCRIPTION / BOT_SHORT_DESCRIPTION).
-    from telegram import BotCommand
-
-    await app.bot.set_my_commands(
-        [
-            BotCommand("start", "Start & how to use"),
-            BotCommand("settings", "Save default quality/format — skip the menu"),
-            BotCommand("premium", "More downloads + priority queue"),
-            BotCommand("history", "Your recent downloads"),
-            BotCommand("help", "All features & limits"),
-            BotCommand("platforms", "Supported sites"),
-            BotCommand("cancel", "Stop the current download"),
-            BotCommand("paysupport", "Help with a payment"),
-        ]
-    )
+    # Cosmetic: a Telegram 5xx here used to abort the whole startup.
+    try:
+        await _set_commands(app)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not set the command menu: %s", e)
 
     from bot.config import BOT_DESCRIPTION, BOT_NAME_OVERRIDE, BOT_SHORT_DESCRIPTION
 
@@ -437,12 +483,19 @@ async def post_init(app: Application) -> None:
         logger.warning("Could not update bot profile fields: %s", e)
 
 
+class _RefundedPayment(filters.MessageFilter):
+    """Service message about a Stars refund (PTB 21.10 has no ready filter)."""
+
+    def filter(self, message) -> bool:
+        return getattr(message, "refunded_payment", None) is not None
+
+
 def build_app() -> Application:
-    # Premium users get a higher hourly limit; the limiter asks per user.
-    from bot.services import user_prefs
+    # Accounts that bought a pack get a higher hourly limit; asked per user.
+    from bot.services import quota
     from bot.services.rate_limit import rate_limiter
 
-    rate_limiter.limit_for = user_prefs.hourly_limit
+    rate_limiter.limit_for = quota.hourly_limit
 
     if not BOT_TOKEN:
         logger.error(
@@ -495,12 +548,16 @@ def build_app() -> Application:
     command("stats", cmd_stats)
     command("settings", cmd_settings)
     command("cancel", cmd_cancel)
-    # Premium (Telegram Stars)
+    # Download packs (Telegram Stars) and the owner's free-access list
     command("premium", premium.cmd_premium)
+    command("buy", premium.cmd_premium)
+    command("approvefree", premium.cmd_approvefree)
+    command("revokefree", premium.cmd_revokefree)
     command("paysupport", premium.cmd_paysupport)
     command("refund", premium.cmd_refund)
     app.add_handler(PreCheckoutQueryHandler(premium.handle_precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, premium.handle_successful_payment))
+    app.add_handler(MessageHandler(_RefundedPayment(), premium.handle_refunded_payment))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
     # Inline mode: @bot <link> in any chat

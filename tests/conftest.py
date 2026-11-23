@@ -32,6 +32,10 @@ os.environ["FFMPEG_PATH"] = ""
 # Never the deployment's data/: running the suite on the server used to append
 # fake rows to the real history.json / stats.json and touch inflight.json.
 os.environ["DATA_DIR"] = str(_SANDBOX / "data")
+# The download allowance counts but never blocks in the general suite (one
+# fake user makes hundreds of downloads); tests/test_download_packs.py turns
+# it on against its own database.
+os.environ["PAYWALL_ENABLED"] = "0"
 os.environ["AUTO_DOWNLOAD_ALWAYS"] = "0"
 os.environ["DM_FAST_AUTO"] = "0"
 os.environ["AUTO_DOWNLOAD_GROUPS"] = "1"

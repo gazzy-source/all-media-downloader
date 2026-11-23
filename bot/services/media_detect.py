@@ -141,7 +141,12 @@ def _detect_via_ytdlp(url: str) -> str:
         opts.pop("progress_hooks", None)
         # Don't need format selection for type probe
         opts.pop("format", None)
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        # Bounded as a whole: socket_timeout only limits one read, so a server
+        # dripping bytes held a shared executor thread indefinitely.
+        # libcurl (impersonation) bypasses the socket deadline, so no
+        # impersonation for a mere type probe.
+        opts.pop("impersonate", None)
+        with deadline(30), yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
         if not info:
             logger.info("probe empty → image: %s", redact.url(url))

@@ -57,6 +57,19 @@ WARP also logs at DEBUG level, and the journal has no size cap; it was 3.9 GB on
 - **Journal cap:** `deploy/journald-size.conf` → `/etc/systemd/journald.conf.d/50-size.conf` (500M, keep 2G free). On 2026-11-21 the journal was trimmed from 3.8 GB to 0.5 GB after archiving the bot's own logs, including 1,920 YT_EVENT records from 2026-07-13 onwards, to `/var/log/mediabot-archive/bot-journal-until-20261121.txt.gz`.
 - **Kernel:** rebooted into 7.0.0-1016-oracle on 2026-11-21. Everything came back unaided: the bot, WARP (with limits and filters), the egress chain, zswap, the guard timer, the Docker containers and the Funnel. Snapshots of what was running before the reboot are in `/var/log/mediabot-archive/pre-reboot-*.txt`.
 
+## Download allowance and Stars packs
+
+- Every user gets `FREE_DOWNLOADS` (100) lifetime downloads, counted together across DMs, inline and groups. After that they buy packs (`DOWNLOAD_PACKS`, default 100⭐ = 100 and 10000⭐ = 10000) through `/premium` or `/buy`.
+- Channels are free, capped at `CHAT_DAILY_DOWNLOADS` (10) a day, which resets at 00:00 UTC. The same applies to a group's anonymous admins, who post as the group. Chats buy nothing. (A lifetime allowance per chat was a loophole, since making a new channel costs nothing.)
+- The allowance check counts the account's downloads already in progress, so pasting many links at once can't run past the limit.
+- Owner commands (`ADMIN_IDS` only):
+  - `/approvefree <id>` makes an account lifetime free and stops counting it; for a chat, it also lifts the daily cap. The id may be a user or a negative channel/group id, or you can reply to the person's message instead. With no argument, it lists the approved ids (in a private chat only).
+  - `/revokefree <id>` puts the account back on its allowance.
+  - `/refund <payer id>` refunds the payer's latest pack and takes those downloads back.
+- The ledger is `data/quota.sqlite3`. It is never evicted, so back it up together with `data/`. To inspect it (read-only):
+  `sudo -u mediabot python3 -c "import sqlite3; c=sqlite3.connect('file:/opt/all-media-downloader/data/quota.sqlite3?mode=ro', uri=True); print(c.execute('select * from accounts order by used desc limit 20').fetchall()); print(c.execute('select account_id,payer_id,stars,downloads,refunded,datetime(ts,\"unixepoch\") from charges').fetchall())"`
+- `PAYWALL_ENABLED=0` keeps counting but blocks nobody, as an emergency switch.
+
 ## Useful inspection commands
 
 ```bash

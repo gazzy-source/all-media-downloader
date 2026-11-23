@@ -106,6 +106,22 @@ These decisions describe the production-stable v1 baseline (`v1.0.0`, `830f351`)
 **Why this choice:** It was disabled on this VM for the measured experiment; this is not a general project default or a claim that firmware maintenance is unnecessary.  
 **Revisit when:** **[R]** VM image/provider maintenance policy changes or the host is replaced; review firmware/security update responsibility explicitly.
 
+## Download allowance in its own SQLite ledger
+
+**Problem:** Charge for downloads past a free allowance: 100 per user, then Stars packs (100⭐ = 100, 10000⭐ = 10000). Count every delivery in DMs, inline, groups and channels. The owner can make an account lifetime free (`/approvefree`).
+**Evidence:** **[C]** History keeps 50 rows per user and 5000 users, and `user_prefs.json` evicts users, so neither can hold a lifetime count or paid records. **[M]** No `user_prefs.json` existed on production on 2026-11-23: the 30-day Premium it replaces was never bought.
+**Alternatives considered:**
+- A per-job reservation, which is exact at the limit but needs a release on every exit path.
+- Counting inside `record_download`, which is fire-and-forget and swallows errors, and which the inline cached swap never called.
+
+**Why this choice:**
+- `data/quota.sqlite3` stores a monotonic `used` count and a charges table keyed by Telegram charge id. The balance is derived (free + non-refunded packs − used), so duplicate payment updates and refunds cannot corrupt it.
+- It is read from memory: the bot is one process. **[M]** A SQLite read per check was 0.6 ms median but up to 88 ms on the event loop, on every inline keystroke. SQLite is written through, and counts go on one writer thread.
+- Downloads are checked before they start, counting the account's jobs already in progress (checked again once the job is registered). They are counted once per confirmed delivery. Many links at once therefore can't run past the allowance, and no per-job release path is needed.
+- Chats (negative ids: a channel's own posts, a group's anonymous admins) are free but capped at 10 a day, at the owner's choice on 2026-11-23. A lifetime allowance per chat was a loophole, because creating a channel costs nothing. A member posting "as" their own channel in a group is not downloaded at all: Telegram shows no person to count.
+
+**Revisit when:** **[R]** a pack size exceeds what Telegram accepts per invoice (10000 XTR verified on 2026-11-23), or the daily chat cap proves too tight or too loose.
+
 ## Known limitations and future triggers
 
 - Job execution is not durable or resumable; restart recovery only has best-effort interruption markers. Add durable work state only if recovery is a requirement.

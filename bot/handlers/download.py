@@ -100,9 +100,12 @@ def _actor_id(update: Update) -> int | None:
     post everywhere would share one allowance.
 
     In a group, only the group itself (anonymous admins) or its linked
-    channel (automatic forwards) is trusted as the sender. A member posting
-    "as" one of their own channels is counted against the group: otherwise
-    every throwaway channel would be a fresh free allowance.
+    channel (automatic forwards, a flag only Telegram sets) is trusted as the
+    sender. A member posting "as" one of their own channels has no account:
+    keyed on that channel, every throwaway channel would be a fresh free
+    allowance; keyed on the group, they would spend the group's downloads
+    or ride its /approvefree. Telegram shows no person behind such a post,
+    so it is not downloaded (None).
     """
     msg = update.effective_message
     chat = update.effective_chat
@@ -113,7 +116,7 @@ def _actor_id(update: Update) -> int | None:
             return sc_id
         if getattr(msg, "is_automatic_forward", False):
             return sc_id  # the linked channel's own post, mirrored here
-        return chat.id
+        return None
     user = update.effective_user
     if user:
         return user.id

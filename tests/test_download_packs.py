@@ -116,7 +116,17 @@ class TestAccount:
         for throwaway in (-1001, -1002, -1003):
             m = fx.msg("x")
             m.sender_chat = SimpleNamespace(id=throwaway)
-            assert hd._actor_id(fx.update(m)) == -100200, "counted against the group"
+            assert hd._actor_id(fx.update(m)) is None, "no account: not the group's either"
+
+    async def test_post_as_own_channel_is_not_downloaded(self, fx, monkeypatch):
+        started = []
+        monkeypatch.setattr(hd.download_manager, "download", lambda **kw: started.append(1))
+        fx.chat.type, fx.chat.id = "supergroup", -100200
+        quota.set_approved(-100200, True, by=OWNER)  # the group's approval doesn't extend
+        m = fx.msg("https://youtu.be/x")
+        m.sender_chat = SimpleNamespace(id=-1001)
+        assert not await hd.auto_download_flow(fx.update(m), fx.ctx, "https://youtu.be/x")
+        assert started == [] and m.replies == []
 
 
 def _res(tmp_path, **kw):

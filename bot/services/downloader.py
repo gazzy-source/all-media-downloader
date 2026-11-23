@@ -683,7 +683,7 @@ def _resolved_impersonate():
     return _IMPERSONATE
 
 
-_YT_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+_YT_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com", "youtubekids.com")
 
 
 def _is_youtube_host(host: str) -> bool:

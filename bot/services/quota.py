@@ -141,7 +141,7 @@ def _load() -> _Ledger:
 
 
 _LOAD_RETRY_S = 30.0
-_load_failed_at = 0.0
+_load_failed_at = float("-inf")  # monotonic() can be < 30 s after boot
 
 
 def _ledger_or_none() -> _Ledger | None:
@@ -358,4 +358,4 @@ def _reset_for_tests(path: Path, *, enabled: bool = True, free: int = 100,
     flush()
     with _lock:
         _PATH, ENABLED, FREE, PACKS, _ledger = path, enabled, free, packs, None
-        _load_failed_at = 0.0
+        _load_failed_at = float("-inf")

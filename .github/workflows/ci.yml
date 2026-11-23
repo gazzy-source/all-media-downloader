@@ -35,8 +35,10 @@ jobs:
       - name: Import package smoke test
         run: |
           python -c "
-          from bot.config import BOT_NAME, QUALITY_MAP
-          from bot.utils.helpers import extract_urls, platform_from_url, progress_bar
+          from bot import __bot_name__ as BOT_NAME
+          from bot.config import QUALITY_MAP, FREE_DOWNLOADS
+          from bot.utils.helpers import extract_urls, platform_from_url
+          from bot.services import quota
           from bot.services.downloader import available_qualities_for
           from bot.utils.instance_lock import acquire_single_instance
           assert extract_urls('see https://youtu.be/dQw4w9WgXcQ')

@@ -91,7 +91,7 @@ Busy? You'll see your place in the queue. Tap <b>✖ Cancel</b> to stop one.
 
 <b>Limits</b>
 • Telegram bots can send files up to ~50 MB — pick a lower quality for long videos
-• {quota.FREE} free downloads (DM, inline, groups and channels together), then /premium packs
+• {quota.FREE} free downloads (DM, inline and groups together), then /premium packs; channels free, {quota.CHAT_DAILY} a day
 • {RATE_LIMIT_PER_HOUR} downloads/hour
 • Search shows videos up to 1 hour long
 
